@@ -1,0 +1,58 @@
+[project]
+name = "interview-agent"
+version = "0.1.0"
+description = "AI voice interview agent: a planner designs the interview from a resume and job offer, a LiveKit + LangGraph agent conducts it by voice, and an evaluator scores the candidate."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    # LiveKit realtime voice agent framework + plugins
+    "livekit-agents>=1.0",                 # includes the `inference` gateway (STT/TTS AssemblyAI + Cartesia)
+    "livekit-plugins-silero>=1.0",         # local VAD
+    "livekit-plugins-turn-detector>=1.0",  # turn detection (MultilingualModel)
+    "livekit-plugins-langchain>=1.0",      # LLMAdapter: wraps the LangGraph workflow as an LLM
+    # LangGraph orchestration + OpenAI chat model
+    "langgraph>=0.6",
+    "langchain-openai>=0.3",
+    # Config
+    "pydantic-settings>=2.0",
+    "fastapi>=0.139.0",
+    "uvicorn[standard]>=0.50.1",
+    "python-multipart>=0.0.32",
+    "markitdown[pdf]>=0.1.6",
+    "qdrant-client>=1.18.0",
+    "sqlalchemy[asyncio]>=2.0.51",
+    "asyncpg>=0.31.0",
+    "alembic>=1.18.5",
+    "httpx>=0.28.1",
+]
+
+[project.scripts]
+agent = "main:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14",
+    "pytest>=8",
+    "pytest-asyncio>=1.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "A", "C4", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"alembic/versions/*" = ["E501", "UP", "I"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["interview_agent"]

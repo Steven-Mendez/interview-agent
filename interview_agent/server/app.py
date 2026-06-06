@@ -1,0 +1,61 @@
+"""FastAPI application factory.
+
+Run with: uv run uvicorn interview_agent.server.app:app --port 8000
+Schema is applied separately with `uv run alembic upgrade head` (not here).
+"""
+
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from qdrant_client import AsyncQdrantClient
+
+from interview_agent.config import settings
+from interview_agent.interview import rag
+from interview_agent.interview.db import create_engine_and_sessionmaker
+from interview_agent.logging_config import setup_file_logging
+from interview_agent.server.routes import router
+
+_FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+
+logger = logging.getLogger("interview_agent.server")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Same rotating-file setup as the worker, in its own file. INFO on the
+    # console: uvicorn only wires its own loggers, not the app's.
+    logging.basicConfig(level=logging.INFO)  # no-op if handlers already exist
+    log_path = setup_file_logging("logs/server.log")
+
+    settings.require_keys()
+    engine, sessionmaker = create_engine_and_sessionmaker(settings.database_url)
+    qdrant = AsyncQdrantClient(url=settings.qdrant_url)
+    await rag.ensure_collection(qdrant, settings)
+    logger.info(
+        "server ready",
+        extra={
+            "log_file": str(log_path),
+            "qdrant": settings.qdrant_url,
+            "max_concurrent_interviews": settings.max_concurrent_interviews,
+        },
+    )
+
+    app.state.sessionmaker = sessionmaker
+    app.state.qdrant = qdrant
+    app.state.embeddings = rag.build_embeddings(settings)
+    try:
+        yield
+    finally:
+        await qdrant.close()
+        await engine.dispose()
+
+
+app = FastAPI(title="interview-agent", lifespan=lifespan)
+app.include_router(router)
+# Mounted last so /interviews/* wins over static files.
+app.mount("/", StaticFiles(directory=_FRONTEND_DIR, html=True), name="frontend")

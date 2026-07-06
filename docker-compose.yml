@@ -3,8 +3,10 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: interview-postgres
+    # Non-default host ports (5433/6335): the standard ones tend to collide
+    # with other local stacks. Must match DATABASE_URL / QDRANT_URL in .env.
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       POSTGRES_USER: interview
       POSTGRES_PASSWORD: interview
@@ -21,8 +23,8 @@ services:
     image: qdrant/qdrant:latest
     container_name: interview-qdrant
     ports:
-      - "6333:6333" # HTTP
-      - "6334:6334" # gRPC
+      - "6335:6333" # HTTP
+      - "6336:6334" # gRPC
     volumes:
       - qdrant_data:/qdrant/storage
 

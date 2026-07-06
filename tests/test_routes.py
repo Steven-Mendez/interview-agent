@@ -25,7 +25,7 @@ from interview_agent.server import routes
 
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL",
-    "postgresql+asyncpg://interview:interview@localhost:5433/interview_test",
+    "postgresql+asyncpg://interview:interview@localhost:5432/interview_test",
 )
 
 

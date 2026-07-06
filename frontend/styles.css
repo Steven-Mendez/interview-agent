@@ -101,6 +101,10 @@ button.secondary { background: #666; }
 
 /* --- Agent state badge -------------------------------------------------------- */
 
+/* `display` on the class beats the UA's [hidden] rule — restore it, or the
+   badge renders as an empty pill before the interview starts. */
+.agent-state[hidden] { display: none; }
+
 .agent-state {
   display: inline-block;
   padding: 0.2rem 0.7rem;

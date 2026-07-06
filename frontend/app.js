@@ -287,17 +287,77 @@ $("start-btn").addEventListener("click", async () => {
 
 // ---- 3: Results -------------------------------------------------------------
 
+// ~3 min at the 2s poll interval. Evaluation normally lands well before, but
+// the worker's auto-trigger can die silently (e.g. server was down at that
+// moment) — the endpoint is re-invocable, so offer a manual retry after this.
+const MAX_EVAL_POLLS = 90;
+let evalPolls = 0;
+
 function showResults() {
   showPanel("results");
+  startEvalPolling();
+}
+
+function startEvalPolling() {
+  evalPolls = 0;
+  $("results-error").hidden = true;
+  $("retry-eval-btn").hidden = true;
+  $("results-status").hidden = false;
   startPolling((interview) => {
     updateMilestones(interview);
-    if (interview.status !== "evaluated" || !interview.evaluation) return;
-    stopPolling();
-    log("evaluation received:", interview.evaluation.hired ? "HIRED" : "NOT HIRED",
-        `score ${interview.evaluation.score}/100`);
-    renderEvaluation(interview);
+    if (interview.status === "evaluated" && interview.evaluation) {
+      stopPolling();
+      log("evaluation received:", interview.evaluation.hired ? "HIRED" : "NOT HIRED",
+          `score ${interview.evaluation.score}/100`);
+      renderEvaluation(interview);
+      return;
+    }
+    if (interview.status === "evaluation_failed") {
+      stopPolling();
+      showEvalError("The evaluation failed. You can retry it.");
+      return;
+    }
+    evalPolls += 1;
+    if (evalPolls >= MAX_EVAL_POLLS) {
+      stopPolling();
+      showEvalError("The evaluation is taking longer than expected. You can retry it.");
+    }
   });
 }
+
+function showEvalError(message) {
+  log("evaluation problem:", message);
+  $("results-status").hidden = true;
+  const err = $("results-error");
+  err.textContent = message;
+  err.hidden = false;
+  $("retry-eval-btn").hidden = false;
+}
+
+$("retry-eval-btn").addEventListener("click", async () => {
+  const button = $("retry-eval-btn");
+  button.disabled = true;
+  $("results-error").textContent = "Retrying evaluation… (can take a couple of minutes)";
+  try {
+    // The response IS the evaluated interview — no need to resume polling.
+    const res = await fetch(`/interviews/${interviewId}/evaluate`, { method: "POST" });
+    if (!res.ok) {
+      const detail = (await res.json().catch(() => ({}))).detail;
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    const interview = await res.json();
+    lastInterview = interview;
+    $("results-error").hidden = true;
+    button.hidden = true;
+    updateMilestones(interview);
+    renderEvaluation(interview);
+  } catch (err) {
+    console.error("[app] evaluation retry failed:", err);
+    $("results-error").textContent = `Error: ${err.message}`;
+  } finally {
+    button.disabled = false;
+  }
+});
 
 function renderEvaluation(interview) {
   const ev = interview.evaluation;

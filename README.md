@@ -1,38 +1,32 @@
-# interview-agent
+# Interview Agent
 
-A voice-based AI job-interview simulator. Upload a resume (PDF) and a job
-offer; a **planner** agent designs the interview (persona, language,
-milestones), a **voice interviewer** conducts it in the browser over
-**LiveKit**, and when it ends an **evaluator** agent scores the candidate
-automatically (hired or not, score, strengths/weaknesses).
+**English** | [Español](README.es.md)
 
-Built on **LiveKit Agents** (audio pipeline), **LangGraph** (interviewer
-brain), **OpenAI** (LLMs + embeddings), **Qdrant** (resume RAG), **Postgres**
-(conversations, milestones, transcript, evaluations) and **FastAPI**.
+An AI voice job-interview simulator. Upload your resume (PDF) and paste a job offer — an AI agent plans a tailored interview, conducts it with you **by voice in the browser**, and scores you when it's over.
 
-## Architecture
+## How it works
 
-- **RAG hybrid**: the planner and evaluator get the FULL resume markdown in
-  their prompt; the interviewer uses a `search_resume` tool (Qdrant, filtered
-  by conversation).
-- **Models**: `gpt-5.5` (reasoning `high`) for planning/evaluation — quality
-  over latency; `gpt-5.4-mini` (reasoning `none`) for the voice interviewer —
-  lowest time-to-first-token; `text-embedding-3-small` for embeddings.
-- **End of interview**: the interviewer marks milestones via tools and calls
-  `end_interview` when done; a hard `INTERVIEW_MAX_MINUTES` cap (wrap-up cue
-  at T−2 min) is the safety net. Evaluation triggers automatically on any end
-  path (plan complete, timeout, candidate closed the tab).
-- **Retention**: resumes, transcripts and evaluations are purged from
-  Postgres and Qdrant after `RETENTION_DAYS` (default 30; 0 disables); the
-  Qdrant resume chunks are already dropped right after each evaluation.
-  Per-interview LLM token usage is stored on the conversation
-  (`token_usage`: planner / interviewer / evaluator).
+Three agents, one flow:
+
+1. **Planner** — reads the resume and the job offer, designs the interview (interviewer persona, language, milestones to cover).
+2. **Interviewer** — a real-time voice agent that runs the interview in the browser over LiveKit, checks off milestones as it goes, and can search your resume mid-conversation (RAG).
+3. **Evaluator** — when the interview ends (plan complete, time cap, or you close the tab), it scores the transcript automatically: hired or not, score, strengths and weaknesses.
+
+## Tech stack
+
+- **LiveKit Agents** — real-time audio pipeline (STT, TTS, turn detection)
+- **LangGraph** — the interviewer's brain (ReAct graph + tools)
+- **OpenAI** — LLMs and embeddings
+- **Qdrant** — vector search over the resume
+- **PostgreSQL** — conversations, milestones, transcripts, evaluations
+- **FastAPI** — API + plain HTML/CSS/JS frontend
 
 ## Requirements
 
-- Python 3.12+ and [uv](https://docs.astral.sh/uv/), Docker
+- Python 3.12+ and [uv](https://docs.astral.sh/uv/)
+- Docker
 - An OpenAI API key
-- A LiveKit Cloud project (URL + API key + secret) — [cloud.livekit.io](https://cloud.livekit.io)
+- A free LiveKit Cloud project (URL + API key + secret) — [cloud.livekit.io](https://cloud.livekit.io)
 
 ## Run it
 
@@ -50,44 +44,6 @@ uv run python main.py dev
 uv run uvicorn interview_agent.server.app:app --port 8000
 ```
 
-Open <http://localhost:8000>: upload a resume PDF, paste the job offer, wait
-for the plan (~30–60 s), then start the voice interview. When it ends you get
-the evaluation on the same page.
+Open <http://localhost:8000>: upload a resume PDF, paste the job offer, wait for the plan (~30–60 s), then start the voice interview. When it ends, the evaluation appears on the same page.
 
-## API
-
-| Endpoint | What it does |
-|---|---|
-| `POST /interviews` | multipart `resume` (PDF) + `job_offer` (text) → converts with markitdown, indexes in Qdrant, runs the planner, returns the plan |
-| `GET /interviews/{id}` | status, plan, milestones, evaluation (the frontend polls this) |
-| `GET /interviews/{id}/token` | LiveKit token; dispatches the interviewer agent to the room with the conversation id |
-| `POST /interviews/{id}/evaluate` | runs the evaluator over the transcript; auto-triggered by the worker, re-invocable (the UI offers a retry if it fails or stalls) |
-| `GET /healthz` | liveness + DB reachability |
-
-## Project layout
-
-```
-main.py                        # LiveKit worker CLI entry point
-docker-compose.yml             # Postgres + Qdrant
-alembic/                       # DB migrations
-frontend/                      # plain HTML/CSS/JS frontend
-interview_agent/
-├── config.py                  # settings from .env
-├── llm.py                     # chat-model factory + streaming helpers
-├── prompts.py                 # all LLM prompts in one place
-├── agent.py                   # LiveKit worker: runs the interview session
-├── interview/
-│   ├── db.py                  # SQLAlchemy async models + queries
-│   ├── rag.py                 # markitdown → chunks → embeddings → Qdrant
-│   ├── models.py              # planner/evaluator structured-output schemas
-│   ├── planner.py             # designs the interview
-│   ├── evaluator.py           # scores the finished interview
-│   └── interviewer_graph.py   # per-session ReAct graph + tools
-└── server/                    # FastAPI app + routes
-```
-
-## Language
-
-The interview language is decided by the planner from the job offer. STT/TTS
-are multilingual with auto-detection; if transcriptions come out garbled, pin
-`STT_LANGUAGE` (e.g. `es`) in `.env`.
+> **Note on language:** the interview language is picked by the planner from the job offer. STT/TTS auto-detect the spoken language; if transcriptions come out garbled, pin `STT_LANGUAGE` (e.g. `es`) in `.env`.

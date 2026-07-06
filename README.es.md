@@ -1,0 +1,49 @@
+# Interview Agent
+
+[English](README.md) | **Español**
+
+Un simulador de entrevistas de trabajo por voz con IA. Sube tu currículum (PDF) y pega una oferta de trabajo — un agente de IA planifica una entrevista a medida, la conduce contigo **por voz en el navegador** y te evalúa al terminar.
+
+## Cómo funciona
+
+Tres agentes, un solo flujo:
+
+1. **Planner** — lee el currículum y la oferta, y diseña la entrevista (persona del entrevistador, idioma, hitos a cubrir).
+2. **Interviewer** — un agente de voz en tiempo real que conduce la entrevista en el navegador sobre LiveKit, va marcando los hitos y puede buscar en tu currículum durante la conversación (RAG).
+3. **Evaluator** — cuando la entrevista termina (plan completado, límite de tiempo, o cierras la pestaña), evalúa el transcript automáticamente: contratado o no, puntuación, fortalezas y debilidades.
+
+## Stack
+
+- **LiveKit Agents** — pipeline de audio en tiempo real (STT, TTS, detección de turnos)
+- **LangGraph** — el cerebro del entrevistador (grafo ReAct + tools)
+- **OpenAI** — LLMs y embeddings
+- **Qdrant** — búsqueda vectorial sobre el currículum
+- **PostgreSQL** — conversaciones, hitos, transcripts, evaluaciones
+- **FastAPI** — API + frontend en HTML/CSS/JS plano
+
+## Requisitos
+
+- Python 3.12+ y [uv](https://docs.astral.sh/uv/)
+- Docker
+- Una API key de OpenAI
+- Un proyecto gratuito de LiveKit Cloud (URL + API key + secret) — [cloud.livekit.io](https://cloud.livekit.io)
+
+## Cómo correrlo
+
+```bash
+uv sync
+cp .env.example .env                    # completa tus claves
+docker compose up -d                    # Postgres (:5433) + Qdrant (:6335)
+uv run alembic upgrade head             # crea el esquema
+uv run python main.py download-files    # una sola vez: modelos de VAD/turnos
+
+# Terminal 1: el worker de LiveKit (el entrevistador)
+uv run python main.py dev
+
+# Terminal 2: la API + frontend
+uv run uvicorn interview_agent.server.app:app --port 8000
+```
+
+Abre <http://localhost:8000>: sube un currículum en PDF, pega la oferta de trabajo, espera el plan (~30–60 s) y empieza la entrevista por voz. Al terminar, la evaluación aparece en la misma página.
+
+> **Nota sobre el idioma:** el planner elige el idioma de la entrevista a partir de la oferta. El STT/TTS detecta el idioma hablado automáticamente; si las transcripciones salen mal, fija `STT_LANGUAGE` (p. ej. `es`) en el `.env`.

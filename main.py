@@ -1,8 +1,8 @@
 """Entry point for the interview agent LiveKit worker.
 
 Usage:
-    uv run python main.py dev          # run as a worker connected to a LiveKit server
-    uv run python main.py download-files   # pre-download model files (e.g. Silero VAD)
+    uv run python main.py dev      # worker with hot reload (local dev)
+    uv run python main.py start    # worker in production mode (Docker)
 """
 
 from interview_agent.agent import run

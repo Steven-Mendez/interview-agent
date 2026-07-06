@@ -33,7 +33,6 @@ from livekit.agents import (
 )
 from livekit.agents.llm import ChatMessage
 from livekit.plugins import langchain, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from qdrant_client import AsyncQdrantClient
 
 from interview_agent.config import settings
@@ -81,7 +80,11 @@ def _build_session(ctx: JobContext, graph) -> AgentSession:
         llm=langchain.LLMAdapter(graph=graph, stream_mode="custom"),
         tts=inference.TTS(model=settings.tts_model, voice=settings.tts_voice),
         vad=ctx.proc.userdata["vad"],
-        turn_handling=TurnHandlingOptions(turn_detection=MultilingualModel()),
+        # Audio end-of-turn detector: `v1` (cloud, via LiveKit Inference) in
+        # dev/hosted mode, `v1-mini` (local, weights ship inside the
+        # livekit-local-inference wheel) when self-hosted, with automatic
+        # cloud→local fallback.
+        turn_handling=TurnHandlingOptions(turn_detection=inference.TurnDetector()),
     )
 
 

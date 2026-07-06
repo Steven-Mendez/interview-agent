@@ -8,7 +8,6 @@ dependencies = [
     # LiveKit realtime voice agent framework + plugins
     "livekit-agents>=1.0",                 # includes the `inference` gateway (STT/TTS AssemblyAI + Cartesia)
     "livekit-plugins-silero>=1.0",         # local VAD
-    "livekit-plugins-turn-detector>=1.0",  # turn detection (MultilingualModel)
     "livekit-plugins-langchain>=1.0",      # LLMAdapter: wraps the LangGraph workflow as an LLM
     # LangGraph orchestration + OpenAI chat model
     "langgraph>=0.6",

@@ -23,7 +23,6 @@ Three agents, one flow:
 
 ## Requirements
 
-- Python 3.12+ and [uv](https://docs.astral.sh/uv/)
 - Docker
 - An OpenAI API key
 - A free LiveKit Cloud project (URL + API key + secret) — [cloud.livekit.io](https://cloud.livekit.io)
@@ -31,11 +30,22 @@ Three agents, one flow:
 ## Run it
 
 ```bash
+cp .env.example .env         # fill in your keys
+docker compose up -d --build
+```
+
+That starts the whole stack: Postgres, Qdrant, the API + frontend, and the LiveKit worker (migrations run automatically).
+
+Open <http://localhost:8000>: upload a resume PDF, paste the job offer, wait for the plan (~30–60 s), then start the voice interview. When it ends, the evaluation appears on the same page.
+
+## Development (local)
+
+To iterate with hot reload, run only the databases in Docker and the app with [uv](https://docs.astral.sh/uv/) (Python 3.12+):
+
+```bash
 uv sync
-cp .env.example .env                    # fill in your keys
-docker compose up -d                    # Postgres (:5433) + Qdrant (:6335)
+docker compose up -d postgres qdrant    # Postgres (:5432) + Qdrant (:6333)
 uv run alembic upgrade head             # create the schema
-uv run python main.py download-files    # one-time: VAD/turn-detector models
 
 # Terminal 1: the LiveKit worker (the interviewer)
 uv run python main.py dev
@@ -43,7 +53,5 @@ uv run python main.py dev
 # Terminal 2: the API + frontend
 uv run uvicorn interview_agent.server.app:app --port 8000
 ```
-
-Open <http://localhost:8000>: upload a resume PDF, paste the job offer, wait for the plan (~30–60 s), then start the voice interview. When it ends, the evaluation appears on the same page.
 
 > **Note on language:** the interview language is picked by the planner from the job offer. STT/TTS auto-detect the spoken language; if transcriptions come out garbled, pin `STT_LANGUAGE` (e.g. `es`) in `.env`.

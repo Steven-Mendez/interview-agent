@@ -35,7 +35,7 @@ class _FakeChain:
     def with_retry(self, **kwargs):
         return self
 
-    async def ainvoke(self, messages):
+    async def ainvoke(self, messages, config=None):
         self.messages = messages
         return self.result
 

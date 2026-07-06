@@ -22,6 +22,11 @@ brain), **OpenAI** (LLMs + embeddings), **Qdrant** (resume RAG), **Postgres**
   `end_interview` when done; a hard `INTERVIEW_MAX_MINUTES` cap (wrap-up cue
   at T−2 min) is the safety net. Evaluation triggers automatically on any end
   path (plan complete, timeout, candidate closed the tab).
+- **Retention**: resumes, transcripts and evaluations are purged from
+  Postgres and Qdrant after `RETENTION_DAYS` (default 30; 0 disables); the
+  Qdrant resume chunks are already dropped right after each evaluation.
+  Per-interview LLM token usage is stored on the conversation
+  (`token_usage`: planner / interviewer / evaluator).
 
 ## Requirements
 
@@ -34,7 +39,7 @@ brain), **OpenAI** (LLMs + embeddings), **Qdrant** (resume RAG), **Postgres**
 ```bash
 uv sync
 cp .env.example .env                    # fill in your keys
-docker compose up -d                    # Postgres (:5432) + Qdrant (:6333)
+docker compose up -d                    # Postgres (:5433) + Qdrant (:6335)
 uv run alembic upgrade head             # create the schema
 uv run python main.py download-files    # one-time: VAD/turn-detector models
 
@@ -56,7 +61,8 @@ the evaluation on the same page.
 | `POST /interviews` | multipart `resume` (PDF) + `job_offer` (text) → converts with markitdown, indexes in Qdrant, runs the planner, returns the plan |
 | `GET /interviews/{id}` | status, plan, milestones, evaluation (the frontend polls this) |
 | `GET /interviews/{id}/token` | LiveKit token; dispatches the interviewer agent to the room with the conversation id |
-| `POST /interviews/{id}/evaluate` | runs the evaluator over the transcript; auto-triggered by the worker, re-invocable |
+| `POST /interviews/{id}/evaluate` | runs the evaluator over the transcript; auto-triggered by the worker, re-invocable (the UI offers a retry if it fails or stalls) |
+| `GET /healthz` | liveness + DB reachability |
 
 ## Project layout
 

@@ -16,6 +16,15 @@ _STANDARD_ATTRS = frozenset(
 ) | {"message", "asctime", "taskName"}
 
 
+def _rotated_name(default_name: str) -> str:
+    """logs/server.log.1 → logs/server-1.log (keep the .log extension last)."""
+    path = Path(default_name)
+    if path.suffix[1:].isdigit():
+        stem = Path(path.stem)  # "server.log"
+        return str(path.with_name(f"{stem.stem}-{path.suffix[1:]}{stem.suffix}"))
+    return default_name
+
+
 class _ExtraFormatter(logging.Formatter):
     """Appends `extra={...}` fields as JSON. LiveKit puts the interesting
     payloads (transcripts, latency timings) in `extra`, which the default
@@ -51,6 +60,9 @@ def setup_file_logging(
     handler = RotatingFileHandler(
         log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
     )
+    # Rotate to `server-1.log` instead of the default `server.log.1`, so
+    # editors keep recognizing (and highlighting) rotated files as logs.
+    handler.namer = _rotated_name
     handler.setLevel(level)
     handler._tag = _HANDLER_TAG  # type: ignore[attr-defined]
     handler.setFormatter(

@@ -12,14 +12,19 @@ import logging
 import uuid
 from typing import Any
 
+import anyio.to_thread
 from fastapi import APIRouter, Form, HTTPException, Request, UploadFile
+from langchain_core.callbacks import UsageMetadataCallbackHandler
 from livekit import api
+from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from interview_agent.config import settings
 from interview_agent.interview import db, rag
 from interview_agent.interview.evaluator import run_evaluator
 from interview_agent.interview.planner import run_planner
+from interview_agent.llm import summarize_usage
 
 logger = logging.getLogger("interview_agent.server")
 
@@ -32,6 +37,18 @@ _MAX_RESUME_BYTES = 10 * 1024 * 1024  # 10 MB
 
 def _sessionmaker(request: Request):
     return request.app.state.sessionmaker
+
+
+@router.get("/healthz")
+async def healthz(request: Request):
+    """Liveness + DB reachability, for deploys and uptime checks."""
+    try:
+        async with _sessionmaker(request)() as session:
+            await session.execute(text("SELECT 1"))
+    except Exception as exc:
+        logger.warning("healthz failed: %s", exc)
+        raise HTTPException(status_code=503, detail="database unreachable") from exc
+    return {"status": "ok"}
 
 
 def _serialize(conversation: db.Conversation) -> dict[str, Any]:
@@ -64,6 +81,7 @@ def _serialize(conversation: db.Conversation) -> dict[str, Any]:
             if evaluation
             else None
         ),
+        "token_usage": conversation.token_usage,
     }
 
 
@@ -99,7 +117,11 @@ async def create_interview(
         "creating interview", extra={"resume": resume.filename, "bytes": len(data)}
     )
     try:
-        resume_markdown = rag.pdf_to_markdown(data, resume.filename or "resume.pdf")
+        # In a worker thread: the conversion is CPU-bound pure Python and
+        # would otherwise stall every other request on this event loop.
+        resume_markdown = await anyio.to_thread.run_sync(
+            rag.pdf_to_markdown, data, resume.filename or "resume.pdf"
+        )
     except Exception as exc:  # markitdown raises converter-specific errors
         raise HTTPException(status_code=400, detail=f"Could not read PDF: {exc}") from exc
     if not resume_markdown.strip():
@@ -132,17 +154,23 @@ async def create_interview(
                 "resume indexed",
                 extra={"conversation": str(conversation_id), "chunks": n_chunks},
             )
+            planner_usage = UsageMetadataCallbackHandler()
             plan = await run_planner(
                 settings,
                 resume_markdown,
                 job_offer,
                 persona=persona,
                 custom_instructions=custom_instructions,
+                usage_callback=planner_usage,
             )
         except Exception as exc:
             logger.exception("planning failed for %s", conversation_id)
             await db.set_status(session, conversation_id, "error")
             raise HTTPException(status_code=500, detail=f"Planning failed: {exc}") from exc
+
+        await db.add_token_usage(
+            session, conversation_id, "planner", summarize_usage(planner_usage.usage_metadata)
+        )
 
         logger.info(
             "interview planned",
@@ -232,22 +260,34 @@ async def get_token(request: Request, interview_id: uuid.UUID):
 
 @router.post("/interviews/{interview_id}/evaluate")
 async def evaluate_interview(request: Request, interview_id: uuid.UUID):
-    async with _sessionmaker(request)() as session:
+    sessionmaker = _sessionmaker(request)
+
+    # Session 1 (short): load everything the evaluator needs, then release
+    # the connection — the LLM call below can take minutes, and holding a
+    # transaction open across it is pure waste.
+    async with sessionmaker() as session:
         conversation = await _load_or_404(session, interview_id)
         messages = await db.get_messages(session, interview_id)
         if not messages:
             raise HTTPException(status_code=409, detail="No transcript to evaluate yet")
         milestones = await db.get_milestones(session, interview_id)
+        resume_markdown = conversation.resume_markdown
+        job_offer = conversation.job_offer
+        plan = conversation.plan or {}
+        ended_reason = conversation.ended_reason or "unknown"
+        custom_instructions = conversation.custom_instructions
 
-        logger.info(
-            "evaluating interview",
-            extra={"conversation": str(interview_id), "messages": len(messages)},
-        )
+    logger.info(
+        "evaluating interview",
+        extra={"conversation": str(interview_id), "messages": len(messages)},
+    )
+    evaluator_usage = UsageMetadataCallbackHandler()
+    try:
         result = await run_evaluator(
             settings,
-            resume_markdown=conversation.resume_markdown,
-            job_offer=conversation.job_offer,
-            plan=conversation.plan or {},
+            resume_markdown=resume_markdown,
+            job_offer=job_offer,
+            plan=plan,
             milestones=[
                 {
                     "title": m.title,
@@ -258,36 +298,62 @@ async def evaluate_interview(request: Request, interview_id: uuid.UUID):
                 for m in milestones
             ],
             transcript=[(m.role, m.content) for m in messages],
-            ended_reason=conversation.ended_reason or "unknown",
-            custom_instructions=conversation.custom_instructions,
+            ended_reason=ended_reason,
+            custom_instructions=custom_instructions,
+            usage_callback=evaluator_usage,
         )
+    except Exception as exc:
+        # Surface the failure: the frontend polls status and offers a retry
+        # (this endpoint is re-invocable) instead of spinning forever.
+        logger.exception("evaluation failed for %s", interview_id)
+        async with sessionmaker() as session:
+            await db.set_status(session, interview_id, "evaluation_failed")
+        raise HTTPException(status_code=502, detail=f"Evaluation failed: {exc}") from exc
 
-        # Idempotent: re-evaluating replaces the previous result.
-        existing = await session.get(db.Evaluation, interview_id)
-        if existing is not None:
-            await session.delete(existing)
-            await session.flush()
-        session.add(
-            db.Evaluation(
-                conversation_id=interview_id,
-                hired=result.hired,
-                score=result.score,
-                strengths=result.strengths,
-                weaknesses=result.weaknesses,
-                rationale=result.rationale,
-                ended_by=conversation.ended_reason or "unknown",
-            )
+    # Session 2 (write): upsert instead of delete+insert — two overlapping
+    # invocations (worker auto-trigger + manual retry) must not race into a
+    # duplicate-key 500; last commit wins and the result stays consistent.
+    values = {
+        "hired": result.hired,
+        "score": result.score,
+        "strengths": result.strengths,
+        "weaknesses": result.weaknesses,
+        "rationale": result.rationale,
+        "ended_by": ended_reason,
+    }
+    async with sessionmaker() as session:
+        await session.execute(
+            pg_insert(db.Evaluation)
+            .values(conversation_id=interview_id, **values)
+            .on_conflict_do_update(index_elements=["conversation_id"], set_=values)
         )
+        conversation = await _load_or_404(session, interview_id)
         conversation.status = "evaluated"
         await session.commit()
-        logger.info(
-            "interview evaluated",
-            extra={
-                "conversation": str(interview_id),
-                "hired": result.hired,
-                "score": result.score,
-            },
+        # Re-evaluations accumulate on purpose: those tokens were spent.
+        await db.add_token_usage(
+            session, interview_id, "evaluator", summarize_usage(evaluator_usage.usage_metadata)
         )
-
         await session.refresh(conversation)
-        return _serialize(conversation)
+        serialized = _serialize(conversation)
+
+    logger.info(
+        "interview evaluated",
+        extra={
+            "conversation": str(interview_id),
+            "hired": result.hired,
+            "score": result.score,
+        },
+    )
+
+    # The resume chunks only exist for the interviewer's search_resume; the
+    # evaluation is done, so drop them (PII). Best-effort: the purge job
+    # sweeps anything missed here.
+    try:
+        await rag.delete_resume_points(
+            request.app.state.qdrant, settings, [interview_id]
+        )
+    except Exception:
+        logger.exception("failed to delete resume points for %s", interview_id)
+
+    return serialized

@@ -56,6 +56,10 @@ class Settings(BaseSettings):
         alias="DATABASE_URL",
     )
 
+    # PII retention: conversations (resume, job offer, transcript) and their
+    # Qdrant points are purged once older than this. 0 disables the purge.
+    retention_days: int = Field(default=30, alias="RETENTION_DAYS")
+
     # Interview session limits and wiring.
     interview_max_minutes: int = Field(default=15, alias="INTERVIEW_MAX_MINUTES")
     # Soft cap on simultaneous interviews: each one burns LLM/STT/TTS budget,

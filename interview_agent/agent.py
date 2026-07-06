@@ -12,6 +12,7 @@ LiveKit credentials are needed for them. LLM calls go to OpenAI directly.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import time
@@ -110,14 +111,35 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
     prompt = build_interviewer_prompt(
         conversation, milestones, settings.interview_max_minutes
     )
+
+    # Interviewer token spend accumulates in memory and is flushed once at
+    # shutdown: usage is telemetry, so losing it on a hard crash beats a DB
+    # write per conversational turn.
+    interviewer_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+    def _track_usage(usage) -> None:
+        for key in interviewer_usage:
+            interviewer_usage[key] += usage.get(key, 0) or 0
+
     graph = build_interviewer_graph(
-        settings, conversation_id, sessionmaker, qdrant, embeddings, end_event, prompt
+        settings,
+        conversation_id,
+        sessionmaker,
+        qdrant,
+        embeddings,
+        end_event,
+        prompt,
+        usage_sink=_track_usage,
     )
     session = _build_session(ctx, graph)
     language = (conversation.plan or {}).get("language", "en")
 
     # --- Transcript persistence + activity tracking -------------------------
     last_activity = time.monotonic()
+    # Turn order assigned here, synchronously on the event loop: the persist
+    # tasks are fire-and-forget and their commits (which decide the
+    # autoincrement id) can land out of order under DB latency.
+    msg_seq = itertools.count()
 
     def _on_item(event: ConversationItemAddedEvent) -> None:
         # Any conversation item counts as activity for the idle watchdog.
@@ -128,12 +150,12 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
             return
         text = item.text_content
         if item.role in ("user", "assistant") and text and text.strip():
-            _spawn(_persist(item.role, text))
+            _spawn(_persist(item.role, text, next(msg_seq)))
 
-    async def _persist(role: str, content: str) -> None:
+    async def _persist(role: str, content: str, seq: int) -> None:
         try:
             async with sessionmaker() as s:
-                await db.insert_message(s, conversation_id, role, content)
+                await db.insert_message(s, conversation_id, role, content, seq=seq)
         except Exception:
             logger.exception("failed to persist transcript item")
 
@@ -224,6 +246,16 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
                     await db.set_status(s, conversation_id, "completed", "candidate_left")
         except Exception:
             logger.exception("failed to record candidate_left")
+        # Flush interviewer spend BEFORE triggering evaluation: token_usage
+        # is read-modify-write, so the writers must be sequenced.
+        if any(interviewer_usage.values()):
+            try:
+                async with sessionmaker() as s:
+                    await db.add_token_usage(
+                        s, conversation_id, "interviewer", interviewer_usage
+                    )
+            except Exception:
+                logger.exception("failed to persist interviewer token usage")
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(

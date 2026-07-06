@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from interview_agent.config import Settings
@@ -38,6 +39,7 @@ async def run_evaluator(
     transcript: list[tuple[str, str]],
     ended_reason: str,
     custom_instructions: str | None = None,
+    usage_callback: UsageMetadataCallbackHandler | None = None,
 ) -> EvaluationResult:
     llm = (
         build_chat_model(
@@ -63,8 +65,12 @@ async def run_evaluator(
     if custom_instructions:
         content += f"\n\n# Candidate's custom instructions\n\n{custom_instructions}"
 
+    # Explicit callback, same rationale as the planner: no context-manager
+    # ContextVar leak, and per-retry-attempt accumulation is real spend.
+    config = {"callbacks": [usage_callback]} if usage_callback else None
     result = await llm.ainvoke(
-        [SystemMessage(content=EVALUATOR_SYSTEM_PROMPT), HumanMessage(content=content)]
+        [SystemMessage(content=EVALUATOR_SYSTEM_PROMPT), HumanMessage(content=content)],
+        config=config,
     )
     if not isinstance(result, EvaluationResult):
         raise TypeError(

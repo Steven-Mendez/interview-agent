@@ -6,6 +6,7 @@ and planning needs the whole picture) plus the job offer.
 
 from __future__ import annotations
 
+from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from interview_agent.config import Settings
@@ -20,6 +21,7 @@ async def run_planner(
     job_offer: str,
     persona: str | None = None,
     custom_instructions: str | None = None,
+    usage_callback: UsageMetadataCallbackHandler | None = None,
 ) -> InterviewPlan:
     llm = (
         build_chat_model(
@@ -42,8 +44,14 @@ async def run_planner(
     if custom_instructions:
         content += f"\n\n# Candidate's custom instructions\n\n{custom_instructions}"
 
+    # Explicit callback (not the get_usage_metadata_callback context manager,
+    # which registers a fresh ContextVar per call and never unregisters it —
+    # a slow leak in a long-running server). Fires per retry attempt: each
+    # attempt is real spend.
+    config = {"callbacks": [usage_callback]} if usage_callback else None
     result = await llm.ainvoke(
-        [SystemMessage(content=PLANNER_SYSTEM_PROMPT), HumanMessage(content=content)]
+        [SystemMessage(content=PLANNER_SYSTEM_PROMPT), HumanMessage(content=content)],
+        config=config,
     )
     if not isinstance(result, InterviewPlan):
         raise TypeError(f"Planner returned {type(result).__name__}, expected InterviewPlan")

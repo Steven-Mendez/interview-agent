@@ -18,12 +18,21 @@ from interview_agent.config import Settings
 
 _MAX_CHUNK_CHARS = 1200
 
+# One instance for the process: construction scans converter plugins, and
+# convert() itself is stateless per call.
+_MARKITDOWN = MarkItDown()
+
 
 def pdf_to_markdown(data: bytes, filename: str = "resume.pdf") -> str:
-    """Convert an uploaded PDF to markdown text."""
+    """Convert an uploaded PDF to markdown text.
+
+    CPU-bound, pure-Python (pdfminer/pdfplumber): call it via
+    anyio.to_thread.run_sync from async code or it stalls the event loop —
+    ~0.2-1s for a normal resume, tens of seconds for a dense 10 MB PDF.
+    """
     stream = io.BytesIO(data)
     stream.name = filename  # helps markitdown pick the PDF converter
-    result = MarkItDown().convert(stream)
+    result = _MARKITDOWN.convert(stream)
     return result.text_content
 
 
@@ -143,3 +152,30 @@ async def search_resume_chunks(
         for point in response.points
         if point.payload and "text" in point.payload
     ]
+
+
+async def delete_resume_points(
+    client: AsyncQdrantClient,
+    settings: Settings,
+    conversation_ids: list[uuid.UUID],
+) -> None:
+    """Remove the resume chunks of the given conversations (PII cleanup).
+
+    Used both right after an evaluation (the chunks are only needed while
+    the interviewer can call search_resume) and by the retention purge.
+    """
+    if not conversation_ids:
+        return
+    await client.delete(
+        collection_name=settings.qdrant_collection,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="conversation_id",
+                        match=models.MatchAny(any=[str(c) for c in conversation_ids]),
+                    )
+                ]
+            )
+        ),
+    )

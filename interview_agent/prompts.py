@@ -60,6 +60,16 @@ Be fair but demanding:
   practice), evaluate relative to those goals; deviations from a standard
   interview that the candidate themselves requested are not a flaw.
 - Write strengths, weaknesses and rationale in the interview language.
+
+Scoring rubric — anchor the 0-100 score to these bands:
+- 90-100: exceptional — strong, concrete evidence on every milestone; would
+  hire without hesitation.
+- 70-89: solid hire — convincing on most milestones, minor gaps or one weak
+  area.
+- 40-69: doubtful — some real evidence but significant gaps, vagueness, or
+  too much left uncovered to be confident.
+- 0-39: no hire — little or no interview evidence of the required skills.
+`hired` should normally be true only when the score is 70 or above.
 """
 
 
@@ -67,9 +77,12 @@ def build_interviewer_prompt(
     conversation: db.Conversation, milestones: list[db.Milestone], max_minutes: int
 ) -> str:
     plan = conversation.plan or {}
+    # Numbers, not UUIDs: the voice model must echo the identifier into
+    # complete_milestone, and a mini model copies "3" far more reliably than
+    # a 36-char UUID. No DONE/PENDING markers here — this prompt is built
+    # once and would freeze them; live status arrives per turn instead.
     milestone_lines = "\n".join(
-        f"- id={m.id} [{'DONE' if m.completed else 'PENDING'}] {m.title}: {m.description}"
-        for m in milestones
+        f"{m.position + 1}. {m.title}: {m.description}" for m in milestones
     )
     focus = "\n".join(f"- {area}" for area in plan.get("focus_areas", []))
     custom = ""
@@ -99,6 +112,9 @@ Focus areas:
 ## Milestones to cover, in order
 {milestone_lines}
 
+Their live DONE/PENDING status arrives in a separate system message each
+turn — trust that message, not your memory.
+
 ## Rules
 - This is a spoken conversation. HARD LIMIT per turn: at most 2-3 short
   sentences and at most ONE question — roughly 50 spoken words. Once you have
@@ -115,11 +131,36 @@ Focus areas:
   that..."), and never restate a question after using a tool — just weave one
   detail into your single short question.
 - When a milestone's description is satisfied, call complete_milestone with its
-  id and a one-line note of what the candidate showed. Do not announce this.
+  number and a one-line note of what the candidate showed. Do not announce this.
+- Tools are invoked ONLY through the function-calling mechanism. NEVER write
+  JSON, tool names or tool arguments in your reply — everything you write is
+  spoken aloud to the candidate.
 - The interview has a hard cap of about {max_minutes} minutes. If told to wrap
   up, close the remaining milestones quickly or skip to the end.
 - When every milestone is DONE (or you are told to wrap up and have nothing
-  left to ask), call end_interview, then say a brief goodbye and thank the
-  candidate. Do NOT reveal any evaluation, score or hiring decision.
+  left to ask), call end_interview and say NOTHING else — do not add your own
+  goodbye; the farewell is delivered automatically after the tool call. Never
+  reveal any evaluation, score or hiring decision.
 - Do not invent facts about the company or role beyond the job offer.{custom}
+"""
+
+
+def build_milestone_status(milestones: list[db.Milestone]) -> str:
+    """The per-turn live-status system message.
+
+    The graph runs with no checkpointer and LiveKit's adapter rebuilds its
+    input from transcript text alone, so tool results — and therefore
+    milestone progress — never survive between turns. This message is the
+    model's only reliable view of what is already covered.
+    """
+    lines = "\n".join(
+        f"{m.position + 1}. [{'DONE' if m.completed else 'PENDING'}] {m.title}"
+        for m in milestones
+    )
+    return f"""\
+## Live milestone status (refreshed this turn)
+{lines}
+
+Work toward the lowest-numbered PENDING milestone. When one is covered, call
+complete_milestone with its number. When ALL are DONE, call end_interview.
 """

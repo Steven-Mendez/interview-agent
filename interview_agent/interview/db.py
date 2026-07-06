@@ -19,6 +19,7 @@ from sqlalchemy import (
     Index,
     Integer,
     Text,
+    delete,
     func,
     select,
     update,
@@ -48,7 +49,8 @@ class Conversation(Base):
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now()
     )
-    # created | planned | interviewing | completed | evaluated | error
+    # created | planned | interviewing | completed | evaluation_failed
+    # | evaluated | error
     status: Mapped[str] = mapped_column(Text, default="created", server_default="created")
     job_offer: Mapped[str] = mapped_column(Text)
     resume_markdown: Mapped[str] = mapped_column(Text)
@@ -61,6 +63,10 @@ class Conversation(Base):
     plan: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     # plan_complete | timeout | candidate_left | idle_timeout
     ended_reason: Mapped[str | None] = mapped_column(Text)
+    # Per-component LLM spend, accumulated over the conversation's lifecycle:
+    # {"planner" | "interviewer" | "evaluator":
+    #   {"input_tokens": int, "output_tokens": int, "total_tokens": int}}
+    token_usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
     # lazy="selectin": async sessions cannot lazy-load on attribute access
     # (MissingGreenlet), so both relationships load eagerly with the parent.
@@ -103,6 +109,11 @@ class Message(Base):
     )
     role: Mapped[str] = mapped_column(Text)  # user | assistant
     content: Mapped[str] = mapped_column(Text)
+    # Turn order, assigned synchronously in the worker's event handler. The
+    # autoincrement id reflects COMMIT order, and the persist tasks are
+    # fire-and-forget — under latency two inserts can commit out of order.
+    # Nullable for rows that predate the column; get_messages falls back to id.
+    seq: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
@@ -161,15 +172,23 @@ async def get_messages(
     result = await session.scalars(
         select(Message)
         .where(Message.conversation_id == conversation_id)
-        .order_by(Message.id)
+        # seq is the true turn order; id breaks ties and covers any row
+        # without one (the migration backfills seq from id order).
+        .order_by(Message.seq, Message.id)
     )
     return list(result)
 
 
 async def insert_message(
-    session: AsyncSession, conversation_id: uuid.UUID, role: str, content: str
+    session: AsyncSession,
+    conversation_id: uuid.UUID,
+    role: str,
+    content: str,
+    seq: int | None = None,
 ) -> None:
-    session.add(Message(conversation_id=conversation_id, role=role, content=content))
+    session.add(
+        Message(conversation_id=conversation_id, role=role, content=content, seq=seq)
+    )
     await session.commit()
 
 
@@ -216,3 +235,48 @@ async def complete_milestone(
     milestone.notes = notes
     await session.commit()
     return milestone
+
+
+async def add_token_usage(
+    session: AsyncSession,
+    conversation_id: uuid.UUID,
+    component: str,
+    usage: dict[str, int],
+) -> None:
+    """Merge one component's token counts into conversations.token_usage.
+
+    Read-modify-write without a lock is safe here: the three writers never
+    run concurrently for one conversation — planning precedes the interview,
+    and the worker flushes interviewer usage before triggering evaluation.
+    """
+    conversation = await session.get(Conversation, conversation_id)
+    if conversation is None:
+        return
+    current = dict(conversation.token_usage or {})
+    existing = current.get(component, {})
+    current[component] = {
+        key: int(existing.get(key, 0)) + int(usage.get(key, 0))
+        for key in ("input_tokens", "output_tokens", "total_tokens")
+    }
+    # Reassign the whole dict: JSONB columns have no mutation tracking, so
+    # in-place updates would never be flushed (same pattern as `.plan`).
+    conversation.token_usage = current
+    await session.commit()
+
+
+async def delete_conversations_older_than(
+    session: AsyncSession, days: int
+) -> list[uuid.UUID]:
+    """Purge conversations (and, via CASCADE, their milestones, messages and
+    evaluations) older than `days`. Returns the deleted ids so the caller can
+    clean up the matching Qdrant points."""
+    cutoff = func.now() - timedelta(days=days)
+    ids = list(
+        await session.scalars(
+            select(Conversation.id).where(Conversation.created_at < cutoff)
+        )
+    )
+    if ids:
+        await session.execute(delete(Conversation).where(Conversation.id.in_(ids)))
+        await session.commit()
+    return ids

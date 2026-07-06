@@ -37,7 +37,7 @@ section {
 
 label { display: block; margin-bottom: 1rem; font-weight: 600; }
 
-input[type="file"], input[type="text"], textarea {
+input[type="file"], input[type="text"], textarea, select {
   display: block;
   width: 100%;
   margin-top: 0.4rem;
@@ -46,7 +46,18 @@ input[type="file"], input[type="text"], textarea {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 0.5rem;
+  background: #fff;
 }
+
+.view-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 1rem;
+}
+.view-header button { flex-shrink: 0; }
+
+.form-actions { display: flex; gap: 0.6rem; }
 
 button {
   font: inherit;

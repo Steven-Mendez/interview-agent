@@ -15,7 +15,7 @@ let interviewEnded = false;
 // ---- View switching ---------------------------------------------------------
 
 function show(view) {
-  for (const id of ["upload-view", "session-view"]) {
+  for (const id of ["upload-view", "settings-view", "session-view"]) {
     $(id).hidden = id !== view;
   }
 }
@@ -24,6 +24,86 @@ function showPanel(panel) {
   $("interview-panel").hidden = panel !== "interview";
   $("results-panel").hidden = panel !== "results";
 }
+
+// ---- Settings ---------------------------------------------------------------
+
+// Voice catalog from GET /settings: { en: [{id, label, gender}], es: [...] }.
+let voiceCatalog = {};
+
+const GENDER_LABELS = {
+  en: { female: "female", male: "male" },
+  es: { female: "femenina", male: "masculina" },
+};
+
+function renderVoiceOptions(language, selected) {
+  const select = $("settings-voice");
+  select.innerHTML = "";
+  for (const voice of voiceCatalog[language] ?? []) {
+    const option = document.createElement("option");
+    option.value = voice.id;
+    const gender = GENDER_LABELS[language]?.[voice.gender] ?? voice.gender;
+    option.textContent = `${voice.label} (${gender})`;
+    option.selected = voice.id === selected;
+    select.appendChild(option);
+  }
+}
+
+$("open-settings-btn").addEventListener("click", async () => {
+  const button = $("open-settings-btn");
+  button.disabled = true;
+  try {
+    const res = await fetch("/settings");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const settings = await res.json();
+    voiceCatalog = settings.voices;
+    const form = $("settings-form");
+    form.elements.agent_name.value = settings.agent_name;
+    form.elements.language.value = settings.language;
+    form.elements.persona.value = settings.persona ?? "";
+    form.elements.custom_instructions.value = settings.custom_instructions ?? "";
+    renderVoiceOptions(settings.language, settings.voice);
+    $("settings-status").textContent = "";
+    show("settings-view");
+  } catch (err) {
+    console.error("[app] could not load settings:", err);
+    $("upload-status").textContent = `Error loading settings: ${err.message}`;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+// Switching language swaps the voice options to that language's pair.
+$("settings-language").addEventListener("change", (event) => {
+  renderVoiceOptions(event.target.value);
+});
+
+$("settings-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("settings-save-btn");
+  button.disabled = true;
+  $("settings-status").textContent = "Saving…";
+  try {
+    const res = await fetch("/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(Object.fromEntries(new FormData(event.target))),
+    });
+    if (!res.ok) {
+      const detail = (await res.json().catch(() => ({}))).detail;
+      throw new Error(typeof detail === "string" ? detail : `HTTP ${res.status}`);
+    }
+    log("settings saved");
+    $("settings-status").textContent = "";
+    show("upload-view");
+  } catch (err) {
+    console.error("[app] could not save settings:", err);
+    $("settings-status").textContent = `Error: ${err.message}`;
+  } finally {
+    button.disabled = false;
+  }
+});
+
+$("settings-back-btn").addEventListener("click", () => show("upload-view"));
 
 // ---- Polling ----------------------------------------------------------------
 

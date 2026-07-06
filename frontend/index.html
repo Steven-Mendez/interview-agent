@@ -14,11 +14,43 @@
 
     <!-- 1: Upload -->
     <section id="upload-view">
-      <h2>1 · Set up your interview</h2>
+      <div class="view-header">
+        <h2>1 · Set up your interview</h2>
+        <button type="button" id="open-settings-btn" class="secondary">⚙ Settings</button>
+      </div>
       <form id="upload-form">
         <label>
           Resume (PDF)
           <input type="file" name="resume" accept="application/pdf" required />
+        </label>
+        <label>
+          Job offer
+          <textarea name="job_offer" rows="8" required
+            placeholder="Paste the job offer text here..."></textarea>
+        </label>
+        <button type="submit" id="upload-btn">Create interview</button>
+        <p id="upload-status" class="muted"></p>
+      </form>
+    </section>
+
+    <!-- Settings: global agent configuration -->
+    <section id="settings-view" hidden>
+      <h2>Settings</h2>
+      <form id="settings-form">
+        <label>
+          Agent name
+          <input type="text" name="agent_name" required placeholder="Emma" />
+        </label>
+        <label>
+          Language
+          <select name="language" id="settings-language">
+            <option value="en">English</option>
+            <option value="es">Español</option>
+          </select>
+        </label>
+        <label>
+          Voice
+          <select name="voice" id="settings-voice"></select>
         </label>
         <label>
           Interviewer persona <span class="muted">(optional)</span>
@@ -26,17 +58,15 @@
             placeholder="e.g. a strict FAANG engineering manager who digs deep" />
         </label>
         <label>
-          Job offer
-          <textarea name="job_offer" rows="8" required
-            placeholder="Paste the job offer text here..."></textarea>
-        </label>
-        <label>
           Custom instructions <span class="muted">(optional)</span>
           <textarea name="custom_instructions" rows="3"
             placeholder="e.g. I want to practice system design questions; max 5 questions"></textarea>
         </label>
-        <button type="submit" id="upload-btn">Create interview</button>
-        <p id="upload-status" class="muted"></p>
+        <div class="form-actions">
+          <button type="submit" id="settings-save-btn">Save</button>
+          <button type="button" id="settings-back-btn" class="secondary">Back</button>
+        </div>
+        <p id="settings-status" class="muted"></p>
       </form>
     </section>
 

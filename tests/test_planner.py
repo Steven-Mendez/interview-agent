@@ -11,7 +11,6 @@ from interview_agent.interview.models import InterviewPlan, MilestoneSpec
 def _plan() -> InterviewPlan:
     return InterviewPlan(
         persona="Laura, engineering manager, warm but rigorous",
-        language="en",
         summary="Solid backend candidate.",
         focus_areas=["Kubernetes", "SQL"],
         milestones=[
@@ -55,18 +54,21 @@ async def test_run_planner_returns_plan_and_includes_optional_inputs(
         settings,
         resume_markdown="# Resume\nPython dev.",
         job_offer="Backend engineer at ACME.",
+        language="es",
+        agent_name="Alex",
         persona="a strict FAANG manager",
         custom_instructions="focus on system design",
     )
 
     assert isinstance(result, InterviewPlan)
-    assert result.language == "en"
     # System + human message, with every input woven into the human content.
     system, human = fake.messages
     assert "recruiter" in system.content
     for needle in (
         "Backend engineer at ACME.",
         "Python dev.",
+        "'es'",
+        "Alex",
         "a strict FAANG manager",
         "focus on system design",
     ):
@@ -77,7 +79,9 @@ async def test_run_planner_omits_optional_sections_when_absent(settings, monkeyp
     fake = _FakeChain(_plan())
     monkeypatch.setattr(planner, "build_chat_model", lambda *a, **k: fake)
 
-    await planner.run_planner(settings, resume_markdown="cv", job_offer="offer")
+    await planner.run_planner(
+        settings, resume_markdown="cv", job_offer="offer", language="en", agent_name="Alex"
+    )
 
     _, human = fake.messages
     assert "desired interviewer persona" not in human.content
@@ -89,4 +93,6 @@ async def test_run_planner_rejects_non_plan_output(settings, monkeypatch):
     monkeypatch.setattr(planner, "build_chat_model", lambda *a, **k: fake)
 
     with pytest.raises(TypeError, match="expected InterviewPlan"):
-        await planner.run_planner(settings, resume_markdown="cv", job_offer="offer")
+        await planner.run_planner(
+            settings, resume_markdown="cv", job_offer="offer", language="en", agent_name="Alex"
+        )

@@ -16,6 +16,7 @@ import anyio.to_thread
 from fastapi import APIRouter, Form, HTTPException, Request, UploadFile
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from livekit import api
+from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +26,13 @@ from interview_agent.interview import db, rag
 from interview_agent.interview.evaluator import run_evaluator
 from interview_agent.interview.planner import run_planner
 from interview_agent.llm import summarize_usage
+from interview_agent.voices import (
+    DEFAULT_AGENT_NAME,
+    DEFAULT_VOICE,
+    SUPPORTED_LANGUAGES,
+    VOICES,
+    voices_by_language,
+)
 
 logger = logging.getLogger("interview_agent.server")
 
@@ -49,6 +57,82 @@ async def healthz(request: Request):
         logger.warning("healthz failed: %s", exc)
         raise HTTPException(status_code=503, detail="database unreachable") from exc
     return {"status": "ok"}
+
+
+# ---- Settings ---------------------------------------------------------------
+
+
+class SettingsUpdate(BaseModel):
+    """PUT /settings body: the global agent configuration."""
+
+    agent_name: str = DEFAULT_AGENT_NAME
+    language: str
+    voice: str
+    persona: str | None = None
+    custom_instructions: str | None = None
+
+    @field_validator("agent_name")
+    @classmethod
+    def _default_name(cls, value: str) -> str:
+        return value.strip() or DEFAULT_AGENT_NAME
+
+    @field_validator("persona", "custom_instructions")
+    @classmethod
+    def _empty_to_none(cls, value: str | None) -> str | None:
+        # Empty form fields arrive as "" — normalize to NULL, same convention
+        # as the old upload form.
+        return (value or "").strip() or None
+
+    @field_validator("language")
+    @classmethod
+    def _known_language(cls, value: str) -> str:
+        if value not in SUPPORTED_LANGUAGES:
+            raise ValueError(f"language must be one of {SUPPORTED_LANGUAGES}")
+        return value
+
+    @model_validator(mode="after")
+    def _voice_matches_language(self) -> SettingsUpdate:
+        voice = VOICES.get(self.voice)
+        if voice is None:
+            raise ValueError(f"unknown voice '{self.voice}'")
+        if voice["language"] != self.language:
+            raise ValueError(
+                f"voice '{self.voice}' is not available for language '{self.language}'"
+            )
+        return self
+
+
+def _serialize_settings(app_settings: db.AppSettings) -> dict[str, Any]:
+    return {
+        "agent_name": app_settings.agent_name,
+        "language": app_settings.language,
+        "voice": app_settings.voice,
+        "persona": app_settings.persona,
+        "custom_instructions": app_settings.custom_instructions,
+        # The catalog rides along so one fetch renders the whole screen.
+        "voices": voices_by_language(),
+    }
+
+
+@router.get("/settings")
+async def get_settings(request: Request):
+    async with _sessionmaker(request)() as session:
+        app_settings = await db.get_app_settings(session)
+        return _serialize_settings(app_settings)
+
+
+@router.put("/settings")
+async def update_settings(request: Request, body: SettingsUpdate):
+    async with _sessionmaker(request)() as session:
+        app_settings = await db.upsert_app_settings(session, body.model_dump())
+        logger.info(
+            "settings updated",
+            extra={"language": app_settings.language, "voice": app_settings.voice},
+        )
+        return _serialize_settings(app_settings)
+
+
+# ---- Interviews ---------------------------------------------------------------
 
 
 def _serialize(conversation: db.Conversation) -> dict[str, Any]:
@@ -97,16 +181,11 @@ async def create_interview(
     request: Request,
     resume: UploadFile,
     job_offer: str = Form(),
-    persona: str | None = Form(default=None),
-    custom_instructions: str | None = Form(default=None),
 ):
     if not (resume.filename or "").lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="resume must be a PDF file")
     if not job_offer.strip():
         raise HTTPException(status_code=400, detail="job_offer must not be empty")
-    # Empty form fields arrive as "" — normalize to NULL.
-    persona = (persona or "").strip() or None
-    custom_instructions = (custom_instructions or "").strip() or None
 
     # Read one byte past the cap: exactly-at-cap passes, anything larger 413s.
     data = await resume.read(_MAX_RESUME_BYTES + 1)
@@ -129,6 +208,17 @@ async def create_interview(
 
     conversation_id = uuid.uuid4()
     async with _sessionmaker(request)() as session:
+        # Snapshot the global agent settings NOW: the interview keeps this
+        # persona/language/voice even if the settings change later.
+        app_settings = await db.get_app_settings(session)
+        voice_cfg = VOICES.get(app_settings.voice, VOICES[DEFAULT_VOICE])
+        agent_settings = {
+            "agent_name": app_settings.agent_name,
+            "language": app_settings.language,
+            "voice": app_settings.voice,
+            "tts_model": voice_cfg["tts_model"],
+            "tts_voice": voice_cfg["tts_voice"],
+        }
         session.add(
             db.Conversation(
                 id=conversation_id,
@@ -136,8 +226,9 @@ async def create_interview(
                 job_offer=job_offer,
                 resume_markdown=resume_markdown,
                 resume_filename=resume.filename,
-                persona=persona,
-                custom_instructions=custom_instructions,
+                persona=app_settings.persona,
+                custom_instructions=app_settings.custom_instructions,
+                agent_settings=agent_settings,
             )
         )
         await session.commit()
@@ -159,8 +250,10 @@ async def create_interview(
                 settings,
                 resume_markdown,
                 job_offer,
-                persona=persona,
-                custom_instructions=custom_instructions,
+                language=app_settings.language,
+                agent_name=app_settings.agent_name,
+                persona=app_settings.persona,
+                custom_instructions=app_settings.custom_instructions,
                 usage_callback=planner_usage,
             )
         except Exception as exc:
@@ -176,12 +269,17 @@ async def create_interview(
             "interview planned",
             extra={
                 "conversation": str(conversation_id),
-                "language": plan.language,
+                "language": app_settings.language,
                 "milestones": len(plan.milestones),
             },
         )
         conversation = await _load_or_404(session, conversation_id)
-        conversation.plan = plan.model_dump(exclude={"milestones"})
+        # The language is injected server-side (the planner no longer decides
+        # it), keeping the plan JSON shape every downstream reader expects.
+        conversation.plan = {
+            **plan.model_dump(exclude={"milestones"}),
+            "language": app_settings.language,
+        }
         conversation.status = "planned"
         for i, spec in enumerate(plan.milestones):
             session.add(

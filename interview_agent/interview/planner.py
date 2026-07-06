@@ -19,6 +19,8 @@ async def run_planner(
     settings: Settings,
     resume_markdown: str,
     job_offer: str,
+    language: str,
+    agent_name: str,
     persona: str | None = None,
     custom_instructions: str | None = None,
     usage_callback: UsageMetadataCallbackHandler | None = None,
@@ -37,7 +39,9 @@ async def run_planner(
 
     content = (
         f"# Job offer\n\n{job_offer}\n\n"
-        f"# Candidate resume (markdown)\n\n{resume_markdown}"
+        f"# Candidate resume (markdown)\n\n{resume_markdown}\n\n"
+        f"# Interview language (mandatory, ISO 639-1)\n\n'{language}'\n\n"
+        f"# Interviewer's name (mandatory)\n\n{agent_name}"
     )
     if persona:
         content += f"\n\n# Candidate's desired interviewer persona\n\n{persona}"

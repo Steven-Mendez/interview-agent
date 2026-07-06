@@ -72,19 +72,12 @@ class Settings(BaseSettings):
     # Where the worker reaches the FastAPI app to auto-trigger evaluation.
     app_base_url: str = Field(default="http://localhost:8000", alias="APP_BASE_URL")
 
-    # STT via LiveKit Inference. Empty STT_LANGUAGE lets the multilingual model
-    # auto-detect the spoken language per utterance; pin a code (e.g. "es") if
-    # transcriptions come out garbled in your language.
+    # STT via LiveKit Inference. The transcription language is pinned to the
+    # interview language chosen in the in-app Settings screen; the TTS model
+    # and voice come from the same screen (see interview_agent/voices.py).
     stt_model: str = Field(
         default="assemblyai/universal-streaming-multilingual", alias="STT_MODEL"
     )
-    stt_language: str = Field(default="", alias="STT_LANGUAGE")
-
-    # TTS via LiveKit Inference. Default is xAI "Eve x1", multilingual with
-    # language auto-detection (other xAI voices: ara, leo, rex). Cartesia
-    # Sonic 3 is a faster-to-start alternative (~0.2s vs ~0.7s ttfb).
-    tts_model: str = Field(default="xai/tts-1", alias="TTS_MODEL")
-    tts_voice: str = Field(default="eve", alias="TTS_VOICE")
 
     # LiveKit: key/secret auth the Inference gateway (STT/TTS); the server URL
     # is where the worker and the browser join interview rooms.

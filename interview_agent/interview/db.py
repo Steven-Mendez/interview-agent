@@ -14,6 +14,7 @@ from typing import Any, ClassVar
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Index,
@@ -25,6 +26,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -32,6 +34,8 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+from interview_agent.voices import DEFAULT_AGENT_NAME, DEFAULT_LANGUAGE, DEFAULT_VOICE
 
 
 class Base(DeclarativeBase):
@@ -61,6 +65,12 @@ class Conversation(Base):
     custom_instructions: Mapped[str | None] = mapped_column(Text)
     # Planner output minus milestones: persona, language, summary, focus_areas.
     plan: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # Snapshot of the app settings taken at creation time, with the voice
+    # already resolved to a concrete tts_model/tts_voice pair: {"agent_name",
+    # "language", "voice", "tts_model", "tts_voice"}. Editing the settings
+    # never affects an interview already planned. NULL on legacy rows — the
+    # worker falls back to the catalog defaults.
+    agent_settings: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     # plan_complete | timeout | candidate_left | idle_timeout
     ended_reason: Mapped[str | None] = mapped_column(Text)
     # Per-component LLM spend, accumulated over the conversation's lifecycle:
@@ -132,6 +142,35 @@ class Evaluation(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     conversation: Mapped[Conversation] = relationship(back_populates="evaluation")
+
+
+class AppSettings(Base):
+    """Global agent configuration edited from the Settings screen.
+
+    A singleton row (id = 1, enforced by the check constraint): the app has
+    exactly one agent to configure. `voice` holds a catalog KEY from
+    interview_agent.voices; the concrete TTS model/voice is resolved when an
+    interview is created.
+    """
+
+    __tablename__ = "app_settings"
+    __table_args__ = (CheckConstraint("id = 1", name="app_settings_singleton"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    agent_name: Mapped[str] = mapped_column(
+        Text, default=DEFAULT_AGENT_NAME, server_default=DEFAULT_AGENT_NAME
+    )
+    language: Mapped[str] = mapped_column(
+        Text, default=DEFAULT_LANGUAGE, server_default=DEFAULT_LANGUAGE
+    )
+    voice: Mapped[str] = mapped_column(
+        Text, default=DEFAULT_VOICE, server_default=DEFAULT_VOICE
+    )
+    persona: Mapped[str | None] = mapped_column(Text)
+    custom_instructions: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(
+        server_default=func.now(), onupdate=func.now()
+    )
 
 
 # --- Engine / session helpers -------------------------------------------------
@@ -262,6 +301,33 @@ async def add_token_usage(
     # in-place updates would never be flushed (same pattern as `.plan`).
     conversation.token_usage = current
     await session.commit()
+
+
+async def get_app_settings(session: AsyncSession) -> AppSettings:
+    """The singleton settings row, or an unsaved default instance if it is
+    missing (fresh test schema without the migration seed, or a hand-deleted
+    row) — callers always get usable values."""
+    settings_row = await session.get(AppSettings, 1)
+    if settings_row is not None:
+        return settings_row
+    # Column defaults only apply on INSERT — set them explicitly here.
+    return AppSettings(
+        id=1,
+        agent_name=DEFAULT_AGENT_NAME,
+        language=DEFAULT_LANGUAGE,
+        voice=DEFAULT_VOICE,
+    )
+
+
+async def upsert_app_settings(session: AsyncSession, values: dict[str, Any]) -> AppSettings:
+    """Write the singleton settings row (insert-or-update, race-safe)."""
+    await session.execute(
+        pg_insert(AppSettings)
+        .values(id=1, **values)
+        .on_conflict_do_update(index_elements=["id"], set_=values)
+    )
+    await session.commit()
+    return await get_app_settings(session)
 
 
 async def delete_conversations_older_than(

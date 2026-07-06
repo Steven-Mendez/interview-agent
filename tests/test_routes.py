@@ -15,7 +15,7 @@ import uuid
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -32,7 +32,6 @@ TEST_DATABASE_URL = os.environ.get(
 def _plan() -> InterviewPlan:
     return InterviewPlan(
         persona="Laura, engineering manager",
-        language="en",
         summary="Solid candidate.",
         focus_areas=["Kubernetes"],
         milestones=[MilestoneSpec(title=f"M{i}", description="Probe it.") for i in range(4)],
@@ -71,6 +70,10 @@ async def client_and_sessionmaker(monkeypatch):
     await _ensure_test_database()
     engine, sessionmaker = db.create_engine_and_sessionmaker(TEST_DATABASE_URL)
     async with engine.begin() as conn:
+        # The test database persists across runs and create_all never ALTERs
+        # an existing table — rebuild from scratch so schema changes (new
+        # columns/tables) land, and every test starts from a clean slate.
+        await conn.run_sync(db.Base.metadata.drop_all)
         await conn.run_sync(db.Base.metadata.create_all)
 
     # The routes only touch qdrant through rag helpers — stub those instead
@@ -145,6 +148,59 @@ async def _seed_finished_interview(sessionmaker) -> uuid.UUID:
     return conversation_id
 
 
+# ---- /settings ---------------------------------------------------------------
+
+
+async def test_get_settings_returns_defaults_and_catalog(client_and_sessionmaker):
+    client, _ = client_and_sessionmaker
+    res = await client.get("/settings")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["agent_name"] == "Emma"
+    assert body["language"] == "en"
+    assert body["voice"] == "en_female"
+    assert body["persona"] is None
+    # Two curated voices per language: one feminine, one masculine.
+    for language in ("en", "es"):
+        genders = {v["gender"] for v in body["voices"][language]}
+        assert genders == {"female", "male"}
+
+
+async def test_put_settings_persists_and_echoes(client_and_sessionmaker):
+    client, _ = client_and_sessionmaker
+    payload = {
+        "agent_name": "Sam",
+        "language": "es",
+        "voice": "es_male",
+        "persona": "una manager exigente",
+        "custom_instructions": "",
+    }
+    res = await client.put("/settings", json=payload)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["agent_name"] == "Sam"
+    assert body["voice"] == "es_male"
+    assert body["custom_instructions"] is None  # "" normalized to NULL
+
+    # Persisted: a fresh GET returns the same values.
+    body = (await client.get("/settings")).json()
+    assert body["language"] == "es"
+    assert body["persona"] == "una manager exigente"
+
+
+async def test_put_settings_rejects_voice_language_mismatch(client_and_sessionmaker):
+    client, _ = client_and_sessionmaker
+    res = await client.put(
+        "/settings", json={"agent_name": "Alex", "language": "en", "voice": "es_male"}
+    )
+    assert res.status_code == 422
+
+    res = await client.put(
+        "/settings", json={"agent_name": "Alex", "language": "fr", "voice": "en_female"}
+    )
+    assert res.status_code == 422
+
+
 # ---- /interviews ------------------------------------------------------------
 
 
@@ -155,9 +211,42 @@ async def test_create_interview_happy_path(client_and_sessionmaker):
     body = res.json()
     assert body["status"] == "planned"
     assert len(body["milestones"]) == 4
-    assert body["plan"]["language"] == "en"
+    assert body["plan"]["language"] == "en"  # injected from the settings
     assert "milestones" not in body["plan"]  # stored separately
     assert "planner" in body["token_usage"]
+
+
+async def test_create_interview_snapshots_settings(client_and_sessionmaker):
+    client, sessionmaker = client_and_sessionmaker
+    res = await client.put(
+        "/settings",
+        json={
+            "agent_name": "Sam",
+            "language": "es",
+            "voice": "es_female",
+            "persona": "una manager exigente",
+            "custom_instructions": "máximo 5 preguntas",
+        },
+    )
+    assert res.status_code == 200
+
+    job_offer = f"offer-{uuid.uuid4()}"  # unique marker to find the row
+    res = await client.post("/interviews", **_upload(job_offer))
+    assert res.status_code == 200
+    assert res.json()["plan"]["language"] == "es"
+
+    async with sessionmaker() as session:
+        row = await session.scalar(
+            select(db.Conversation).where(db.Conversation.job_offer == job_offer)
+        )
+    assert row.persona == "una manager exigente"
+    assert row.custom_instructions == "máximo 5 preguntas"
+    snapshot = row.agent_settings
+    assert snapshot["agent_name"] == "Sam"
+    assert snapshot["language"] == "es"
+    assert snapshot["voice"] == "es_female"
+    assert snapshot["tts_model"] == "cartesia/sonic-3"
+    assert snapshot["tts_voice"]  # resolved, not just the catalog key
 
 
 async def test_create_interview_rejects_non_pdf(client_and_sessionmaker):

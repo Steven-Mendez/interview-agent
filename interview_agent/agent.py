@@ -5,8 +5,9 @@ worker loads the plan from Postgres, runs the per-session interviewer graph,
 persists the transcript, enforces the time cap and auto-triggers the
 evaluation on shutdown.
 
-STT (AssemblyAI) and TTS (xAI) run through LiveKit Inference, so only
-LiveKit credentials are needed for them. LLM calls go to OpenAI directly.
+STT (AssemblyAI) and TTS (Cartesia/Inworld, per the voice chosen in the
+Settings screen) run through LiveKit Inference, so only LiveKit credentials
+are needed for them. LLM calls go to OpenAI directly.
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from interview_agent.config import settings
 from interview_agent.interview import db, rag
 from interview_agent.interview.interviewer_graph import build_interviewer_graph
 from interview_agent.prompts import build_interviewer_prompt
+from interview_agent.voices import DEFAULT_LANGUAGE, DEFAULT_VOICE, VOICES
 
 logger = logging.getLogger("interview_agent")
 
@@ -67,18 +69,25 @@ def _conversation_id_from_job(ctx: JobContext) -> uuid.UUID | None:
     return None
 
 
-def _build_session(ctx: JobContext, graph) -> AgentSession:
+def _build_session(ctx: JobContext, graph, agent_settings: dict | None) -> AgentSession:
+    # The settings snapshot taken when the interview was created; legacy rows
+    # (NULL) fall back to the catalog defaults.
+    cfg = agent_settings or {}
+    default_voice = VOICES[DEFAULT_VOICE]
+    language = cfg.get("language", DEFAULT_LANGUAGE)
     return AgentSession(
-        stt=inference.STT(
-            model=settings.stt_model,
-            # Empty STT_LANGUAGE falls back to per-utterance auto-detection.
-            language=settings.stt_language or None,
-        ),
+        # STT is pinned to the configured interview language (no per-utterance
+        # auto-detection): everything optimizes for that language.
+        stt=inference.STT(model=settings.stt_model, language=language),
         # The "LLM" is a LangGraph workflow, adapted for LiveKit. "custom"
         # stream mode: only text the graph writes via get_stream_writer() is
         # spoken — tool outputs never leak into TTS (see graph chat nodes).
         llm=langchain.LLMAdapter(graph=graph, stream_mode="custom"),
-        tts=inference.TTS(model=settings.tts_model, voice=settings.tts_voice),
+        tts=inference.TTS(
+            model=cfg.get("tts_model", default_voice["tts_model"]),
+            voice=cfg.get("tts_voice", default_voice["tts_voice"]),
+            language=language,
+        ),
         vad=ctx.proc.userdata["vad"],
         # Audio end-of-turn detector: `v1` (cloud, via LiveKit Inference) in
         # dev/hosted mode, `v1-mini` (local, weights ship inside the
@@ -134,7 +143,7 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
         prompt,
         usage_sink=_track_usage,
     )
-    session = _build_session(ctx, graph)
+    session = _build_session(ctx, graph, conversation.agent_settings)
     language = (conversation.plan or {}).get("language", "en")
 
     # --- Transcript persistence + activity tracking -------------------------

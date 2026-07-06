@@ -23,12 +23,6 @@ class InterviewPlan(BaseModel):
             "e.g. 'Laura, engineering manager, warm but rigorous'."
         )
     )
-    language: str = Field(
-        description=(
-            "ISO 639-1 code of the language the interview must be conducted "
-            "in, inferred from the job offer (e.g. 'es', 'en')."
-        )
-    )
     summary: str = Field(
         description="2-3 sentence summary of the candidate/role fit to guide the interview."
     )

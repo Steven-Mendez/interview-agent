@@ -14,6 +14,8 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from qdrant_client import AsyncQdrantClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import Response
 
 from interview_agent.config import settings
 from interview_agent.interview import db, rag
@@ -21,7 +23,28 @@ from interview_agent.interview.db import create_engine_and_sessionmaker
 from interview_agent.logging_config import setup_file_logging
 from interview_agent.server.routes import router
 
-_FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_FRONTEND_DIR = _REPO_ROOT / "web" / "dist" / "client"
+
+_SHELL = "index.html"
+
+
+class SpaStaticFiles(StaticFiles):
+    """Serves the built SPA, falling back to the shell for unknown paths.
+
+    Client-side routes (e.g. `/interviews/<uuid>`) aren't real files — a
+    direct load or refresh must still get the app shell instead of a 404, so
+    the router can take over and render the right view.
+    """
+
+    async def get_response(self, path: str, scope) -> Response:
+        try:
+            return await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code == 404:
+                return await super().get_response(_SHELL, scope)
+            raise
+
 
 _PURGE_INTERVAL_SECONDS = 24 * 60 * 60
 
@@ -93,6 +116,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="interview-agent", lifespan=lifespan)
-app.include_router(router)
-# Mounted last so /interviews/* wins over static files.
-app.mount("/", StaticFiles(directory=_FRONTEND_DIR, html=True), name="frontend")
+app.include_router(router, prefix="/api")
+# Mounted last so /api/* wins over static files. SpaStaticFiles falls back to
+# the shell for client-side routes so refreshes/deep links keep working.
+# Backend-only dev without a `cd web && pnpm build` still gets the API.
+if _FRONTEND_DIR.is_dir():
+    app.mount(
+        "/", SpaStaticFiles(directory=_FRONTEND_DIR, html=True), name="frontend"
+    )
+else:
+    logger.warning("web/dist/client missing; serving API only (run: cd web && pnpm build)")

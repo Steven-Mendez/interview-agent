@@ -53,3 +53,8 @@ Thumbs.db
 *.wav
 *.mp3
 recordings/
+
+# Node / web frontend (web/dist/ already covered by dist/ above)
+node_modules/
+web/.tanstack/
+web/.output/

@@ -19,7 +19,8 @@ Three agents, one flow:
 - **OpenAI** — LLMs and embeddings
 - **Qdrant** — vector search over the resume
 - **PostgreSQL** — conversations, milestones, transcripts, evaluations
-- **FastAPI** — API + plain HTML/CSS/JS frontend
+- **FastAPI** — the API, under `/api` (also serves the built frontend)
+- **TanStack Start + shadcn/ui** — React frontend in `web/`, built as a SPA
 
 ## Requirements
 
@@ -42,7 +43,7 @@ The **Settings** screen configures the agent globally: its name, the interview l
 
 ## Development (local)
 
-To iterate with hot reload, run only the databases in Docker and the app with [uv](https://docs.astral.sh/uv/) (Python 3.12+):
+To iterate with hot reload, run only the databases in Docker and the app with [uv](https://docs.astral.sh/uv/) (Python 3.12+) and [pnpm](https://pnpm.io/) (Node 22+):
 
 ```bash
 uv sync
@@ -52,8 +53,13 @@ uv run alembic upgrade head             # create the schema
 # Terminal 1: the LiveKit worker (the interviewer)
 uv run python main.py dev
 
-# Terminal 2: the API + frontend
+# Terminal 2: the API
 uv run uvicorn interview_agent.server.app:app --port 8000
+
+# Terminal 3: the frontend dev server (HMR, proxies /api to :8000)
+cd web && pnpm install && pnpm dev
 ```
+
+Open <http://localhost:3000> for the dev frontend. (The uvicorn on :8000 serves the last `pnpm build` output, if any — production behavior.)
 
 > **Note on language and voice:** the interview language, the agent's name and its voice are set in the in-app Settings screen (not in `.env`). Speech recognition and synthesis are pinned to the configured language; the voice catalog lives in `interview_agent/voices.py`.

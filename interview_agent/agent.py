@@ -271,7 +271,7 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    f"{settings.app_base_url}/interviews/{conversation_id}/evaluate",
+                    f"{settings.app_base_url}/api/interviews/{conversation_id}/evaluate",
                     timeout=300,
                 )
                 logger.info("auto-evaluation triggered: HTTP %s", response.status_code)

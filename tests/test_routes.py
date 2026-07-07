@@ -90,7 +90,7 @@ async def client_and_sessionmaker(monkeypatch):
     monkeypatch.setattr(routes, "run_planner", _fake_planner)
 
     app = FastAPI()
-    app.include_router(routes.router)
+    app.include_router(routes.router, prefix="/api")
     app.state.sessionmaker = sessionmaker
     app.state.qdrant = object()  # only ever handed to the stubbed rag helpers
     app.state.embeddings = object()
@@ -153,7 +153,7 @@ async def _seed_finished_interview(sessionmaker) -> uuid.UUID:
 
 async def test_get_settings_returns_defaults_and_catalog(client_and_sessionmaker):
     client, _ = client_and_sessionmaker
-    res = await client.get("/settings")
+    res = await client.get("/api/settings")
     assert res.status_code == 200
     body = res.json()
     assert body["agent_name"] == "Emma"
@@ -175,7 +175,7 @@ async def test_put_settings_persists_and_echoes(client_and_sessionmaker):
         "persona": "una manager exigente",
         "custom_instructions": "",
     }
-    res = await client.put("/settings", json=payload)
+    res = await client.put("/api/settings", json=payload)
     assert res.status_code == 200
     body = res.json()
     assert body["agent_name"] == "Sam"
@@ -183,7 +183,7 @@ async def test_put_settings_persists_and_echoes(client_and_sessionmaker):
     assert body["custom_instructions"] is None  # "" normalized to NULL
 
     # Persisted: a fresh GET returns the same values.
-    body = (await client.get("/settings")).json()
+    body = (await client.get("/api/settings")).json()
     assert body["language"] == "es"
     assert body["persona"] == "una manager exigente"
 
@@ -191,12 +191,12 @@ async def test_put_settings_persists_and_echoes(client_and_sessionmaker):
 async def test_put_settings_rejects_voice_language_mismatch(client_and_sessionmaker):
     client, _ = client_and_sessionmaker
     res = await client.put(
-        "/settings", json={"agent_name": "Alex", "language": "en", "voice": "es_male"}
+        "/api/settings", json={"agent_name": "Alex", "language": "en", "voice": "es_male"}
     )
     assert res.status_code == 422
 
     res = await client.put(
-        "/settings", json={"agent_name": "Alex", "language": "fr", "voice": "en_female"}
+        "/api/settings", json={"agent_name": "Alex", "language": "fr", "voice": "en_female"}
     )
     assert res.status_code == 422
 
@@ -206,7 +206,7 @@ async def test_put_settings_rejects_voice_language_mismatch(client_and_sessionma
 
 async def test_create_interview_happy_path(client_and_sessionmaker):
     client, _ = client_and_sessionmaker
-    res = await client.post("/interviews", **_upload())
+    res = await client.post("/api/interviews", **_upload())
     assert res.status_code == 200
     body = res.json()
     assert body["status"] == "planned"
@@ -219,7 +219,7 @@ async def test_create_interview_happy_path(client_and_sessionmaker):
 async def test_create_interview_snapshots_settings(client_and_sessionmaker):
     client, sessionmaker = client_and_sessionmaker
     res = await client.put(
-        "/settings",
+        "/api/settings",
         json={
             "agent_name": "Sam",
             "language": "es",
@@ -231,7 +231,7 @@ async def test_create_interview_snapshots_settings(client_and_sessionmaker):
     assert res.status_code == 200
 
     job_offer = f"offer-{uuid.uuid4()}"  # unique marker to find the row
-    res = await client.post("/interviews", **_upload(job_offer))
+    res = await client.post("/api/interviews", **_upload(job_offer))
     assert res.status_code == 200
     assert res.json()["plan"]["language"] == "es"
 
@@ -252,7 +252,7 @@ async def test_create_interview_snapshots_settings(client_and_sessionmaker):
 async def test_create_interview_rejects_non_pdf(client_and_sessionmaker):
     client, _ = client_and_sessionmaker
     res = await client.post(
-        "/interviews",
+        "/api/interviews",
         files={"resume": ("cv.docx", b"bytes", "application/msword")},
         data={"job_offer": "offer"},
     )
@@ -269,7 +269,7 @@ async def test_create_interview_planning_failure_marks_error(
 
     monkeypatch.setattr(routes, "run_planner", _boom)
     job_offer = f"offer-{uuid.uuid4()}"  # unique marker to find the row
-    res = await client.post("/interviews", **_upload(job_offer))
+    res = await client.post("/api/interviews", **_upload(job_offer))
     assert res.status_code == 500
 
     # The row survives with a visible error status (not stuck in "created").
@@ -283,7 +283,7 @@ async def test_create_interview_planning_failure_marks_error(
 
 async def test_get_interview_404(client_and_sessionmaker):
     client, _ = client_and_sessionmaker
-    res = await client.get(f"/interviews/{uuid.uuid4()}")
+    res = await client.get(f"/api/interviews/{uuid.uuid4()}")
     assert res.status_code == 404
 
 
@@ -295,7 +295,7 @@ async def test_evaluate_happy_and_idempotent(client_and_sessionmaker, monkeypatc
     monkeypatch.setattr(routes, "run_evaluator", _fake_evaluator)
     conversation_id = await _seed_finished_interview(sessionmaker)
 
-    res = await client.post(f"/interviews/{conversation_id}/evaluate")
+    res = await client.post(f"/api/interviews/{conversation_id}/evaluate")
     assert res.status_code == 200
     body = res.json()
     assert body["status"] == "evaluated"
@@ -304,7 +304,7 @@ async def test_evaluate_happy_and_idempotent(client_and_sessionmaker, monkeypatc
     assert body["evaluation"]["ended_by"] == "plan_complete"
 
     # Re-evaluation upserts instead of racing delete+insert into a 500.
-    res2 = await client.post(f"/interviews/{conversation_id}/evaluate")
+    res2 = await client.post(f"/api/interviews/{conversation_id}/evaluate")
     assert res2.status_code == 200
     assert res2.json()["evaluation"]["score"] == 82
 
@@ -321,7 +321,7 @@ async def test_evaluate_without_transcript_409(client_and_sessionmaker, monkeypa
         )
         await session.commit()
 
-    res = await client.post(f"/interviews/{conversation_id}/evaluate")
+    res = await client.post(f"/api/interviews/{conversation_id}/evaluate")
     assert res.status_code == 409
 
 
@@ -335,14 +335,14 @@ async def test_evaluate_failure_sets_status_and_retry_recovers(
         raise RuntimeError("LLM down")
 
     monkeypatch.setattr(routes, "run_evaluator", _boom)
-    res = await client.post(f"/interviews/{conversation_id}/evaluate")
+    res = await client.post(f"/api/interviews/{conversation_id}/evaluate")
     assert res.status_code == 502
-    status = (await client.get(f"/interviews/{conversation_id}")).json()["status"]
+    status = (await client.get(f"/api/interviews/{conversation_id}")).json()["status"]
     assert status == "evaluation_failed"
 
     # The endpoint stays re-invocable: a later retry succeeds.
     monkeypatch.setattr(routes, "run_evaluator", _fake_evaluator)
-    res2 = await client.post(f"/interviews/{conversation_id}/evaluate")
+    res2 = await client.post(f"/api/interviews/{conversation_id}/evaluate")
     assert res2.status_code == 200
     assert res2.json()["status"] == "evaluated"
 
@@ -408,6 +408,6 @@ async def test_get_messages_orders_by_seq_not_id(client_and_sessionmaker):
 
 async def test_healthz_ok(client_and_sessionmaker):
     client, _ = client_and_sessionmaker
-    res = await client.get("/healthz")
+    res = await client.get("/api/healthz")
     assert res.status_code == 200
     assert res.json() == {"status": "ok"}

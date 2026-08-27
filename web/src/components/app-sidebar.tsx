@@ -1,6 +1,6 @@
 import * as React from "react"
 import { Link } from "@tanstack/react-router"
-import { CommandIcon, MicIcon, SettingsIcon } from "lucide-react"
+import { CommandIcon, HistoryIcon, MicIcon, SettingsIcon } from "lucide-react"
 
 import {
   Sidebar,
@@ -39,6 +39,12 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
                 <SidebarMenuButton render={<Link to="/" />}>
                   <MicIcon />
                   <span>New interview</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <SidebarMenuItem>
+                <SidebarMenuButton render={<Link to="/interviews" />}>
+                  <HistoryIcon />
+                  <span>History</span>
                 </SidebarMenuButton>
               </SidebarMenuItem>
               <SidebarMenuItem>

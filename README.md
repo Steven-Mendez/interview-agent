@@ -39,6 +39,8 @@ That starts the whole stack: Postgres, Qdrant, the API + frontend, and the LiveK
 
 Open <http://localhost:8000>: upload a resume PDF, paste the job offer, wait for the plan (~30–60 s), then start the voice interview. When it ends, the evaluation appears on the same page.
 
+The **History** screen lists every interview you have run, newest first, with its score, verdict and how far the topics got — filterable by state. Opening one shows its scorecard and, folded away, the full transcript. **Repeat** runs the same role again: a brand-new interview off the stored resume and job offer, at the same level and length, with freshly planned questions. The original is left untouched, and every re-run stays grouped under it.
+
 The **Settings** screen configures the agent globally: its name, the interview language (English or Spanish, with a feminine and a masculine voice per language), an optional interviewer persona and custom instructions. Changes apply to interviews created afterwards.
 
 ## Development (local)

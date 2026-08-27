@@ -5,7 +5,12 @@ import pytest
 
 from interview_agent.config import Settings
 from interview_agent.interview import planner
-from interview_agent.interview.models import InterviewPlan, MilestoneSpec
+from interview_agent.interview.models import (
+    InterviewLength,
+    InterviewPlan,
+    MilestoneSpec,
+    Seniority,
+)
 
 
 def _plan() -> InterviewPlan:
@@ -14,7 +19,10 @@ def _plan() -> InterviewPlan:
         summary="Solid backend candidate.",
         focus_areas=["Kubernetes", "SQL"],
         milestones=[
-            MilestoneSpec(title=f"M{i}", description="Probe it.") for i in range(4)
+            MilestoneSpec(
+                title=f"M{i}", description="Probe it.", expected_evidence="Names one index."
+            )
+            for i in range(4)
         ],
     )
 
@@ -96,3 +104,60 @@ async def test_run_planner_rejects_non_plan_output(settings, monkeypatch):
         await planner.run_planner(
             settings, resume_markdown="cv", job_offer="offer", language="en", agent_name="Alex"
         )
+
+
+async def test_run_planner_pins_an_explicit_level(settings, monkeypatch):
+    """Given a level, the planner is told it and must not classify one."""
+    fake = _FakeChain(_plan())
+    monkeypatch.setattr(planner, "build_chat_model", lambda *a, **k: fake)
+
+    await planner.run_planner(
+        settings,
+        resume_markdown="# Resume",
+        job_offer="Backend engineer, RAG and AWS.",
+        language="en",
+        agent_name="Alex",
+        seniority=Seniority.JUNIOR,
+        interview_length=InterviewLength.SHORT,
+    )
+
+    system = fake.messages[0].content
+    assert "Junior (roughly 0-2 years of experience)" in system
+    assert "CLASSIFY IT FIRST" not in system
+    # The length axis drives milestone count and minutes, not the level.
+    assert "between 3 and 4 milestones" in system
+    assert "about\n8 minutes" in system
+
+
+async def test_run_planner_asks_for_classification_when_level_is_auto(
+    settings, monkeypatch
+):
+    fake = _FakeChain(_plan())
+    monkeypatch.setattr(planner, "build_chat_model", lambda *a, **k: fake)
+
+    await planner.run_planner(
+        settings,
+        resume_markdown="# Resume",
+        job_offer="Backend engineer, RAG and AWS.",
+        language="en",
+        agent_name="Alex",
+        seniority=None,
+    )
+
+    system = fake.messages[0].content
+    assert "CLASSIFY IT FIRST" in system
+    assert "Do NOT classify by the technologies mentioned" in system
+
+
+async def test_run_planner_defaults_to_a_standard_length(settings, monkeypatch):
+    fake = _FakeChain(_plan())
+    monkeypatch.setattr(planner, "build_chat_model", lambda *a, **k: fake)
+
+    await planner.run_planner(
+        settings,
+        resume_markdown="# Resume",
+        job_offer="Backend engineer.",
+        language="en",
+        agent_name="Alex",
+    )
+    assert "between 4 and 6 milestones" in fake.messages[0].content

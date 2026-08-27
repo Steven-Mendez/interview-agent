@@ -10,6 +10,7 @@ Postgres, in CI on the service container (TEST_DATABASE_URL overrides).
 from __future__ import annotations
 
 import itertools
+import json
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -24,8 +25,16 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from interview_agent import agent
 from interview_agent.config import settings
 from interview_agent.interview import db, rag
-from interview_agent.interview.models import EvaluationResult, InterviewPlan, MilestoneSpec
+from interview_agent.interview.models import (
+    EvaluationResult,
+    InterviewLength,
+    InterviewPlan,
+    MilestoneSpec,
+    Seniority,
+)
+from interview_agent.prompts import length_for
 from interview_agent.server import routes
+from interview_agent.voices import VOICES
 
 TEST_DATABASE_URL = os.environ.get(
     "TEST_DATABASE_URL",
@@ -33,12 +42,19 @@ TEST_DATABASE_URL = os.environ.get(
 )
 
 
-def _plan() -> InterviewPlan:
+def _plan(detected: Seniority | None = None) -> InterviewPlan:
     return InterviewPlan(
         persona="Laura, engineering manager",
         summary="Solid candidate.",
         focus_areas=["Kubernetes"],
-        milestones=[MilestoneSpec(title=f"M{i}", description="Probe it.") for i in range(4)],
+        detected_seniority=detected,
+        seniority_evidence="The offer asks for 1-2 years." if detected else None,
+        milestones=[
+            MilestoneSpec(
+                title=f"M{i}", description="Probe it.", expected_evidence="Names one index."
+            )
+            for i in range(4)
+        ],
     )
 
 
@@ -49,6 +65,8 @@ def _evaluation() -> EvaluationResult:
         strengths=["clear communication"],
         weaknesses=["little SQL depth"],
         rationale="Convincing on most milestones.",
+        seniority_evaluated=Seniority.MID,
+        calibration_notes=["Skipped trade-off depth: above this level."],
     )
 
 
@@ -113,11 +131,17 @@ async def _fake_evaluator(settings, **kwargs) -> EvaluationResult:
     return _evaluation()
 
 
-def _upload(job_offer: str = "Backend engineer at ACME."):
+def _upload(job_offer: str = "Backend engineer at ACME.", **extra: str):
     return {
         "files": {"resume": ("cv.pdf", b"%PDF-fake", "application/pdf")},
-        "data": {"job_offer": job_offer},
+        "data": {"job_offer": job_offer, **extra},
     }
+
+
+def _interviewer(**fields: str) -> str:
+    """The `interviewer` form field. Only the keys passed are sent, so the
+    test controls exactly what inherits and what overrides."""
+    return json.dumps(fields)
 
 
 async def _seed_finished_interview(sessionmaker) -> uuid.UUID:
@@ -532,8 +556,465 @@ async def test_resumed_job_appends_instead_of_interleaving(client_and_sessionmak
 # ---- /healthz ---------------------------------------------------------------
 
 
+# ---- per-interview interviewer ----------------------------------------------
+
+
+async def test_create_interview_takes_a_per_interview_interviewer(client_and_sessionmaker):
+    client, sessionmaker = client_and_sessionmaker
+    # Global settings say English/Emma; this interview asks for Spanish/Sam.
+    await client.put(
+        "/api/settings",
+        json={
+            "agent_name": "Emma",
+            "language": "en",
+            "voice": "en_female",
+            "persona": "a global persona",
+        },
+    )
+    res = await client.post(
+        "/api/interviews",
+        **_upload(
+            interviewer=_interviewer(
+                agent_name="Sam",
+                language="es",
+                voice="es_male",
+                persona="una manager exigente",
+                custom_instructions="Pregunta por Kubernetes.",
+            )
+        ),
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert body["interviewer"] == {
+        "agent_name": "Sam",
+        "language": "es",
+        "voice": "es_male",
+    }
+    assert body["plan"]["language"] == "es"
+
+    async with sessionmaker() as session:
+        row = await db.get_conversation(session, uuid.UUID(body["id"]))
+        assert row is not None
+        # The voice resolved to a concrete TTS pair for the worker.
+        assert row.agent_settings["tts_voice"] == VOICES["es_male"]["tts_voice"]
+        assert row.persona == "una manager exigente"
+        assert row.custom_instructions == "Pregunta por Kubernetes."
+
+    # The global settings are untouched by the per-interview choice.
+    assert (await client.get("/api/settings")).json()["language"] == "en"
+
+
+async def test_create_interview_without_an_interviewer_uses_the_settings(
+    client_and_sessionmaker,
+):
+    client, sessionmaker = client_and_sessionmaker
+    await client.put(
+        "/api/settings",
+        json={
+            "agent_name": "Emma",
+            "language": "es",
+            "voice": "es_female",
+            "persona": "una manager exigente",
+        },
+    )
+    body = (await client.post("/api/interviews", **_upload())).json()
+    assert body["interviewer"]["language"] == "es"
+    assert body["interviewer"]["voice"] == "es_female"
+    async with sessionmaker() as session:
+        row = await db.get_conversation(session, uuid.UUID(body["id"]))
+        assert row is not None and row.persona == "una manager exigente"
+
+
+async def test_an_empty_persona_clears_it_for_this_interview_only(client_and_sessionmaker):
+    client, sessionmaker = client_and_sessionmaker
+    await client.put(
+        "/api/settings",
+        json={
+            "agent_name": "Emma",
+            "language": "en",
+            "voice": "en_female",
+            "persona": "a global persona",
+        },
+    )
+    # "" is a real answer — run this one WITHOUT a persona — while omitting
+    # the field inherits. Both must not touch the stored settings.
+    body = (
+        await client.post("/api/interviews", **_upload(interviewer=_interviewer(persona="")))
+    ).json()
+    async with sessionmaker() as session:
+        row = await db.get_conversation(session, uuid.UUID(body["id"]))
+        assert row is not None and row.persona is None
+    assert (await client.get("/api/settings")).json()["persona"] == "a global persona"
+
+
+async def test_create_interview_rejects_an_impossible_voice(client_and_sessionmaker):
+    client, _ = client_and_sessionmaker
+    res = await client.post(
+        "/api/interviews", **_upload(interviewer=_interviewer(language="en", voice="es_male"))
+    )
+    assert res.status_code == 400
+    assert "not available" in res.json()["detail"]
+
+    res = await client.post(
+        "/api/interviews", **_upload(interviewer=_interviewer(voice="klingon"))
+    )
+    assert res.status_code == 400
+    res = await client.post(
+        "/api/interviews", **_upload(interviewer=_interviewer(language="fr", voice="en_female"))
+    )
+    assert res.status_code == 400
+    # Malformed JSON is a 400 too, not a 500.
+    res = await client.post("/api/interviews", **_upload(interviewer="{nope"))
+    assert res.status_code == 400
+
+
+async def test_repeat_keeps_the_original_interviewer(client_and_sessionmaker):
+    client, sessionmaker = client_and_sessionmaker
+    source = (
+        await client.post(
+            "/api/interviews",
+            **_upload(
+                interviewer=_interviewer(
+                    agent_name="Sam", language="es", voice="es_male", persona="exigente"
+                )
+            ),
+        )
+    ).json()
+
+    # The global settings move on AFTER the original ran.
+    await client.put(
+        "/api/settings",
+        json={
+            "agent_name": "Nova",
+            "language": "en",
+            "voice": "en_female",
+            "persona": "a brand new persona",
+        },
+    )
+    repeat = (await client.post(f"/api/interviews/{source['id']}/repeat")).json()
+    assert repeat["interviewer"] == source["interviewer"]
+    assert repeat["plan"]["language"] == "es"
+    async with sessionmaker() as session:
+        row = await db.get_conversation(session, uuid.UUID(repeat["id"]))
+        assert row is not None and row.persona == "exigente"
+
+
+async def test_repeat_of_a_personaless_interview_stays_personaless(client_and_sessionmaker):
+    client, sessionmaker = client_and_sessionmaker
+    source = (
+        await client.post("/api/interviews", **_upload(interviewer=_interviewer(persona="")))
+    ).json()
+    await client.put(
+        "/api/settings",
+        json={
+            "agent_name": "Emma",
+            "language": "en",
+            "voice": "en_female",
+            "persona": "a persona added later",
+        },
+    )
+    repeat = (await client.post(f"/api/interviews/{source['id']}/repeat")).json()
+    async with sessionmaker() as session:
+        row = await db.get_conversation(session, uuid.UUID(repeat["id"]))
+        # Inheriting "none" must not pick up the persona the settings grew.
+        assert row is not None and row.persona is None
+
+
+# ---- history / repeat --------------------------------------------------------
+
+
+async def test_history_lists_newest_first_with_a_summary(client_and_sessionmaker):
+    client, sessionmaker = client_and_sessionmaker
+    first = (await client.post("/api/interviews", **_upload("# Backend engineer\nACME."))).json()
+    second = (await client.post("/api/interviews", **_upload("Data engineer at Beta."))).json()
+    # Same-second creations: order the rows explicitly so "newest first" is
+    # about created_at, not about which insert happened to land first.
+    async with sessionmaker() as session:
+        await session.execute(
+            update(db.Conversation)
+            .where(db.Conversation.id == uuid.UUID(first["id"]))
+            .values(created_at=datetime.now(UTC) - timedelta(hours=1))
+        )
+        await session.commit()
+
+    res = await client.get("/api/interviews")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total"] == 2
+    assert [item["id"] for item in body["items"]] == [second["id"], first["id"]]
+
+    row = body["items"][1]
+    # The title is the offer's first line, with the markdown hash stripped.
+    assert row["title"] == "Backend engineer"
+    assert row["resume_filename"] == "cv.pdf"
+    assert row["status"] == "planned"
+    assert row["milestones_total"] == 4
+    assert row["milestones_completed"] == 0
+    assert row["evaluation"] is None
+    assert row["repeat_of_id"] is None
+    # The heavy fields stay out of the list.
+    assert "plan" not in row and "job_offer" not in row
+
+
+async def test_history_paginates_and_filters_by_status(client_and_sessionmaker):
+    client, sessionmaker = client_and_sessionmaker
+    await client.post("/api/interviews", **_upload())
+    await client.post("/api/interviews", **_upload())
+    evaluated_id = await _seed_finished_interview(sessionmaker)
+    async with sessionmaker() as session:
+        await db.set_status(session, evaluated_id, "evaluated")
+
+    body = (await client.get("/api/interviews", params={"limit": 1})).json()
+    assert body["total"] == 3 and len(body["items"]) == 1
+    page_two = (await client.get("/api/interviews", params={"limit": 1, "offset": 1})).json()
+    assert page_two["items"][0]["id"] != body["items"][0]["id"]
+
+    filtered = (await client.get("/api/interviews", params={"status": "evaluated"})).json()
+    assert [item["id"] for item in filtered["items"]] == [str(evaluated_id)]
+    assert filtered["total"] == 1
+
+    assert (await client.get("/api/interviews", params={"status": "nope"})).status_code == 400
+    assert (await client.get("/api/interviews", params={"limit": 0})).status_code == 422
+
+
+async def test_history_row_carries_the_score(client_and_sessionmaker, monkeypatch):
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(routes, "run_evaluator", _fake_evaluator)
+    conversation_id = await _seed_finished_interview(sessionmaker)
+    await client.post(f"/api/interviews/{conversation_id}/evaluate")
+
+    body = (await client.get("/api/interviews")).json()
+    row = next(item for item in body["items"] if item["id"] == str(conversation_id))
+    assert row["status"] == "evaluated"
+    assert row["evaluation"] == {"hired": True, "score": 82}
+    assert row["milestones_completed"] == 1
+
+
+async def test_transcript_returns_the_turns_in_order(client_and_sessionmaker):
+    client, sessionmaker = client_and_sessionmaker
+    conversation_id = await _seed_finished_interview(sessionmaker)
+    res = await client.get(f"/api/interviews/{conversation_id}/transcript")
+    assert res.status_code == 200
+    messages = res.json()["messages"]
+    assert [(m["role"], m["content"]) for m in messages] == [
+        ("assistant", "Tell me about X."),
+        ("user", "I built X."),
+    ]
+    assert messages[0]["created_at"]
+
+    assert (await client.get(f"/api/interviews/{uuid.uuid4()}/transcript")).status_code == 404
+
+
+async def test_repeat_replans_the_same_role_into_a_new_interview(client_and_sessionmaker):
+    client, sessionmaker = client_and_sessionmaker
+    source = (
+        await client.post(
+            "/api/interviews",
+            **_upload("Backend engineer at ACME.", seniority="senior", interview_length="deep"),
+        )
+    ).json()
+
+    res = await client.post(f"/api/interviews/{source['id']}/repeat")
+    assert res.status_code == 200
+    repeat = res.json()
+    assert repeat["id"] != source["id"]
+    assert repeat["status"] == "planned"
+    # Same inputs and same calibration, freshly planned milestones.
+    assert repeat["job_offer"] == source["job_offer"]
+    assert repeat["resume_filename"] == "cv.pdf"
+    assert repeat["seniority"] == "senior"
+    assert repeat["seniority_source"] == "explicit"
+    assert repeat["interview_length"] == "deep"
+    assert len(repeat["milestones"]) == 4
+    assert repeat["repeat_of_id"] == source["id"]
+    assert "planner" in repeat["token_usage"]
+
+    # The original is untouched, and both show up in the history.
+    assert (await client.get(f"/api/interviews/{source['id']}")).json()["status"] == "planned"
+    assert (await client.get("/api/interviews")).json()["total"] == 2
+
+    # The stored resume markdown is what gets re-indexed and re-planned.
+    async with sessionmaker() as session:
+        row = await db.get_conversation(session, uuid.UUID(repeat["id"]))
+        assert row is not None and row.resume_markdown == "# Resume\nPython dev."
+
+
+async def test_repeat_of_a_repeat_points_back_at_the_original(client_and_sessionmaker):
+    client, _ = client_and_sessionmaker
+    source = (await client.post("/api/interviews", **_upload())).json()
+    first = (await client.post(f"/api/interviews/{source['id']}/repeat")).json()
+    second = (await client.post(f"/api/interviews/{first['id']}/repeat")).json()
+    # The chain flattens: every attempt groups under the original's id.
+    assert first["repeat_of_id"] == source["id"]
+    assert second["repeat_of_id"] == source["id"]
+
+
+async def test_repeat_keeps_an_auto_detected_level_marked_as_auto(
+    client_and_sessionmaker, monkeypatch
+):
+    client, _ = client_and_sessionmaker
+
+    async def _detecting_planner(settings, resume_markdown, job_offer, **kwargs):
+        return _plan(detected=Seniority.JUNIOR)
+
+    monkeypatch.setattr(routes, "run_planner", _detecting_planner)
+    source = (await client.post("/api/interviews", **_upload())).json()
+    assert source["seniority_source"] == "detected"
+
+    # The planner is told the answer this time (seniority is pinned), so it
+    # classifies nothing — the provenance has to be carried, not re-derived.
+    repeat = (await client.post(f"/api/interviews/{source['id']}/repeat")).json()
+    assert repeat["seniority"] == "junior"
+    assert repeat["seniority_source"] == "detected"
+    assert repeat["seniority_evidence"] == source["seniority_evidence"]
+
+
+async def test_repeat_accepts_overrides_and_404s_on_an_unknown_id(client_and_sessionmaker):
+    client, _ = client_and_sessionmaker
+    source = (
+        await client.post("/api/interviews", **_upload("Offer.", seniority="lead"))
+    ).json()
+
+    repeat = (
+        await client.post(
+            f"/api/interviews/{source['id']}/repeat",
+            json={"seniority": "junior", "interview_length": "short"},
+        )
+    ).json()
+    assert repeat["seniority"] == "junior"
+    assert repeat["seniority_source"] == "explicit"
+    assert repeat["interview_length"] == "short"
+    # The overridden length re-derives this interview's own time cap.
+    assert repeat["max_minutes"] == min(
+        length_for(InterviewLength.SHORT)["minutes"], settings.interview_max_minutes
+    )
+
+    bad = await client.post(
+        f"/api/interviews/{source['id']}/repeat", json={"seniority": "wizard"}
+    )
+    assert bad.status_code == 400
+    assert (await client.post(f"/api/interviews/{uuid.uuid4()}/repeat")).status_code == 404
+
+
 async def test_healthz_ok(client_and_sessionmaker):
     client, _ = client_and_sessionmaker
     res = await client.get("/api/healthz")
     assert res.status_code == 200
     assert res.json() == {"status": "ok"}
+
+
+# ---- Seniority / length calibration ------------------------------------------
+
+
+async def test_create_interview_defaults_to_auto_and_takes_the_detected_level(
+    client_and_sessionmaker, monkeypatch
+):
+    """No level in the form: the planner classifies it ONCE and the server
+    pins the result. Every later stage reads that pinned value."""
+
+    async def _detecting_planner(settings, resume_markdown, job_offer, **kwargs):
+        assert kwargs["seniority"] is None  # i.e. "classify it yourself"
+        return _plan(detected=Seniority.JUNIOR)
+
+    monkeypatch.setattr(routes, "run_planner", _detecting_planner)
+    client, _ = client_and_sessionmaker
+    res = await client.post("/api/interviews", **_upload())
+    assert res.status_code == 200
+    body = res.json()
+    assert body["seniority"] == "junior"
+    assert body["seniority_source"] == "detected"
+    assert body["seniority_evidence"] == "The offer asks for 1-2 years."
+    assert body["interview_length"] == "standard"
+    # Pinned in columns, deliberately not duplicated into the plan JSON.
+    assert "detected_seniority" not in body["plan"]
+    assert "seniority_evidence" not in body["plan"]
+
+
+async def test_explicit_seniority_wins_and_the_planner_never_classifies(
+    client_and_sessionmaker, monkeypatch
+):
+    seen = {}
+
+    async def _planner(settings, resume_markdown, job_offer, **kwargs):
+        seen["seniority"] = kwargs["seniority"]
+        seen["length"] = kwargs["interview_length"]
+        # Even if the planner does classify, the user's choice must win.
+        return _plan(detected=Seniority.SENIOR)
+
+    monkeypatch.setattr(routes, "run_planner", _planner)
+    client, _ = client_and_sessionmaker
+    res = await client.post(
+        "/api/interviews", **_upload(seniority="junior", interview_length="short")
+    )
+    assert res.status_code == 200
+    body = res.json()
+    assert seen["seniority"] is Seniority.JUNIOR
+    assert seen["length"] is InterviewLength.SHORT
+    assert body["seniority"] == "junior"
+    assert body["seniority_source"] == "explicit"
+    assert body["seniority_evidence"] is None
+
+
+async def test_interview_length_sets_this_interviews_own_time_cap(
+    client_and_sessionmaker,
+):
+    client, _ = client_and_sessionmaker
+    res = await client.post("/api/interviews", **_upload(interview_length="short"))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["interview_length"] == "short"
+    # Clamped by the global setting, so it can only ever be shorter.
+    assert body["max_minutes"] == min(8, settings.interview_max_minutes)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("seniority", "archmage"), ("interview_length", "epic")],
+)
+async def test_create_interview_rejects_unknown_axis_values(
+    client_and_sessionmaker, field, value
+):
+    client, _ = client_and_sessionmaker
+    res = await client.post("/api/interviews", **_upload(**{field: value}))
+    assert res.status_code == 400
+
+
+async def test_milestones_carry_their_bar_to_the_api(client_and_sessionmaker):
+    client, _ = client_and_sessionmaker
+    res = await client.post("/api/interviews", **_upload())
+    assert res.status_code == 200
+    assert all(m["expected_evidence"] == "Names one index." for m in res.json()["milestones"])
+
+
+async def test_evaluate_judges_against_the_pinned_level(
+    client_and_sessionmaker, monkeypatch
+):
+    """The evaluator is HANDED the level and the per-milestone bars; it never
+    re-infers seniority from how advanced the stack sounds."""
+    client, sessionmaker = client_and_sessionmaker
+    interview_id = await _seed_finished_interview(sessionmaker)
+    async with sessionmaker() as session:
+        await session.execute(
+            update(db.Conversation)
+            .where(db.Conversation.id == interview_id)
+            .values(seniority="junior")
+        )
+        await session.commit()
+
+    seen = {}
+
+    async def _capturing_evaluator(settings, **kwargs):
+        seen.update(kwargs)
+        return _evaluation()
+
+    monkeypatch.setattr(routes, "run_evaluator", _capturing_evaluator)
+    res = await client.post(f"/api/interviews/{interview_id}/evaluate")
+    assert res.status_code == 200
+    assert seen["seniority"] == "junior"
+    assert all("expected_evidence" in m for m in seen["milestones"])
+
+    evaluation = res.json()["evaluation"]
+    assert evaluation["seniority_evaluated"] == "mid"  # what the fake returned
+    assert evaluation["calibration_notes"] == [
+        "Skipped trade-off depth: above this level."
+    ]

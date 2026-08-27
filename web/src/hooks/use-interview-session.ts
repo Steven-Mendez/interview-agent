@@ -20,10 +20,16 @@ export interface ChatMessage {
   interim: boolean
 }
 
+/** Options for `start`. The device id comes from the pre-join check, so the
+ *  interview is published through the microphone the candidate just tested. */
+export interface StartOptions {
+  audioDeviceId?: string
+}
+
 export interface InterviewSession {
   phase: SessionPhase
   /** Call DIRECTLY from an onClick — mic permission + audio autoplay need the gesture. */
-  start: () => void
+  start: (options?: StartOptions) => void
   error: string | null
   messages: ChatMessage[]
   /** Raw `lk.agent.state` (initializing/listening/thinking/speaking) or null. */
@@ -207,59 +213,69 @@ export function useInterviewSession(interviewId: string): InterviewSession {
     })
   }, [])
 
-  const start = React.useCallback(() => {
-    // Runs inside the click handler: mic permission + audio autoplay need the
-    // user gesture. No state update between here and setMicrophoneEnabled that
-    // could re-render before the permission prompt (phase→connecting is the
-    // only one, and it just swaps the button for a status line).
-    if (phaseRef.current !== "idle") return
+  const start = React.useCallback(
+    (options?: StartOptions) => {
+      // Runs inside the click handler: mic permission + audio autoplay need the
+      // user gesture. No state update between here and setMicrophoneEnabled that
+      // could re-render before the permission prompt (phase→connecting is the
+      // only one, and it just swaps the button for a status line).
+      if (phaseRef.current !== "idle") return
 
-    void (async () => {
-      setPhase("connecting")
-      setError(null)
-      try {
-        const {
-          server_url,
-          token,
-          room: roomName,
-        } = await getInterviewToken(interviewId)
-        log("token received, connecting to room:", roomName)
+      void (async () => {
+        setPhase("connecting")
+        setError(null)
+        try {
+          const {
+            server_url,
+            token,
+            room: roomName,
+          } = await getInterviewToken(interviewId)
+          log("token received, connecting to room:", roomName)
 
-        const r = new Room({
-          // Cleaner mic input = better STT = better interview.
-          audioCaptureDefaults: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true,
-          },
-          publishDefaults: { dtx: true },
-        })
-        roomRef.current = r
-        registerTranscriptionHandler(r)
-        registerAgentStateHandler(r)
-        r.on(RoomEvent.Disconnected, (reason) => {
-          // Interview over (agent deleted the room, or connection lost).
-          log("disconnected from room (reason:", reason, ") — showing results")
-          setAgentState(null)
-          setEndedAt(Date.now())
-          setPhase("ended")
-        })
+          const r = new Room({
+            // Cleaner mic input = better STT = better interview.
+            audioCaptureDefaults: {
+              // The device chosen in the pre-join check; omitted falls back to
+              // the browser's default input.
+              deviceId: options?.audioDeviceId || undefined,
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+            publishDefaults: { dtx: true },
+          })
+          roomRef.current = r
+          registerTranscriptionHandler(r)
+          registerAgentStateHandler(r)
+          r.on(RoomEvent.Disconnected, (reason) => {
+            // Interview over (agent deleted the room, or connection lost).
+            log(
+              "disconnected from room (reason:",
+              reason,
+              ") — showing results"
+            )
+            setAgentState(null)
+            setEndedAt(Date.now())
+            setPhase("ended")
+          })
 
-        await r.connect(server_url, token)
-        await r.localParticipant.setMicrophoneEnabled(true)
-        log("connected, microphone enabled")
-        // Expose the room only now: <RoomAudioRenderer> mounts after the mic
-        // gesture and still picks up the agent's (later) audio track.
-        setRoom(r)
-        setPhase("live")
-      } catch (err) {
-        console.error("[app] could not start the interview:", err)
-        setError(errorMessage(err))
-        roomRef.current = null
-        setPhase("idle")
-      }
-    })()
-  }, [interviewId, registerTranscriptionHandler, registerAgentStateHandler])
+          await r.connect(server_url, token)
+          await r.localParticipant.setMicrophoneEnabled(true)
+          log("connected, microphone enabled")
+          // Expose the room only now: <RoomAudioRenderer> mounts after the mic
+          // gesture and still picks up the agent's (later) audio track.
+          setRoom(r)
+          setPhase("live")
+        } catch (err) {
+          console.error("[app] could not start the interview:", err)
+          setError(errorMessage(err))
+          roomRef.current = null
+          setPhase("idle")
+        }
+      })()
+    },
+    [interviewId, registerTranscriptionHandler, registerAgentStateHandler]
+  )
 
   // Tear the room down on real unmount (navigation away). start() is
   // click-driven, so StrictMode's mount/unmount/mount cycle runs before any

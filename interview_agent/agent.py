@@ -295,9 +295,10 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
         task.add_done_callback(background_tasks.discard)
 
     end_event = asyncio.Event()
-    prompt = build_interviewer_prompt(
-        conversation, milestones, settings.interview_max_minutes
-    )
+    # This interview's own cap (derived from interview_length at creation),
+    # falling back to the global setting for rows that predate the column.
+    max_minutes = conversation.max_minutes or settings.interview_max_minutes
+    prompt = build_interviewer_prompt(conversation, milestones, max_minutes)
 
     # Interviewer token spend accumulates in memory and is flushed once at
     # shutdown: usage is telemetry, so losing it on a hard crash beats a DB
@@ -411,7 +412,7 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
 
     async def time_cap() -> None:
         nonlocal wrap_up_issued
-        budget = settings.interview_max_minutes * 60 - _WRAP_UP_SECONDS - elapsed_seconds
+        budget = max_minutes * 60 - _WRAP_UP_SECONDS - elapsed_seconds
         # Already out of budget: warn immediately and let the usual wrap-up run,
         # so the candidate gets a goodbye instead of a dead screen.
         await asyncio.sleep(max(0, budget))
@@ -463,16 +464,35 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
                     )
             except Exception:
                 logger.exception("failed to persist interviewer token usage")
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{settings.app_base_url}/api/interviews/{conversation_id}/evaluate",
-                    timeout=300,
-                )
+        # Retried on TRANSPORT errors only — the API being briefly unreachable
+        # (restart, boot ordering) is the one failure that leaves nothing
+        # behind: the row sits in "completed" forever and no one ever asks
+        # again. A response, even a 502, means the endpoint ran and marked
+        # the row evaluation_failed, which the frontend offers to retry — so
+        # re-POSTing that would only spend the tokens twice.
+        url = f"{settings.app_base_url}/api/interviews/{conversation_id}/evaluate"
+        for attempt, backoff in enumerate((2, 5, 10, 0), start=1):
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(url, timeout=300)
                 logger.info("auto-evaluation triggered: HTTP %s", response.status_code)
-        except Exception:
-            # The endpoint is re-invocable; a failed trigger is not fatal.
-            logger.exception("failed to auto-trigger evaluation")
+                break
+            except httpx.RequestError as exc:
+                logger.warning(
+                    "evaluation trigger unreachable (attempt %s): %s", attempt, exc
+                )
+                if backoff:
+                    await asyncio.sleep(backoff)
+            except Exception:
+                logger.exception("failed to auto-trigger evaluation")
+                break
+        else:
+            # Out of attempts: say so loudly, the interview is now orphaned
+            # until someone hits Retry in the UI.
+            logger.error(
+                "evaluation never triggered for %s; retry it from the UI",
+                conversation_id,
+            )
         await qdrant.close()
         await engine.dispose()
 

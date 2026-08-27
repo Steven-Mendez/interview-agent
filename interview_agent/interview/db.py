@@ -46,6 +46,8 @@ class Base(DeclarativeBase):
 class Conversation(Base):
     __tablename__ = "conversations"
 
+    __table_args__ = (Index("conversations_created_at_idx", "created_at"),)
+
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     # Bumped on every UPDATE (status changes included); the capacity check
@@ -65,12 +67,37 @@ class Conversation(Base):
     custom_instructions: Mapped[str | None] = mapped_column(Text)
     # Planner output minus milestones: persona, language, summary, focus_areas.
     plan: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # The two calibration axes, resolved ONCE at creation and never re-inferred
+    # downstream. `seniority` sets DEPTH (what is asked and what counts as a
+    # sufficient answer), `interview_length` sets VOLUME (milestone count and
+    # minutes). Deliberately NOT mirrored into `plan`: one source of truth, no
+    # drift. seniority_source: explicit | detected | fallback.
+    seniority: Mapped[str] = mapped_column(Text, default="mid", server_default="mid")
+    seniority_source: Mapped[str] = mapped_column(
+        Text, default="fallback", server_default="fallback"
+    )
+    # Why the planner classified it this way; NULL when the user picked it.
+    seniority_evidence: Mapped[str | None] = mapped_column(Text)
+    interview_length: Mapped[str] = mapped_column(
+        Text, default="standard", server_default="standard"
+    )
+    # Time cap for THIS interview, derived from interview_length and clamped by
+    # the global setting. NULL on legacy rows — callers fall back to it.
+    max_minutes: Mapped[int | None] = mapped_column(Integer)
     # Snapshot of the app settings taken at creation time, with the voice
     # already resolved to a concrete tts_model/tts_voice pair: {"agent_name",
     # "language", "voice", "tts_model", "tts_voice"}. Editing the settings
     # never affects an interview already planned. NULL on legacy rows — the
     # worker falls back to the catalog defaults.
     agent_settings: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    # Set when this interview was started as a re-run of an earlier one, and
+    # always points at the ROOT of the chain (repeating a repeat re-points at
+    # the original), so every attempt on the same resume/offer groups under
+    # one id. SET NULL on delete: losing the original must not cascade away
+    # the attempts that came after it.
+    repeat_of_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="SET NULL")
+    )
     # plan_complete | timeout | candidate_left | idle_timeout
     ended_reason: Mapped[str | None] = mapped_column(Text)
     # Per-component LLM spend, accumulated over the conversation's lifecycle:
@@ -102,6 +129,11 @@ class Milestone(Base):
     position: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(Text)
     description: Mapped[str] = mapped_column(Text)
+    # The bar, materialized at planning time: what the candidate must say for
+    # this milestone to count as covered AT THE PINNED LEVEL. Travels to the
+    # evaluator so it judges against a written criterion instead of
+    # re-deriving how deep the topic "should" go. NULL on legacy rows.
+    expected_evidence: Mapped[str | None] = mapped_column(Text)
     completed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     completed_at: Mapped[datetime | None] = mapped_column()
     notes: Mapped[str | None] = mapped_column(Text)
@@ -138,6 +170,11 @@ class Evaluation(Base):
     strengths: Mapped[list[str]] = mapped_column(JSONB)
     weaknesses: Mapped[list[str]] = mapped_column(JSONB)
     rationale: Mapped[str] = mapped_column(Text)
+    # The level judged against, plus the expectations the evaluator discarded
+    # for being above it. Forcing the discard into an output field is what
+    # keeps above-level expectations out of `weaknesses`.
+    seniority_evaluated: Mapped[str | None] = mapped_column(Text)
+    calibration_notes: Mapped[list[str] | None] = mapped_column(JSONB)
     ended_by: Mapped[str] = mapped_column(Text)  # same values as ended_reason
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
@@ -192,6 +229,33 @@ async def get_conversation(
     session: AsyncSession, conversation_id: uuid.UUID
 ) -> Conversation | None:
     return await session.get(Conversation, conversation_id)
+
+
+async def list_conversations(
+    session: AsyncSession,
+    limit: int,
+    offset: int,
+    status: str | None = None,
+) -> tuple[list[Conversation], int]:
+    """One page of the history, newest first, plus the unpaginated total.
+
+    Both relationships are lazy="selectin", so the milestones and the
+    evaluation of the whole page load in two extra queries — not one per row.
+    """
+    filters = [Conversation.status == status] if status else []
+    total = await session.scalar(
+        select(func.count()).select_from(Conversation).where(*filters)
+    )
+    rows = await session.scalars(
+        select(Conversation)
+        .where(*filters)
+        # created_at ties (same-second seeds in tests) would otherwise page
+        # non-deterministically; id breaks them.
+        .order_by(Conversation.created_at.desc(), Conversation.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    return list(rows), int(total or 0)
 
 
 async def get_milestones(

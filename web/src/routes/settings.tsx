@@ -3,8 +3,14 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useForm } from "@tanstack/react-form"
 import * as z from "zod"
 
-import { ApiError, getSettings, updateSettings } from "@/lib/api"
-import type { Settings, SettingsUpdate, VoiceOption } from "@/lib/api"
+import {
+  ApiError,
+  LANGUAGE_LABELS,
+  getSettings,
+  updateSettings,
+  voiceLabel,
+} from "@/lib/api"
+import type { Settings, SettingsUpdate } from "@/lib/api"
 import { log } from "@/lib/log"
 import { Button } from "@/components/ui/button"
 import {
@@ -45,24 +51,6 @@ const settingsSchema = z.object({
   persona: z.string(),
   custom_instructions: z.string(),
 })
-
-// en/es labels for the two curated genders — ported verbatim from
-// frontend/app.js's GENDER_LABELS.
-const GENDER_LABELS: Partial<Record<string, Partial<Record<string, string>>>> =
-  {
-    en: { female: "female", male: "male" },
-    es: { female: "femenina", male: "masculina" },
-  }
-
-const LANGUAGE_LABELS: Partial<Record<string, string>> = {
-  en: "English",
-  es: "Español",
-}
-
-function voiceLabel(language: string, voice: VoiceOption): string {
-  const gender = GENDER_LABELS[language]?.[voice.gender] ?? voice.gender
-  return `${voice.label} (${gender})`
-}
 
 function SettingsPage() {
   const query = useQuery({ queryKey: SETTINGS_QUERY_KEY, queryFn: getSettings })

@@ -10,9 +10,9 @@ from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from interview_agent.config import Settings
-from interview_agent.interview.models import InterviewPlan
+from interview_agent.interview.models import InterviewLength, InterviewPlan, Seniority
 from interview_agent.llm import build_chat_model
-from interview_agent.prompts import PLANNER_SYSTEM_PROMPT
+from interview_agent.prompts import build_planner_prompt
 
 
 async def run_planner(
@@ -21,6 +21,10 @@ async def run_planner(
     job_offer: str,
     language: str,
     agent_name: str,
+    # None means "classify it yourself": the ONE explicit classification in the
+    # whole pipeline. Anything else is authoritative and the planner is told so.
+    seniority: Seniority | None = None,
+    interview_length: InterviewLength = InterviewLength.STANDARD,
     persona: str | None = None,
     custom_instructions: str | None = None,
     usage_callback: UsageMetadataCallbackHandler | None = None,
@@ -54,7 +58,10 @@ async def run_planner(
     # attempt is real spend.
     config = {"callbacks": [usage_callback]} if usage_callback else None
     result = await llm.ainvoke(
-        [SystemMessage(content=PLANNER_SYSTEM_PROMPT), HumanMessage(content=content)],
+        [
+            SystemMessage(content=build_planner_prompt(seniority, interview_length)),
+            HumanMessage(content=content),
+        ],
         config=config,
     )
     if not isinstance(result, InterviewPlan):

@@ -12,9 +12,9 @@ from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from interview_agent.config import Settings
-from interview_agent.interview.models import EvaluationResult
+from interview_agent.interview.models import EvaluationResult, Seniority
 from interview_agent.llm import build_chat_model
-from interview_agent.prompts import EVALUATOR_SYSTEM_PROMPT
+from interview_agent.prompts import build_evaluator_prompt
 
 
 def _format_transcript(messages: list[tuple[str, str]]) -> str:
@@ -23,8 +23,13 @@ def _format_transcript(messages: list[tuple[str, str]]) -> str:
 
 
 def _format_milestones(milestones: list[dict[str, Any]]) -> str:
+    """Each milestone carries the bar set for it at planning time, so the
+    evaluator judges against a written criterion instead of re-deriving how
+    deep the topic "should" go. Legacy rows have no bar; the line just omits it.
+    """
     return "\n".join(
         f"- [{'x' if m['completed'] else ' '}] {m['title']}: {m['description']}"
+        + (f" (passes when: {m['expected_evidence']})" if m.get("expected_evidence") else "")
         + (f" (notes: {m['notes']})" if m.get("notes") else "")
         for m in milestones
     )
@@ -38,6 +43,9 @@ async def run_evaluator(
     milestones: list[dict[str, Any]],
     transcript: list[tuple[str, str]],
     ended_reason: str,
+    # The level pinned at creation. Never re-inferred here: re-inferring is
+    # what let an advanced-looking stack drag the bar up to senior.
+    seniority: Seniority | str | None = None,
     custom_instructions: str | None = None,
     usage_callback: UsageMetadataCallbackHandler | None = None,
 ) -> EvaluationResult:
@@ -69,7 +77,10 @@ async def run_evaluator(
     # ContextVar leak, and per-retry-attempt accumulation is real spend.
     config = {"callbacks": [usage_callback]} if usage_callback else None
     result = await llm.ainvoke(
-        [SystemMessage(content=EVALUATOR_SYSTEM_PROMPT), HumanMessage(content=content)],
+        [
+            SystemMessage(content=build_evaluator_prompt(seniority)),
+            HumanMessage(content=content),
+        ],
         config=config,
     )
     if not isinstance(result, EvaluationResult):

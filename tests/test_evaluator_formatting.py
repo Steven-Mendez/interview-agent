@@ -24,3 +24,26 @@ def test_format_milestones_checkboxes_and_notes():
     lines = out.splitlines()
     assert lines[0] == "- [x] K8s: Probe it. (notes: solid)"
     assert lines[1] == "- [ ] SQL: Ask joins."  # no notes suffix when empty
+
+
+def test_format_milestones_carries_the_expected_evidence_bar():
+    """The bar travels to the evaluator so it judges against a written
+    criterion instead of re-deriving how deep the topic should go."""
+    out = _format_milestones(
+        [
+            {
+                "title": "Indexes",
+                "description": "Probe it.",
+                "expected_evidence": "Names the missing index",
+                "completed": True,
+                "notes": "solid",
+            },
+            # Legacy row planned before the column existed.
+            {"title": "SQL", "description": "Ask joins.", "completed": False, "notes": None},
+        ]
+    )
+    lines = out.splitlines()
+    assert lines[0] == (
+        "- [x] Indexes: Probe it. (passes when: Names the missing index) (notes: solid)"
+    )
+    assert lines[1] == "- [ ] SQL: Ask joins."

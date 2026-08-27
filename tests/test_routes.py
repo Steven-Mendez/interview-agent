@@ -413,10 +413,16 @@ async def test_add_token_usage_merges_components(client_and_sessionmaker):
     }
 
 
-async def test_token_allows_a_fresh_reconnect(client_and_sessionmaker):
+async def test_token_allows_a_fresh_reconnect(client_and_sessionmaker, monkeypatch):
     # A crash never marks the row completed, so "interviewing" is how a
     # resumable interview looks. Recent ones must still get a token.
     client, sessionmaker = client_and_sessionmaker
+    # Minting the JWT needs real credentials; settings default to "" and CI
+    # has no .env, so supply throwaway ones rather than depend on the
+    # environment (which is what made this pass locally and fail in CI).
+    monkeypatch.setattr(settings, "livekit_api_key", "devkey")
+    monkeypatch.setattr(settings, "livekit_api_secret", "devsecret" * 4)
+    monkeypatch.setattr(settings, "livekit_url", "wss://example.livekit.cloud")
     conversation_id = uuid.uuid4()
     async with sessionmaker() as session:
         session.add(

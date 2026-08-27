@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import anyio.to_thread
@@ -313,6 +314,26 @@ async def get_token(request: Request, interview_id: uuid.UUID):
                 status_code=409,
                 detail=f"Interview is '{conversation.status}', expected 'planned'",
             )
+        # Reconnect window: an "interviewing" row outlives its worker (a crash
+        # never marks it completed), so without a bound a candidate could
+        # rejoin days later. The worker charges the elapsed time against the
+        # cap, so a stale resume would greet them and wrap up in the same
+        # breath. Same window the capacity check uses — a live interview can
+        # never outlast its time cap, and nothing else updates the row while
+        # it runs, so updated_at is effectively the interview's start.
+        if conversation.status == "interviewing":
+            window = timedelta(minutes=settings.interview_max_minutes + 5)
+            if conversation.updated_at < datetime.now(UTC) - window:
+                logger.info(
+                    "refusing stale reconnect",
+                    extra={
+                        "conversation": str(interview_id),
+                        "updated_at": conversation.updated_at.isoformat(),
+                    },
+                )
+                raise HTTPException(
+                    status_code=409, detail="Interview is 'expired', expected 'planned'"
+                )
         # Capacity check (soft cap): only for NEW interviews — an already
         # "interviewing" conversation is a reconnect of a counted session.
         # Soft because a token issued now only counts once the worker marks
@@ -365,6 +386,17 @@ async def evaluate_interview(request: Request, interview_id: uuid.UUID):
     # transaction open across it is pure waste.
     async with sessionmaker() as session:
         conversation = await _load_or_404(session, interview_id)
+        # A live interview must never be evaluated. The worker only POSTs here
+        # after marking the row "completed", so this only rejects an early
+        # retry from the browser, or a crashed job's evaluation firing while a
+        # reconnected job is still talking — which would score a half
+        # transcript AND purge the resume chunks from Qdrant (see the cleanup
+        # at the end of this handler), silently blinding search_resume for the
+        # rest of the live interview.
+        if conversation.status == "interviewing":
+            raise HTTPException(
+                status_code=409, detail="Interview is still in progress"
+            )
         messages = await db.get_messages(session, interview_id)
         if not messages:
             raise HTTPException(status_code=409, detail="No transcript to evaluate yet")

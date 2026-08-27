@@ -16,28 +16,36 @@ import asyncio
 import itertools
 import json
 import logging
+import re
 import time
+import unicodedata
 import uuid
+from collections import deque
+from collections.abc import AsyncIterable, Callable, Sequence
+from datetime import UTC, datetime
 
 import httpx
-from livekit import api
+from livekit import api, rtc
 from livekit.agents import (
     Agent,
     AgentSession,
     ConversationItemAddedEvent,
     JobContext,
     JobProcess,
+    ModelSettings,
     TurnHandlingOptions,
     WorkerOptions,
     cli,
     inference,
+    stt,
 )
-from livekit.agents.llm import ChatMessage
+from livekit.agents.llm import ChatContext, ChatMessage
 from livekit.plugins import langchain, silero
 from qdrant_client import AsyncQdrantClient
 
 from interview_agent.config import settings
 from interview_agent.interview import db, rag
+from interview_agent.interview.db import Message
 from interview_agent.interview.interviewer_graph import build_interviewer_graph
 from interview_agent.prompts import build_interviewer_prompt
 from interview_agent.voices import DEFAULT_LANGUAGE, DEFAULT_VOICE, VOICES
@@ -45,6 +53,25 @@ from interview_agent.voices import DEFAULT_LANGUAGE, DEFAULT_VOICE, VOICES
 logger = logging.getLogger("interview_agent")
 
 _WRAP_UP_SECONDS = 120  # warning-to-forced-close window inside the time cap
+
+# Tuning for _make_duplicate_final_filter, calibrated against a real interview
+# (see its docstring). Every threshold errs towards keeping speech: a missed
+# duplicate is a visible, recoverable bug, a false positive silently deletes
+# candidate speech from the transcript the evaluator scores.
+_DEDUPE_MIN_WORDS = 8  # shortest real duplicate seen was 18 words
+_DEDUPE_MAX_LAG_SECONDS = 5.0  # an aggregate lands 0-0.5s after the final it repeats
+_DEDUPE_HISTORY_SECONDS = 60.0  # longest stretch one aggregate spanned was 11s
+_DEDUPE_MAX_FINALS = 64  # memory guard for a 15-minute interview
+
+_NON_WORD = re.compile(r"[^\w\s]", re.UNICODE)
+
+# How much of an interrupted interview is replayed into the interviewer's
+# context on resume. A 15-minute interview runs ~28 exchanges (~56 messages),
+# so this never trims a legitimate resume — it only bounds the pathological
+# case. It is not the cost control either: the replay is a one-off ~4% of an
+# interview's tokens, whereas charging the elapsed time (see time_cap) is what
+# stops a resume from doubling the interview and quadrupling LLM input.
+_RESUME_MAX_MESSAGES = 80
 
 
 def prewarm(proc: JobProcess) -> None:
@@ -67,6 +94,100 @@ def _conversation_id_from_job(ctx: JobContext) -> uuid.UUID | None:
         except ValueError:
             pass
     return None
+
+
+def _normalize_final(text: str) -> list[str]:
+    """Token list for comparing two renderings of the same speech.
+
+    AssemblyAI's formatted and unformatted finals differ only in case,
+    punctuation and digit grouping — "de los 5. 000 a 10. 000 productos." vs
+    "de los 5 000 a 10 000 productos" — so fold all three away. Tokens, not a
+    string: comparing word lists keeps "no" from matching the tail of "camino".
+    """
+    folded = unicodedata.normalize("NFD", text.lower())
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    return _NON_WORD.sub(" ", folded).split()
+
+
+def _make_duplicate_final_filter(
+    *, now: Callable[[], float] = time.monotonic
+) -> Callable[[str], bool]:
+    """Return `keep(final_text) -> bool`, dropping redundant STT finals.
+
+    `assemblyai/universal-streaming-multilingual` emits, for one long answer,
+    several FORMATTED per-phrase finals and then one UNFORMATTED final that
+    re-states everything since its own turn started. That aggregate is
+    cumulative rather than incremental (livekit/agents#3312), and it wrecks the
+    transcript two different ways depending on whether it beats the turn flush:
+    arriving before, it is concatenated into the same message; arriving after,
+    it opens a whole second turn. Both come from the same event, so dropping it
+    here — upstream of the browser stream, the end-of-turn detector and
+    `conversation_item_added` — fixes both.
+
+    The aggregate always covers up to and including the most recent phrase
+    final, so it is structurally a *suffix* of what was already emitted. Match
+    on suffix rather than containment: containment would also swallow a
+    legitimate prefix of earlier speech.
+
+    Stateful. Only kept finals are recorded, so the buffer stays a faithful
+    record of what actually went downstream. It is a rolling time window and is
+    deliberately NOT reset on turn commit: the aggregate lands ~0.06s AFTER the
+    commit, so a commit-scoped buffer would be empty exactly when it is needed.
+    """
+    history: deque[tuple[float, list[str]]] = deque(maxlen=_DEDUPE_MAX_FINALS)
+
+    def keep(text: str) -> bool:
+        tokens = _normalize_final(text)
+        if not tokens:
+            return True
+        stamp = now()
+        cutoff = stamp - _DEDUPE_HISTORY_SECONDS
+        while history and history[0][0] < cutoff:
+            history.popleft()
+        # A duplicate treads on the heels of what it repeats; anything slower is
+        # the candidate genuinely saying the same thing again (e.g. after being
+        # asked to repeat), which must be kept.
+        recent = bool(history) and stamp - history[-1][0] <= _DEDUPE_MAX_LAG_SECONDS
+        if len(tokens) >= _DEDUPE_MIN_WORDS and recent:
+            seen = [tok for _, toks in history for tok in toks]
+            if len(tokens) <= len(seen) and seen[-len(tokens) :] == tokens:
+                return False
+        history.append((stamp, tokens))
+        return True
+
+    return keep
+
+
+def _next_seq(messages: Sequence[Message]) -> int:
+    """Where this job should start numbering the transcript.
+
+    `msg_seq` used to be a bare `itertools.count()`, which restarts at 0 when a
+    second job runs for the same conversation (worker crash + browser reload —
+    `get_token` deliberately allows that, see routes.py). `get_messages` orders
+    by `(seq, id)`, so two runs of 0,1,2… interleave into gibberish. Continue
+    past the highest seq instead.
+
+    `seq` is nullable — the backfill covered every row that existed then, but
+    nothing enforces it — so skip NULLs rather than crash comparing them.
+    """
+    return max((m.seq for m in messages if m.seq is not None), default=-1) + 1
+
+
+def _chat_ctx_from_messages(messages: Sequence[Message]) -> ChatContext:
+    """Rebuild the interviewer's memory of an interrupted interview.
+
+    Bounded to the last `_RESUME_MAX_MESSAGES` turns: the LangChain adapter
+    converts the WHOLE ChatContext into graph state on every turn
+    (`livekit/plugins/langchain/langgraph.py:_chat_ctx_to_state`), so an
+    unbounded replay would ride along on every LLM call for the rest of the
+    interview. Milestone progress covers whatever gets trimmed — the graph
+    re-reads it from Postgres each turn, it never lives in this context.
+    """
+    ctx = ChatContext.empty()
+    for m in messages[-_RESUME_MAX_MESSAGES:]:
+        if m.role in ("user", "assistant") and m.content and m.content.strip():
+            ctx.add_message(role=m.role, content=m.content)
+    return ctx
 
 
 def _build_session(ctx: JobContext, graph, agent_settings: dict | None) -> AgentSession:
@@ -93,8 +214,56 @@ def _build_session(ctx: JobContext, graph, agent_settings: dict | None) -> Agent
         # dev/hosted mode, `v1-mini` (local, weights ship inside the
         # livekit-local-inference wheel) when self-hosted, with automatic
         # cloud→local fallback.
-        turn_handling=TurnHandlingOptions(turn_detection=inference.TurnDetector()),
+        turn_handling=TurnHandlingOptions(
+            turn_detection=inference.TurnDetector(),
+            # Pinned to livekit's streaming defaults. Do NOT raise min_delay to
+            # chase the "late stt final" warning: AssemblyAI's aggregate final
+            # would then land *before* the flush and get concatenated into the
+            # same transcript instead of opening a second turn — the same
+            # duplicate, but invisible. InterviewAgent.stt_node handles it.
+            endpointing={"mode": "fixed", "min_delay": 0.3, "max_delay": 2.5},
+        ),
     )
+
+
+class InterviewAgent(Agent):
+    """Agent that drops AssemblyAI's redundant aggregate STT finals.
+
+    Everything that was duplicating — the browser transcription stream, the
+    running transcript the end-of-turn detector accumulates, and
+    `conversation_item_added` (hence the `messages` rows and the LLM's
+    ChatContext) — consumes the single event stream `stt_node` yields, so one
+    filter here covers all of them. See `_make_duplicate_final_filter`.
+    """
+
+    def __init__(self, *, instructions: str, chat_ctx: ChatContext | None = None) -> None:
+        # chat_ctx carries the earlier half of a resumed interview; livekit
+        # copies it into the agent and never re-emits it as conversation items,
+        # so seeding it does not re-persist the transcript.
+        super().__init__(instructions=instructions, chat_ctx=chat_ctx)
+        # On the agent rather than inside stt_node, so the buffer survives a
+        # reconnect of the STT stream.
+        self._keep_final = _make_duplicate_final_filter()
+        self._dropped_finals = 0
+
+    async def stt_node(
+        self, audio: AsyncIterable[rtc.AudioFrame], model_settings: ModelSettings
+    ) -> AsyncIterable[stt.SpeechEvent]:
+        async for event in Agent.default.stt_node(self, audio, model_settings):
+            # Only finals are judged: interim/preflight transcripts drive the
+            # live bubble, and RECOGNITION_USAGE carries STT billing metrics.
+            if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT and event.alternatives:
+                text = event.alternatives[0].text
+                if text.strip() and not self._keep_final(text):
+                    self._dropped_finals += 1
+                    logger.info(
+                        "dropped duplicate stt final #%d (%d words): %.120s",
+                        self._dropped_finals,
+                        len(text.split()),
+                        text,
+                    )
+                    continue
+            yield event
 
 
 async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
@@ -105,6 +274,12 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
     async with sessionmaker() as s:
         conversation = await db.get_conversation(s, conversation_id)
         milestones = await db.get_milestones(s, conversation_id)
+        # Non-empty only when a previous job already ran for this conversation
+        # (worker crash + browser reload). Everything the resume needs — turn
+        # numbering, the interviewer's memory, the real start time — comes off
+        # these rows, so this is the only extra query, and it runs before
+        # session.start so it costs the candidate no time to first word.
+        prior_messages = await db.get_messages(s, conversation_id)
     if conversation is None or conversation.plan is None:
         logger.error("no planned conversation %s; aborting job", conversation_id)
         await engine.dispose()
@@ -151,7 +326,14 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
     # Turn order assigned here, synchronously on the event loop: the persist
     # tasks are fire-and-forget and their commits (which decide the
     # autoincrement id) can land out of order under DB latency.
-    msg_seq = itertools.count()
+    msg_seq = itertools.count(_next_seq(prior_messages))
+    if prior_messages:
+        logger.info(
+            "resuming interview %s: %d prior messages, transcript continues at seq %d",
+            conversation_id,
+            len(prior_messages),
+            _next_seq(prior_messages),
+        )
 
     def _on_item(event: ConversationItemAddedEvent) -> None:
         # Any conversation item counts as activity for the idle watchdog.
@@ -216,10 +398,23 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
                 reason = "timeout"
         await finish(reason)
 
+    # On a resume the clock does not restart: charge what the first half already
+    # spent, or a reconnect would hand out a whole fresh budget. Computed here
+    # rather than inside time_cap so a failure is loud — raised in the coroutine
+    # it would kill timer_task silently and leave the interview with no hard
+    # stop. min(created_at), not prior_messages[0]: get_messages sorts by seq,
+    # and NULL seq sorts last in Postgres.
+    elapsed_seconds = 0.0
+    if prior_messages:
+        started = min(m.created_at for m in prior_messages)
+        elapsed_seconds = max(0.0, (datetime.now(UTC) - started).total_seconds())
+
     async def time_cap() -> None:
         nonlocal wrap_up_issued
-        warn_after = max(0, settings.interview_max_minutes * 60 - _WRAP_UP_SECONDS)
-        await asyncio.sleep(warn_after)
+        budget = settings.interview_max_minutes * 60 - _WRAP_UP_SECONDS - elapsed_seconds
+        # Already out of budget: warn immediately and let the usual wrap-up run,
+        # so the candidate gets a goodbye instead of a dead screen.
+        await asyncio.sleep(max(0, budget))
         if closing:
             return
         wrap_up_issued = True
@@ -286,7 +481,12 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
     async with sessionmaker() as s:
         await db.set_status(s, conversation_id, "interviewing")
 
-    await session.start(room=ctx.room, agent=Agent(instructions=prompt))
+    await session.start(
+        room=ctx.room,
+        agent=InterviewAgent(
+            instructions=prompt, chat_ctx=_chat_ctx_from_messages(prior_messages)
+        ),
+    )
     watcher_task = asyncio.create_task(watch_end_event())
     timer_task = asyncio.create_task(time_cap())
     idle_task = asyncio.create_task(idle_watchdog())
@@ -300,13 +500,26 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
 
     ctx.room.on("participant_disconnected", _on_participant_disconnected)
 
-    await session.generate_reply(
-        instructions=(
+    # Only the worker writes to `messages`, so rows here mean this conversation
+    # already had a job: the interview was cut short and is being resumed. The
+    # transcript so far is in the agent's context, so pick the thread back up
+    # instead of starting over.
+    opening = (
+        (
+            f"The connection dropped and the candidate has just rejoined. In language "
+            f"'{language}': acknowledge the interruption in ONE short sentence — do NOT "
+            "introduce yourself again — then carry on from where the transcript left "
+            "off, without repeating your last question word for word. Under 40 words "
+            "total. Do not use any tools yet."
+        )
+        if prior_messages
+        else (
             f"Greet the candidate in language '{language}': introduce yourself "
             "per your persona in ONE short sentence, then ask ONE short first "
             "question. Under 40 words total. Do not use any tools yet."
         )
     )
+    await session.generate_reply(instructions=opening)
 
 
 async def entrypoint(ctx: JobContext) -> None:

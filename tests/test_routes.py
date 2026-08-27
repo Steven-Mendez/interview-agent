@@ -9,16 +9,20 @@ Postgres, in CI on the service container (TEST_DATABASE_URL overrides).
 
 from __future__ import annotations
 
+import itertools
 import os
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from interview_agent import agent
+from interview_agent.config import settings
 from interview_agent.interview import db, rag
 from interview_agent.interview.models import EvaluationResult, InterviewPlan, MilestoneSpec
 from interview_agent.server import routes
@@ -325,6 +329,30 @@ async def test_evaluate_without_transcript_409(client_and_sessionmaker, monkeypa
     assert res.status_code == 409
 
 
+async def test_evaluate_refuses_a_live_interview(client_and_sessionmaker, monkeypatch):
+    # Evaluating mid-interview would score half a transcript and, worse, purge
+    # the resume chunks from Qdrant — blinding search_resume for the rest of
+    # the live interview. The worker only POSTs here after marking "completed".
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(routes, "run_evaluator", _fake_evaluator)
+    conversation_id = uuid.uuid4()
+    async with sessionmaker() as session:
+        session.add(
+            db.Conversation(
+                id=conversation_id,
+                status="interviewing",
+                job_offer="o",
+                resume_markdown="r",
+            )
+        )
+        await session.commit()
+        await db.insert_message(session, conversation_id, "user", "mid-answer", seq=0)
+
+    res = await client.post(f"/api/interviews/{conversation_id}/evaluate")
+    assert res.status_code == 409
+    assert "in progress" in res.json()["detail"]
+
+
 async def test_evaluate_failure_sets_status_and_retry_recovers(
     client_and_sessionmaker, monkeypatch
 ):
@@ -385,6 +413,57 @@ async def test_add_token_usage_merges_components(client_and_sessionmaker):
     }
 
 
+async def test_token_allows_a_fresh_reconnect(client_and_sessionmaker):
+    # A crash never marks the row completed, so "interviewing" is how a
+    # resumable interview looks. Recent ones must still get a token.
+    client, sessionmaker = client_and_sessionmaker
+    conversation_id = uuid.uuid4()
+    async with sessionmaker() as session:
+        session.add(
+            db.Conversation(
+                id=conversation_id,
+                status="interviewing",
+                job_offer="o",
+                resume_markdown="r",
+            )
+        )
+        await session.commit()
+
+    res = await client.get(f"/api/interviews/{conversation_id}/token")
+    assert res.status_code == 200
+    assert res.json()["room"] == f"interview-{conversation_id}"
+
+
+async def test_token_refuses_a_stale_reconnect(client_and_sessionmaker):
+    # An orphaned "interviewing" row lives until the retention purge. Without a
+    # bound, a candidate could rejoin days later — and since the worker charges
+    # the elapsed time against the cap, they would be greeted and wrapped up in
+    # the same breath.
+    client, sessionmaker = client_and_sessionmaker
+    conversation_id = uuid.uuid4()
+    stale = datetime.now(UTC) - timedelta(minutes=settings.interview_max_minutes + 30)
+    async with sessionmaker() as session:
+        session.add(
+            db.Conversation(
+                id=conversation_id,
+                status="interviewing",
+                job_offer="o",
+                resume_markdown="r",
+            )
+        )
+        await session.commit()
+        # onupdate=func.now() fires on any UPDATE, so age the row directly.
+        await session.execute(
+            update(db.Conversation)
+            .where(db.Conversation.id == conversation_id)
+            .values(updated_at=stale)
+        )
+        await session.commit()
+
+    res = await client.get(f"/api/interviews/{conversation_id}/token")
+    assert res.status_code == 409
+
+
 async def test_get_messages_orders_by_seq_not_id(client_and_sessionmaker):
     _, sessionmaker = client_and_sessionmaker
     conversation_id = uuid.uuid4()
@@ -401,6 +480,47 @@ async def test_get_messages_orders_by_seq_not_id(client_and_sessionmaker):
         await db.insert_message(session, conversation_id, "user", "first", seq=0)
         messages = await db.get_messages(session, conversation_id)
     assert [m.content for m in messages] == ["first", "second"]
+
+
+async def test_resumed_job_appends_instead_of_interleaving(client_and_sessionmaker):
+    # A worker crash mid-interview leaves the row "interviewing", so a reload
+    # dispatches a second job. It must continue the transcript, not renumber
+    # from 0 — which order_by(seq, id) would shuffle into the first half.
+    _, sessionmaker = client_and_sessionmaker
+    conversation_id = uuid.uuid4()
+    async with sessionmaker() as session:
+        session.add(
+            db.Conversation(
+                id=conversation_id,
+                status="interviewing",
+                job_offer="o",
+                resume_markdown="r",
+            )
+        )
+        await session.commit()
+        for seq, (role, content) in enumerate(
+            [("assistant", "greeting"), ("user", "answer 1"), ("assistant", "question 2")]
+        ):
+            await db.insert_message(session, conversation_id, role, content, seq=seq)
+
+        prior = await db.get_messages(session, conversation_id)
+        assert agent._next_seq(prior) == 3
+        resumed_seq = itertools.count(agent._next_seq(prior))
+
+        for role, content in [("assistant", "welcome back"), ("user", "answer 2")]:
+            await db.insert_message(
+                session, conversation_id, role, content, seq=next(resumed_seq)
+            )
+        messages = await db.get_messages(session, conversation_id)
+
+    assert [m.content for m in messages] == [
+        "greeting",
+        "answer 1",
+        "question 2",
+        "welcome back",
+        "answer 2",
+    ]
+    assert [m.seq for m in messages] == [0, 1, 2, 3, 4]
 
 
 # ---- /healthz ---------------------------------------------------------------

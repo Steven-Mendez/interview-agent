@@ -66,10 +66,10 @@ def setup_file_logging(
     handler.setLevel(level)
     handler._tag = _HANDLER_TAG  # type: ignore[attr-defined]
     handler.setFormatter(
-        _ExtraFormatter(
-            "%(asctime)s %(levelname)-8s %(name)s %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
+        # No datefmt: the default asctime keeps milliseconds, without which
+        # sub-second ordering (an STT final vs. the turn flush it raced) is
+        # unreadable in the log.
+        _ExtraFormatter("%(asctime)s %(levelname)-8s %(name)s %(message)s")
     )
     root.addHandler(handler)
 

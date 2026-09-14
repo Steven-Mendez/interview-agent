@@ -1,12 +1,20 @@
 name: CI
 
+# Every push, on every branch: a branch without a PR used to get no CI at
+# all. The pull_request event only adds value for forks, whose pushes never
+# reach this repository, so same-repo PRs skip it and rely on the push run —
+# status checks are matched by commit, so the PR still sees them.
 on:
   push:
-    branches: [main]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
+  backend:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -31,4 +39,29 @@ jobs:
           enable-cache: true
       - run: uv sync
       - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      # The live-LLM calibration test skips itself without OPENAI_API_KEY.
       - run: uv run pytest
+
+  frontend:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.8.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm check
+      - run: pnpm test
+      - run: pnpm build

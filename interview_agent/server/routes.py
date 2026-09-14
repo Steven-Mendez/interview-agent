@@ -2,7 +2,9 @@
 
 Flow: POST /interviews (upload + plan) → GET /interviews/{id}/token (join
 room, agent dispatched) → interview happens → POST /interviews/{id}/evaluate
-(auto-triggered by the worker, re-invocable) → GET /interviews/{id} (poll).
+(auto-triggered by the worker; claims the row and answers 202 while the
+evaluation runs in the background, see server.evaluations) →
+GET /interviews/{id} (poll until evaluated / evaluation_failed).
 
 Past interviews are browsable through GET /interviews (paginated history) and
 GET /interviews/{id}/transcript, and re-runnable through
@@ -23,16 +25,15 @@ from langchain_core.callbacks import UsageMetadataCallbackHandler
 from livekit import api
 from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from interview_agent.config import settings
 from interview_agent.interview import db, rag
-from interview_agent.interview.evaluator import run_evaluator
 from interview_agent.interview.models import InterviewLength, Seniority
 from interview_agent.interview.planner import run_planner
 from interview_agent.llm import summarize_usage
 from interview_agent.prompts import DEFAULT_SENIORITY, length_for
+from interview_agent.server import evaluations
 from interview_agent.voices import (
     DEFAULT_AGENT_NAME,
     SUPPORTED_LANGUAGES,
@@ -288,6 +289,37 @@ def _offer_title(job_offer: str, limit: int = 90) -> str:
     return "Untitled role"
 
 
+def _reconnect_deadline(conversation: db.Conversation) -> datetime:
+    """Until when an "interviewing" row can be rejoined.
+
+    A crash never marks the row completed, so without a bound a candidate
+    could rejoin days later — and since the worker charges the elapsed time
+    against the cap, a stale resume would greet them and wrap up in the same
+    breath. Nothing else updates the row while the interview runs, so
+    updated_at is effectively its start; the same window the capacity check
+    uses (a live interview can never outlast its cap)."""
+    cap = conversation.max_minutes or settings.interview_max_minutes
+    return conversation.updated_at + timedelta(minutes=cap + 5)
+
+
+def _can_reconnect(conversation: db.Conversation) -> bool:
+    return datetime.now(UTC) < _reconnect_deadline(conversation)
+
+
+def _lifecycle_fields(conversation: db.Conversation) -> dict[str, Any]:
+    """What the UI needs to know whether a row can be (re)joined, without
+    re-deriving the reconnect window from a cap it may not have (legacy rows
+    fall back to server config): `can_start` for planned rows and for
+    interviewing ones still inside the window, and the window's end."""
+    if conversation.status == "interviewing":
+        deadline = _reconnect_deadline(conversation)
+        return {
+            "can_start": datetime.now(UTC) < deadline,
+            "reconnect_until": deadline.isoformat(),
+        }
+    return {"can_start": conversation.status == "planned", "reconnect_until": None}
+
+
 def _serialize(conversation: db.Conversation) -> dict[str, Any]:
     evaluation = conversation.evaluation
     return {
@@ -296,6 +328,7 @@ def _serialize(conversation: db.Conversation) -> dict[str, Any]:
         "updated_at": conversation.updated_at.isoformat(),
         "status": conversation.status,
         "ended_reason": conversation.ended_reason,
+        **_lifecycle_fields(conversation),
         "title": _offer_title(conversation.job_offer),
         "job_offer": conversation.job_offer,
         "resume_filename": conversation.resume_filename,
@@ -357,6 +390,7 @@ def _serialize_summary(conversation: db.Conversation) -> dict[str, Any]:
         "updated_at": conversation.updated_at.isoformat(),
         "status": conversation.status,
         "ended_reason": conversation.ended_reason,
+        **_lifecycle_fields(conversation),
         "title": _offer_title(conversation.job_offer),
         "resume_filename": conversation.resume_filename,
         "seniority": conversation.seniority,
@@ -370,21 +404,6 @@ def _serialize_summary(conversation: db.Conversation) -> dict[str, Any]:
             {"hired": evaluation.hired, "score": evaluation.score} if evaluation else None
         ),
     }
-
-
-async def _record_spent_usage(
-    session: AsyncSession,
-    conversation_id: uuid.UUID,
-    component: str,
-    handler: UsageMetadataCallbackHandler,
-) -> None:
-    """Book the tokens a FAILED planner/evaluator run consumed. The callback
-    fires per retry attempt, so a run that never produced a usable result
-    still spent whatever it reports; only a run that never reached the model
-    (nothing to book) is skipped."""
-    usage = summarize_usage(handler.usage_metadata)
-    if any(usage.values()):
-        await db.add_token_usage(session, conversation_id, component, usage)
 
 
 async def _load_or_404(session: AsyncSession, interview_id: uuid.UUID) -> db.Conversation:
@@ -543,7 +562,7 @@ async def _plan_and_persist(
             await db.set_status(session, conversation_id, "error")
             # The attempts inside with_retry were real spend even though no
             # plan came out of them.
-            await _record_spent_usage(session, conversation_id, "planner", planner_usage)
+            await evaluations.record_spent_usage(session, conversation_id, "planner", planner_usage)
             raise HTTPException(status_code=500, detail=f"Planning failed: {exc}") from exc
 
         await db.add_token_usage(
@@ -598,6 +617,7 @@ _HISTORY_STATUSES = (
     "planned",
     "interviewing",
     "completed",
+    "evaluating",
     "evaluated",
     "evaluation_failed",
     "error",
@@ -744,27 +764,19 @@ async def get_token(request: Request, interview_id: uuid.UUID):
                 status_code=409,
                 detail=f"Interview is '{conversation.status}', expected 'planned'",
             )
-        # Reconnect window: an "interviewing" row outlives its worker (a crash
-        # never marks it completed), so without a bound a candidate could
-        # rejoin days later. The worker charges the elapsed time against the
-        # cap, so a stale resume would greet them and wrap up in the same
-        # breath. Same window the capacity check uses — a live interview can
-        # never outlast its time cap, and nothing else updates the row while
-        # it runs, so updated_at is effectively the interview's start.
-        if conversation.status == "interviewing":
-            cap = conversation.max_minutes or settings.interview_max_minutes
-            window = timedelta(minutes=cap + 5)
-            if conversation.updated_at < datetime.now(UTC) - window:
-                logger.info(
-                    "refusing stale reconnect",
-                    extra={
-                        "conversation": str(interview_id),
-                        "updated_at": conversation.updated_at.isoformat(),
-                    },
-                )
-                raise HTTPException(
-                    status_code=409, detail="Interview is 'expired', expected 'planned'"
-                )
+        # Reconnect window (see _reconnect_deadline): an "interviewing" row
+        # past it is an orphan of a crashed worker, not a live interview.
+        if conversation.status == "interviewing" and not _can_reconnect(conversation):
+            logger.info(
+                "refusing stale reconnect",
+                extra={
+                    "conversation": str(interview_id),
+                    "updated_at": conversation.updated_at.isoformat(),
+                },
+            )
+            raise HTTPException(
+                status_code=409, detail="Interview is 'expired', expected 'planned'"
+            )
         # Capacity check (soft cap): only for NEW interviews — an already
         # "interviewing" conversation is a reconnect of a counted session.
         # Soft because a token issued now only counts once the worker marks
@@ -808,128 +820,43 @@ async def get_token(request: Request, interview_id: uuid.UUID):
     return {"server_url": settings.livekit_url, "room": room, "token": token}
 
 
-@router.post("/interviews/{interview_id}/evaluate")
+@router.post("/interviews/{interview_id}/evaluate", status_code=202)
 async def evaluate_interview(request: Request, interview_id: uuid.UUID):
-    sessionmaker = _sessionmaker(request)
+    """Start the evaluation in the background; 202 with the row as it stands.
 
-    # Session 1 (short): load everything the evaluator needs, then release
-    # the connection — the LLM call below can take minutes, and holding a
-    # transaction open across it is pure waste.
-    async with sessionmaker() as session:
+    Idempotent: the row is CLAIMED with one atomic UPDATE into "evaluating"
+    (db.claim_evaluation), so the worker's auto-trigger and a Retry from the
+    browser racing here start exactly one run — the loser just gets the row
+    back. A run whose process died (no heartbeat for evaluations.STALE_AFTER)
+    is claimed again, which is what the UI's Retry does once its own clock,
+    anchored on the same heartbeat, runs out. Poll GET /interviews/{id} for
+    the outcome.
+    """
+    async with _sessionmaker(request)() as session:
         conversation = await _load_or_404(session, interview_id)
-        # A live interview must never be evaluated. The worker only POSTs here
-        # after marking the row "completed", so this only rejects an early
-        # retry from the browser, or a crashed job's evaluation firing while a
-        # reconnected job is still talking — which would score a half
-        # transcript AND purge the resume chunks from Qdrant (see the cleanup
-        # at the end of this handler), silently blinding search_resume for the
-        # rest of the live interview.
         if conversation.status == "interviewing":
-            raise HTTPException(status_code=409, detail="Interview is still in progress")
-        messages = await db.get_messages(session, interview_id)
-        if not messages:
+            # A live interview must never be evaluated: it would score half a
+            # transcript AND purge the resume chunks from Qdrant (see the
+            # runner), blinding search_resume for the rest of it. But a row
+            # past its reconnect window is not live — a crash never marks it
+            # completed — and the transcript it left is still worth scoring.
+            if _can_reconnect(conversation):
+                raise HTTPException(status_code=409, detail="Interview is still in progress")
+            logger.info(
+                "closing an orphaned interview for evaluation",
+                extra={
+                    "conversation": str(interview_id),
+                    "updated_at": conversation.updated_at.isoformat(),
+                },
+            )
+            await db.set_status(session, interview_id, "completed", "connection_lost")
+        if not await db.has_messages(session, interview_id):
             raise HTTPException(status_code=409, detail="No transcript to evaluate yet")
-        milestones = await db.get_milestones(session, interview_id)
-        resume_markdown = conversation.resume_markdown
-        job_offer = conversation.job_offer
-        plan = conversation.plan or {}
-        ended_reason = conversation.ended_reason or "unknown"
-        custom_instructions = conversation.custom_instructions
-        seniority = conversation.seniority
-
-    logger.info(
-        "evaluating interview",
-        extra={"conversation": str(interview_id), "messages": len(messages)},
-    )
-    evaluator_usage = UsageMetadataCallbackHandler()
-    try:
-        result = await run_evaluator(
-            settings,
-            resume_markdown=resume_markdown,
-            job_offer=job_offer,
-            plan=plan,
-            milestones=[
-                {
-                    "title": m.title,
-                    "description": m.description,
-                    "expected_evidence": m.expected_evidence,
-                    "completed": m.completed,
-                    "notes": m.notes,
-                }
-                for m in milestones
-            ],
-            transcript=[(m.role, m.content) for m in messages],
-            ended_reason=ended_reason,
-            seniority=seniority,
-            custom_instructions=custom_instructions,
-            usage_callback=evaluator_usage,
-        )
-    except Exception as exc:
-        # Surface the failure: the frontend polls status and offers a retry
-        # (this endpoint is re-invocable) instead of spinning forever.
-        logger.exception("evaluation failed for %s", interview_id)
-        async with sessionmaker() as session:
-            await db.set_status(session, interview_id, "evaluation_failed")
-            await _record_spent_usage(session, interview_id, "evaluator", evaluator_usage)
-        raise HTTPException(status_code=502, detail=f"Evaluation failed: {exc}") from exc
-
-    if result.seniority_evaluated.value != seniority:
-        # The level is pinned and handed to the evaluator; an echo of a
-        # different one means the calibration did not hold on this run.
-        # Stored as returned (it is what the score was judged against) but
-        # made visible here.
-        logger.warning(
-            "evaluator judged %s against '%s' instead of the pinned '%s'",
-            interview_id,
-            result.seniority_evaluated.value,
-            seniority,
-        )
-
-    # Session 2 (write): upsert instead of delete+insert — two overlapping
-    # invocations (worker auto-trigger + manual retry) must not race into a
-    # duplicate-key 500; last commit wins and the result stays consistent.
-    values = {
-        "hired": result.hired,
-        "score": result.score,
-        "strengths": result.strengths,
-        "weaknesses": result.weaknesses,
-        "rationale": result.rationale,
-        "seniority_evaluated": result.seniority_evaluated.value,
-        "calibration_notes": result.calibration_notes,
-        "ended_by": ended_reason,
-    }
-    async with sessionmaker() as session:
-        await session.execute(
-            pg_insert(db.Evaluation)
-            .values(conversation_id=interview_id, **values)
-            .on_conflict_do_update(index_elements=["conversation_id"], set_=values)
-        )
-        conversation = await _load_or_404(session, interview_id)
-        conversation.status = "evaluated"
-        await session.commit()
-        # Re-evaluations accumulate on purpose: those tokens were spent.
-        await db.add_token_usage(
-            session, interview_id, "evaluator", summarize_usage(evaluator_usage.usage_metadata)
-        )
+        if await db.claim_evaluation(session, interview_id, evaluations.STALE_AFTER):
+            request.app.state.evaluations.start(interview_id)
+            logger.info("evaluation scheduled", extra={"conversation": str(interview_id)})
+        else:
+            # Not claimable: a run is already on it, and still heartbeating.
+            logger.info("evaluation already running", extra={"conversation": str(interview_id)})
         await session.refresh(conversation)
-        serialized = _serialize(conversation)
-
-    logger.info(
-        "interview evaluated",
-        extra={
-            "conversation": str(interview_id),
-            "hired": result.hired,
-            "score": result.score,
-            "seniority": result.seniority_evaluated.value,
-        },
-    )
-
-    # The resume chunks only exist for the interviewer's search_resume; the
-    # evaluation is done, so drop them (PII). Best-effort: the purge job
-    # sweeps anything missed here.
-    try:
-        await rag.delete_resume_points(request.app.state.qdrant, settings, [interview_id])
-    except Exception:
-        logger.exception("failed to delete resume points for %s", interview_id)
-
-    return serialized
+        return _serialize(conversation)

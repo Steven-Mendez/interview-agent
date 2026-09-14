@@ -7,12 +7,20 @@ const API_BASE = "/api"
 
 // ---- Shapes -----------------------------------------------------------------
 
-/** Mirrors `interview_agent/interview/db.py` + the transitions in agent.py. */
+/** Mirrors `interview_agent/interview/db.py` + the transitions in agent.py.
+ *
+ * created → planned → interviewing → completed → evaluating → evaluated |
+ * evaluation_failed; `error` is a plan that failed. `completed` is the gap
+ * between the interview ending and the evaluation being claimed — seconds,
+ * normally; it sticks only when the worker's trigger never reached the API.
+ * `evaluating` is a run in progress in the API process, which bumps the
+ * row's `updated_at` every 30 s as a heartbeat while it goes. */
 export type InterviewStatus =
   | "created"
   | "planned"
   | "interviewing"
   | "completed"
+  | "evaluating"
   | "evaluated"
   | "evaluation_failed"
   | "error"
@@ -89,6 +97,15 @@ export interface Interview {
   updated_at: string
   status: InterviewStatus
   ended_reason: string | null
+  /** Whether Start (or a rejoin) can be attempted: true for `planned`, and
+   *  for `interviewing` rows still inside their reconnect window. False for
+   *  an `interviewing` row past it — its worker died (a crash never marks
+   *  the row completed), so it can only be evaluated as recorded, or
+   *  repeated. */
+  can_start: boolean
+  /** ISO-8601, UTC: until when the room waits for a rejoin. Non-null only on
+   *  `interviewing` rows. */
+  reconnect_until: string | null
   /** First line of the job offer — the closest thing to a role title. */
   title: string
   job_offer: string
@@ -120,6 +137,11 @@ export interface InterviewSummary {
   updated_at: string
   status: InterviewStatus
   ended_reason: string | null
+  /** Same meaning as on `Interview`: false on an `interviewing` row means
+   *  it was interrupted for good. */
+  can_start: boolean
+  /** Same as on `Interview`: non-null only while `interviewing`. */
+  reconnect_until: string | null
   title: string
   resume_filename: string | null
   seniority: Seniority
@@ -309,7 +331,18 @@ export function getInterviewToken(interviewId: string): Promise<TokenResponse> {
   return request<TokenResponse>(`/interviews/${interviewId}/token`)
 }
 
-/** Re-invocable: the response IS the evaluated interview (no need to re-poll after calling this). */
+/** Starts (or restarts) the evaluation in the background: 202 with the row
+ *  in `evaluating` — or the current row untouched when a run is already
+ *  going, so calling it twice never starts two. The verdict is NOT in the
+ *  response: keep polling GET /interviews/{id} until the status is
+ *  `evaluated` or `evaluation_failed`.
+ *
+ *  Re-invocable on any ended row with a transcript, which includes a run
+ *  whose process died (`evaluating` with an `updated_at` older than 2 min)
+ *  and an `interviewing` row past its reconnect window — that one is marked
+ *  `completed` with ended_reason "connection_lost" and evaluated as recorded.
+ *  409 for a live interview still inside the window and for a row with no
+ *  transcript; 404 for an unknown id. */
 export function evaluateInterview(interviewId: string): Promise<Interview> {
   return request<Interview>(`/interviews/${interviewId}/evaluate`, {
     method: "POST",

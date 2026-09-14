@@ -40,6 +40,7 @@ import {
   repeatInterview,
 } from "@/lib/api"
 import type { Interview } from "@/lib/api"
+import { EVAL_TIMEOUT_MS, evaluationAnchor } from "@/lib/evaluation"
 import { cn } from "@/lib/utils"
 import { log } from "@/lib/log"
 import { useInterviewSession } from "@/hooks/use-interview-session"
@@ -106,13 +107,12 @@ const AGENT_STATE_LABELS: Partial<Record<string, string>> = {
   speaking: "Speaking…",
 }
 
-// 180s after the disconnect the evaluation is considered stuck (the worker's
-// auto-trigger can die silently); the endpoint is re-invocable, so we offer a
-// manual retry — same policy as app.js's MAX_EVAL_POLLS (90 * 2s).
-const EVAL_TIMEOUT_MS = 180_000
-
+// The interview itself is over — what is left is the verdict, or waiting for
+// it: ended but not yet claimed (completed), being evaluated in the
+// background (evaluating), or done either way.
 const TERMINAL_STATUSES = new Set([
   "completed",
+  "evaluating",
   "evaluated",
   "evaluation_failed",
 ])
@@ -147,6 +147,12 @@ function InterviewSessionPage({ interviewId }: { interviewId: string }) {
     // Planning failed: there is nothing to start (the token endpoint would
     // 409), so the pre-join check would only lead to a Start that fails.
     <FailedPanel interview={interview} />
+  ) : interview.status === "interviewing" &&
+    !interview.can_start &&
+    session.phase === "idle" ? (
+    // The worker died mid-interview and the reconnect window has closed:
+    // nothing to rejoin (Start would 409 too), only what was recorded.
+    <InterruptedPanel interview={interview} />
   ) : (
     <InterviewPanel session={session} interview={interview} />
   )
@@ -184,6 +190,10 @@ function InterviewPanel({
       <PreJoinPanel
         preview={preview}
         error={error}
+        // An `interviewing` row that can still start is one this candidate
+        // left (a closed tab, a dropped line) with the room waiting for them.
+        rejoin={interview.status === "interviewing"}
+        rejoinUntil={interview.reconnect_until}
         onStart={() =>
           start({
             audioDeviceId: preview.micId || undefined,
@@ -431,18 +441,30 @@ function LevelMeter({ level }: { level: number }) {
   )
 }
 
+const timeFormat = new Intl.DateTimeFormat(undefined, { timeStyle: "short" })
+
 /** What you see before joining: pick the microphone you will be heard
- *  through, watch it register sound, and optionally frame yourself. */
+ *  through, watch it register sound, and optionally frame yourself.
+ *
+ *  `rejoin` turns Start into Rejoin: the interview is already running and
+ *  its room waits for the candidate — until `rejoinUntil` (ISO), when the
+ *  backend says so. */
 function PreJoinPanel({
   preview,
   error,
+  rejoin,
+  rejoinUntil,
   onStart,
 }: {
   preview: DevicePreview
   error: string | null
+  rejoin: boolean
+  rejoinUntil: string | null
   onStart: () => void
 }) {
   const ready = preview.status === "ready"
+  const rejoinDeadline = rejoinUntil === null ? NaN : Date.parse(rejoinUntil)
+  const verb = rejoin ? "Rejoin" : "Start"
 
   return (
     <PageShell center>
@@ -451,10 +473,31 @@ function PreJoinPanel({
           <span className="flex size-12 items-center justify-center rounded-full bg-primary/10 text-primary">
             <MicIcon className="size-6" />
           </span>
-          <h1 className="text-lg font-medium">Ready when you are</h1>
+          <h1 className="text-lg font-medium">
+            {rejoin ? "Pick up where you left off" : "Ready when you are"}
+          </h1>
           <p className="text-sm text-muted-foreground">
-            Check your devices first. The interviewer greets you a few seconds
-            after you connect — just speak into your mic.
+            {rejoin ? (
+              <>
+                This interview is still running — the interviewer is waiting for
+                you to come back
+                {rejoinUntil !== null && Number.isFinite(rejoinDeadline) && (
+                  <>
+                    {" "}
+                    until{" "}
+                    <time dateTime={rejoinUntil}>
+                      {timeFormat.format(rejoinDeadline)}
+                    </time>
+                  </>
+                )}
+                . Check your devices, then rejoin.
+              </>
+            ) : (
+              <>
+                Check your devices first. The interviewer greets you a few
+                seconds after you connect — just speak into your mic.
+              </>
+            )}
           </p>
         </div>
 
@@ -604,7 +647,7 @@ function PreJoinPanel({
             {/* Never gated on the check: a candidate whose browser hides the
                 device list must still be able to start. */}
             <Button onClick={onStart}>
-              {ready ? "Start interview" : "Start interview anyway"}
+              {ready ? `${verb} interview` : `${verb} interview anyway`}
             </Button>
           </CardFooter>
         </Card>
@@ -709,48 +752,43 @@ function ResultsPanel({
   const queryClient = useQueryClient()
   const [timedOut, setTimedOut] = React.useState(false)
 
-  // Anchor the evaluation-timeout clock at the disconnect; on a deep-link
-  // revisit (no disconnect in this tab) anchor it at the row's own
-  // updated_at, which is when the worker marked it completed. Anchoring at
-  // mount instead made an interview that has been stuck for hours — the
-  // worker's trigger never reached the API — demand another three minutes of
-  // waiting before offering the retry that was needed all along.
-  const anchorRef = React.useRef<number>(
-    endedAt ?? (Date.parse(interview.updated_at) || Date.now())
-  )
-  if (endedAt !== null) anchorRef.current = endedAt
-
   const status = interview.status
-  const waiting = !TERMINAL_STATUSES.has(status) || status === "completed"
+  // No verdict yet: the run is going (evaluating), has not been claimed
+  // (completed), or this tab saw the disconnect before the worker even
+  // marked the row (still interviewing, phase 'ended').
+  const waiting = status !== "evaluated" && status !== "evaluation_failed"
+
+  // The timeout clock counts from the disconnect (or the row's updated_at on
+  // a revisit) until the run is claimed, then from its latest heartbeat —
+  // every poll that brings a newer updated_at moves the anchor and, through
+  // the effect below, pushes the deadline back. See evaluationAnchor.
+  const anchor = evaluationAnchor(status, interview.updated_at, endedAt)
 
   React.useEffect(() => {
     if (!waiting) return
-    const remaining = anchorRef.current + EVAL_TIMEOUT_MS - Date.now()
+    const remaining = anchor + EVAL_TIMEOUT_MS - Date.now()
     if (remaining <= 0) {
       setTimedOut(true)
       return
     }
+    // An anchor that moved forward (a heartbeat, or the run being claimed
+    // after the alert went up) means the evaluation is alive after all.
+    setTimedOut(false)
     const timer = setTimeout(() => setTimedOut(true), remaining)
     return () => clearTimeout(timer)
-  }, [waiting, status])
+  }, [waiting, status, anchor])
 
   const retry = useMutation({
-    // The response IS the evaluated interview — no need to resume polling.
+    // 202: the row back in `evaluating`, no verdict yet — seeding it resumes
+    // the poll, and the poll brings the evaluated row.
     mutationFn: () => evaluateInterview(interviewId),
-    onSuccess: (updated) => {
-      queryClient.setQueryData(
-        interviewQueryOptions(interviewId).queryKey,
-        updated
-      )
-      // The history row for this interview still reads "Evaluating…" in any
-      // cached page — and a page is fresh for 10 s after it was fetched.
+    onSuccess: (row) => {
+      queryClient.setQueryData(interviewQueryOptions(interviewId).queryKey, row)
+      // The history row for this interview still reads "Ended" in any cached
+      // page — and a page is fresh for 10 s after it was fetched.
       void queryClient.invalidateQueries({ queryKey: ["interviews"] })
       setTimedOut(false)
-      log(
-        "evaluation received:",
-        updated.evaluation?.hired ? "HIRED" : "NOT HIRED",
-        `score ${updated.evaluation?.score ?? "?"}/100`
-      )
+      log("evaluation restarted:", row.status)
     },
     onError: (error) => {
       console.error("[app] evaluation retry failed:", error)
@@ -763,6 +801,14 @@ function ResultsPanel({
 
   const failed = status === "evaluation_failed"
   const showRetry = failed || timedOut
+  // What the button does depends on where the run got stuck: it never
+  // started (completed / interviewing), it died on the way (evaluating), or
+  // it ended in an error (evaluation_failed).
+  const action = failed
+    ? "Retry"
+    : status === "evaluating"
+      ? "Restart"
+      : "Start"
 
   return (
     <PageShell center>
@@ -783,13 +829,15 @@ function ResultsPanel({
                 ? errorMessage(retry.error)
                 : failed
                   ? "The evaluation failed. You can retry it."
-                  : "The evaluation is taking longer than expected. You can retry it."}
+                  : status === "evaluating"
+                    ? "The evaluation is taking longer than expected. You can restart it."
+                    : "The evaluation did not start. You can start it now."}
             </AlertDescription>
           </Alert>
         )}
         {showRetry && (
           <Button onClick={() => retry.mutate()} disabled={retry.isPending}>
-            {retry.isPending ? "Retrying…" : "Retry evaluation"}
+            {retry.isPending ? "Starting…" : `${action} evaluation`}
           </Button>
         )}
       </PageContainer>
@@ -856,6 +904,81 @@ function FailedPanel({ interview }: { interview: Interview }) {
           <Button onClick={() => repeat.mutate()} disabled={repeat.isPending}>
             <RotateCcwIcon />
             {repeat.isPending ? "Planning…" : "Repeat this interview"}
+          </Button>
+        </div>
+      </PageContainer>
+    </PageShell>
+  )
+}
+
+/** An `interviewing` row past its reconnect window: the worker died mid-run
+ *  (a crash never marks the row completed), so there is no room left to
+ *  rejoin. What remains is the transcript up to the cut — evaluate it as it
+ *  stands, or plan the interview again. */
+function InterruptedPanel({ interview }: { interview: Interview }) {
+  const queryClient = useQueryClient()
+  const repeat = useRepeatInterview(interview.id)
+  const evaluate = useMutation({
+    mutationFn: () => evaluateInterview(interview.id),
+    onSuccess: (row) => {
+      log("evaluation started for the interrupted interview:", row.status)
+      // 202 with the row in `evaluating`: seeding it is what swaps this panel
+      // for the results one, whose poll then carries the row to its verdict.
+      queryClient.setQueryData(
+        interviewQueryOptions(interview.id).queryKey,
+        row
+      )
+      // The history row still reads "Interrupted" in any cached page.
+      void queryClient.invalidateQueries({ queryKey: ["interviews"] })
+    },
+    onError: (error) => {
+      console.error(
+        "[app] could not evaluate the interrupted interview:",
+        error
+      )
+    },
+  })
+  const busy = evaluate.isPending || repeat.isPending
+
+  return (
+    <PageShell center>
+      <PageContainer
+        variant="narrow"
+        className="flex flex-col items-center gap-4 text-center"
+      >
+        <span className="flex size-12 items-center justify-center rounded-full bg-warning/10 text-warning">
+          <PhoneOffIcon className="size-6" />
+        </span>
+        <h1 className="text-lg font-medium">This interview was interrupted</h1>
+        <p className="text-sm text-muted-foreground">
+          The connection to the interviewer was lost and the interview can no
+          longer be resumed. You can evaluate what was recorded up to that
+          point, or repeat it from the start with the same resume and offer.
+        </p>
+        {(evaluate.isError || repeat.isError) && (
+          <Alert variant="destructive" className="w-full text-left">
+            <AlertDescription>
+              {errorMessage(evaluate.isError ? evaluate.error : repeat.error)}
+            </AlertDescription>
+          </Alert>
+        )}
+        <div className="flex flex-col gap-2 @xl/main:flex-row">
+          <Button variant="ghost" render={<Link to="/interviews" />}>
+            <HistoryIcon />
+            History
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => repeat.mutate()}
+            disabled={busy}
+            title="Plan a fresh interview for the same role and resume"
+          >
+            <RotateCcwIcon />
+            {repeat.isPending ? "Planning…" : "Repeat this interview"}
+          </Button>
+          <Button onClick={() => evaluate.mutate()} disabled={busy}>
+            <SparklesIcon />
+            {evaluate.isPending ? "Starting…" : "Evaluate what was recorded"}
           </Button>
         </div>
       </PageContainer>

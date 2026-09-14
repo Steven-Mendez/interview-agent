@@ -269,10 +269,11 @@ class InterviewAgent(Agent):
 
 # Backoff between evaluation-trigger attempts; the trailing 0 is the last try.
 _TRIGGER_BACKOFF_SECONDS = (2, 5, 10, 0)
-# The evaluator runs INLINE in the request (see routes.evaluate_interview), so
-# the read side waits for a whole high-reasoning LLM call; the connect side
-# does not — a black-holed host must fail fast, not burn minutes per attempt.
-_TRIGGER_TIMEOUT = httpx.Timeout(300.0, connect=5.0)
+# The endpoint only CLAIMS the row and schedules the evaluation in the API
+# process (see server.evaluations), answering 202 at once, so the read side
+# needs seconds, not the minutes a full LLM call takes; the connect side
+# must fail fast — a black-holed host must not burn minutes per attempt.
+_TRIGGER_TIMEOUT = httpx.Timeout(30.0, connect=5.0)
 
 
 async def _trigger_evaluation(
@@ -288,13 +289,11 @@ async def _trigger_evaluation(
     Being briefly unreachable (restart, boot ordering) is the one failure
     that leaves nothing behind: the row sits in "completed" forever and no
     one ever asks again. Everything else means the request got through and
-    must NOT be re-sent — the endpoint runs the evaluator inline, so:
-    - a response, even a 502, means it ran and marked the row
-      evaluation_failed, which the frontend offers to retry;
-    - a read timeout means it is STILL RUNNING (an evaluation slower than
-      the timeout); posting again would start a second, concurrent
-      evaluation of the same transcript and spend the tokens twice.
-    Only a connect failure is safe to retry, so that is the whole list.
+    is not re-sent: the endpoint claims the row and schedules the run in
+    the background, and a second POST would be a no-op at best (the claim
+    is atomic) and noise at worst. A response of any status means the API
+    handled it; a read timeout after the connect means it most likely did
+    too. Only a connect failure is safe to retry, so that is the whole list.
 
     `transport` and `sleep` exist for the tests.
     """

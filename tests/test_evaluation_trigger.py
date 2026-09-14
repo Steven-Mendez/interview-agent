@@ -93,7 +93,8 @@ async def test_gives_up_after_the_bounded_attempts_and_says_so(slept, caplog):
 
 
 def test_connect_side_of_the_timeout_fails_fast():
-    # The read side waits for a whole inline evaluation; the connect side
-    # must not, or a black-holed host burns minutes per attempt.
+    # The connect side must fail fast, or a black-holed host burns minutes
+    # per attempt.
     assert agent._TRIGGER_TIMEOUT.connect == 5.0
-    assert agent._TRIGGER_TIMEOUT.read == 300.0
+    # The endpoint answers 202 as soon as it has claimed the row.
+    assert agent._TRIGGER_TIMEOUT.read == 30.0

@@ -52,6 +52,7 @@ const STATUS_FILTERS = [
   "planned",
   "interviewing",
   "completed",
+  "evaluating",
   "evaluated",
   "evaluation_failed",
   "error",
@@ -79,21 +80,34 @@ export const Route = createFileRoute("/interviews/")({
   component: HistoryPage,
 })
 
+interface StatusMeta {
+  label: string
+  variant: "outline" | "secondary" | "destructive" | "default"
+}
+
 /** How each status reads, and the badge tone that carries it. */
-const STATUS_META: Record<
-  InterviewStatus,
-  {
-    label: string
-    variant: "outline" | "secondary" | "destructive" | "default"
-  }
-> = {
+const STATUS_META: Record<InterviewStatus, StatusMeta> = {
   created: { label: "Planning…", variant: "outline" },
   planned: { label: "Ready to start", variant: "outline" },
   interviewing: { label: "In progress", variant: "default" },
-  completed: { label: "Evaluating…", variant: "secondary" },
+  completed: { label: "Ended", variant: "secondary" },
+  evaluating: { label: "Evaluating…", variant: "secondary" },
   evaluated: { label: "Evaluated", variant: "secondary" },
   evaluation_failed: { label: "Evaluation failed", variant: "destructive" },
   error: { label: "Failed", variant: "destructive" },
+}
+
+// The one status the row alone does not settle: `interviewing` past its
+// reconnect window is a worker that died mid-run, not an interview going on.
+const INTERRUPTED_META: StatusMeta = {
+  label: "Interrupted",
+  variant: "outline",
+}
+
+function statusMeta(row: InterviewSummary): StatusMeta {
+  return row.status === "interviewing" && !row.can_start
+    ? INTERRUPTED_META
+    : STATUS_META[row.status]
 }
 
 const dateFormat = new Intl.DateTimeFormat(undefined, {
@@ -330,7 +344,7 @@ function HistoryRow({
   repeating: boolean
   disabled: boolean
 }) {
-  const meta = STATUS_META[item.status]
+  const meta = statusMeta(item)
   const evaluation = item.evaluation
   // Same traffic light as the scorecard: green once hired, otherwise red/amber
   // by how far the score sits from a pass.

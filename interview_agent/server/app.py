@@ -21,6 +21,7 @@ from interview_agent.config import settings
 from interview_agent.interview import db, rag
 from interview_agent.interview.db import create_engine_and_sessionmaker
 from interview_agent.logging_config import setup_file_logging
+from interview_agent.server.evaluations import EvaluationRunner
 from interview_agent.server.routes import router
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -95,6 +96,9 @@ async def lifespan(app: FastAPI):
     app.state.sessionmaker = sessionmaker
     app.state.qdrant = qdrant
     app.state.embeddings = rag.build_embeddings(settings)
+    # POST /evaluate claims a row and hands it here; the run itself happens
+    # in this process, off the request.
+    app.state.evaluations = EvaluationRunner(sessionmaker, qdrant)
 
     purge_task: asyncio.Task | None = None
     if settings.retention_days > 0:
@@ -109,6 +113,9 @@ async def lifespan(app: FastAPI):
             purge_task.cancel()
             with suppress(asyncio.CancelledError):
                 await purge_task
+        # Before the engine goes: each cancelled run marks its row so the UI
+        # offers a retry instead of a spinner over a run nobody is doing.
+        await app.state.evaluations.shutdown()
         await qdrant.close()
         await engine.dispose()
 

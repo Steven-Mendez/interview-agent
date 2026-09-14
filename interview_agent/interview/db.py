@@ -20,8 +20,11 @@ from sqlalchemy import (
     Index,
     Integer,
     Text,
+    and_,
     delete,
+    exists,
     func,
+    or_,
     select,
     update,
 )
@@ -53,8 +56,8 @@ class Conversation(Base):
     # Bumped on every UPDATE (status changes included); the capacity check
     # uses it to ignore orphaned "interviewing" rows from crashed workers.
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
-    # created | planned | interviewing | completed | evaluation_failed
-    # | evaluated | error
+    # created | planned | interviewing | completed | evaluating
+    # | evaluation_failed | evaluated | error
     status: Mapped[str] = mapped_column(Text, default="created", server_default="created")
     job_offer: Mapped[str] = mapped_column(Text)
     resume_markdown: Mapped[str] = mapped_column(Text)
@@ -97,6 +100,7 @@ class Conversation(Base):
         UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="SET NULL")
     )
     # plan_complete | timeout | candidate_left | idle_timeout
+    # | connection_lost (the worker died; set when the orphan is evaluated)
     ended_reason: Mapped[str | None] = mapped_column(Text)
     # Per-component LLM spend, accumulated over the conversation's lifecycle:
     # {"planner" | "interviewer" | "evaluator":
@@ -270,6 +274,14 @@ async def get_messages(session: AsyncSession, conversation_id: uuid.UUID) -> lis
     return list(result)
 
 
+async def has_messages(session: AsyncSession, conversation_id: uuid.UUID) -> bool:
+    """Whether anything was said at all — the cheapest "is there a transcript"."""
+    result = await session.scalar(
+        select(exists().where(Message.conversation_id == conversation_id))
+    )
+    return bool(result)
+
+
 async def insert_message(
     session: AsyncSession,
     conversation_id: uuid.UUID,
@@ -310,6 +322,74 @@ async def set_status(
         update(Conversation).where(Conversation.id == conversation_id).values(**values)
     )
     await session.commit()
+
+
+# Rows an evaluation can be started from. "evaluated" is included on purpose:
+# re-running one upserts the result, and those tokens are spent knowingly.
+EVALUATION_CLAIMABLE = ("completed", "evaluation_failed", "evaluated")
+
+
+async def claim_evaluation(
+    session: AsyncSession, conversation_id: uuid.UUID, stale_after: timedelta
+) -> bool:
+    """Move the row into "evaluating" in ONE statement, so two callers racing
+    to evaluate the same interview (the worker's trigger and a retry from the
+    browser) cannot both start a run: exactly one sees the row change.
+
+    Claimable: any EVALUATION_CLAIMABLE status, or an "evaluating" row whose
+    updated_at is older than `stale_after` — a live run heartbeats that
+    column, so one that stopped moving belongs to a process that died.
+    """
+    result = await session.execute(
+        update(Conversation)
+        .where(
+            Conversation.id == conversation_id,
+            or_(
+                Conversation.status.in_(EVALUATION_CLAIMABLE),
+                and_(
+                    Conversation.status == "evaluating",
+                    Conversation.updated_at < func.now() - stale_after,
+                ),
+            ),
+        )
+        .values(status="evaluating")
+        .returning(Conversation.id)
+    )
+    claimed = result.scalar_one_or_none() is not None
+    await session.commit()
+    return claimed
+
+
+async def heartbeat_evaluation(session: AsyncSession, conversation_id: uuid.UUID) -> bool:
+    """Bump updated_at while an evaluation runs. Returns False once the row
+    has left "evaluating" (finished, or reclaimed by someone else), which
+    tells the caller to stop."""
+    result = await session.execute(
+        update(Conversation)
+        .where(Conversation.id == conversation_id, Conversation.status == "evaluating")
+        .values(updated_at=func.now())
+        .returning(Conversation.id)
+    )
+    alive = result.scalar_one_or_none() is not None
+    await session.commit()
+    return alive
+
+
+async def set_status_if(
+    session: AsyncSession, conversation_id: uuid.UUID, expected: str, status: str
+) -> bool:
+    """`set_status` guarded on the current value: the transition happens only
+    if the row is still in `expected`. Lets a run that lost its claim (a
+    reclaim after it went stale) leave the newer run's outcome alone."""
+    result = await session.execute(
+        update(Conversation)
+        .where(Conversation.id == conversation_id, Conversation.status == expected)
+        .values(status=status)
+        .returning(Conversation.id)
+    )
+    changed = result.scalar_one_or_none() is not None
+    await session.commit()
+    return changed
 
 
 async def complete_milestone(

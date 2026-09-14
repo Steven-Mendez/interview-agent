@@ -9,6 +9,7 @@ Postgres, in CI on the service container (TEST_DATABASE_URL overrides).
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import os
@@ -33,7 +34,7 @@ from interview_agent.interview.models import (
     Seniority,
 )
 from interview_agent.prompts import length_for
-from interview_agent.server import routes
+from interview_agent.server import evaluations, routes
 from interview_agent.voices import VOICES
 
 TEST_DATABASE_URL = os.environ.get(
@@ -116,6 +117,7 @@ async def client_and_sessionmaker(monkeypatch):
     app.state.sessionmaker = sessionmaker
     app.state.qdrant = object()  # only ever handed to the stubbed rag helpers
     app.state.embeddings = object()
+    app.state.evaluations = evaluations.EvaluationRunner(sessionmaker, app.state.qdrant)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -174,6 +176,17 @@ async def _seed_finished_interview(sessionmaker) -> uuid.UUID:
         ):
             await db.insert_message(session, conversation_id, role, content, seq=seq)
     return conversation_id
+
+
+async def _settled(client: AsyncClient, conversation_id: uuid.UUID, timeout: float = 5.0) -> dict:
+    """Poll the row the way the UI does until the background run has landed."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        body = (await client.get(f"/api/interviews/{conversation_id}")).json()
+        if body["status"] not in ("completed", "evaluating"):
+            return body
+        assert asyncio.get_running_loop().time() < deadline, f"still {body['status']}"
+        await asyncio.sleep(0.01)
 
 
 # ---- /settings ---------------------------------------------------------------
@@ -336,16 +349,24 @@ async def test_get_interview_404(client_and_sessionmaker):
 
 
 # ---- /evaluate --------------------------------------------------------------
+# The endpoint claims the row and answers 202; the run itself lands in the
+# background (server.evaluations), so these poll the row afterwards the way
+# the UI does.
 
 
-async def test_evaluate_happy_and_idempotent(client_and_sessionmaker, monkeypatch):
+async def test_evaluate_answers_202_and_the_result_lands_in_the_background(
+    client_and_sessionmaker, monkeypatch
+):
     client, sessionmaker = client_and_sessionmaker
-    monkeypatch.setattr(routes, "run_evaluator", _fake_evaluator)
+    monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
     conversation_id = await _seed_finished_interview(sessionmaker)
 
     res = await client.post(f"/api/interviews/{conversation_id}/evaluate")
-    assert res.status_code == 200
-    body = res.json()
+    assert res.status_code == 202
+    assert res.json()["status"] == "evaluating"
+    assert res.json()["evaluation"] is None
+
+    body = await _settled(client, conversation_id)
     assert body["status"] == "evaluated"
     assert body["evaluation"]["hired"] is True
     assert body["evaluation"]["score"] == 82
@@ -353,13 +374,144 @@ async def test_evaluate_happy_and_idempotent(client_and_sessionmaker, monkeypatc
 
     # Re-evaluation upserts instead of racing delete+insert into a 500.
     res2 = await client.post(f"/api/interviews/{conversation_id}/evaluate")
-    assert res2.status_code == 200
-    assert res2.json()["evaluation"]["score"] == 82
+    assert res2.status_code == 202
+    assert (await _settled(client, conversation_id))["evaluation"]["score"] == 82
+
+
+async def test_a_second_evaluate_while_one_runs_starts_nothing(
+    client_and_sessionmaker, monkeypatch
+):
+    # The worker's auto-trigger and a Retry from the browser can race here;
+    # the atomic claim lets exactly one of them start a run.
+    client, sessionmaker = client_and_sessionmaker
+    release = asyncio.Event()
+    calls = 0
+
+    async def _slow_evaluator(settings, **kwargs):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return _evaluation()
+
+    monkeypatch.setattr(evaluations, "run_evaluator", _slow_evaluator)
+    conversation_id = await _seed_finished_interview(sessionmaker)
+
+    first = await client.post(f"/api/interviews/{conversation_id}/evaluate")
+    assert first.status_code == 202
+    for _ in range(500):  # let the run reach the evaluator
+        if calls:
+            break
+        await asyncio.sleep(0.01)
+    assert calls == 1
+
+    second = await client.post(f"/api/interviews/{conversation_id}/evaluate")
+    assert second.status_code == 202
+    assert second.json()["status"] == "evaluating"
+    assert calls == 1
+
+    release.set()
+    assert (await _settled(client, conversation_id))["status"] == "evaluated"
+    assert calls == 1
+
+
+async def test_a_run_whose_process_died_is_claimed_again(client_and_sessionmaker, monkeypatch):
+    # "evaluating" with a heartbeat that stopped is the orphan of a restart:
+    # a Retry must be allowed to take it over. One still beating is not.
+    client, sessionmaker = client_and_sessionmaker
+    calls = 0
+
+    async def _counting_evaluator(settings, **kwargs):
+        nonlocal calls
+        calls += 1
+        return _evaluation()
+
+    monkeypatch.setattr(evaluations, "run_evaluator", _counting_evaluator)
+    conversation_id = await _seed_finished_interview(sessionmaker)
+    async with sessionmaker() as session:
+        await session.execute(
+            update(db.Conversation)
+            .where(db.Conversation.id == conversation_id)
+            .values(status="evaluating")
+        )
+        await session.commit()
+
+    # Fresh: somebody is on it.
+    res = await client.post(f"/api/interviews/{conversation_id}/evaluate")
+    assert res.status_code == 202
+    assert res.json()["status"] == "evaluating"
+    assert calls == 0
+
+    stale = datetime.now(UTC) - evaluations.STALE_AFTER - timedelta(minutes=1)
+    async with sessionmaker() as session:
+        await session.execute(
+            update(db.Conversation)
+            .where(db.Conversation.id == conversation_id)
+            .values(updated_at=stale)
+        )
+        await session.commit()
+
+    res = await client.post(f"/api/interviews/{conversation_id}/evaluate")
+    assert res.status_code == 202
+    assert (await _settled(client, conversation_id))["status"] == "evaluated"
+    assert calls == 1
+
+
+async def test_a_live_run_keeps_its_heartbeat_moving(client_and_sessionmaker, monkeypatch):
+    # updated_at is what tells a live run from a dead one — for the claim
+    # above and for the UI's "taking too long" clock alike.
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(evaluations, "HEARTBEAT_SECONDS", 0.02)
+    release = asyncio.Event()
+
+    async def _slow_evaluator(settings, **kwargs):
+        await release.wait()
+        return _evaluation()
+
+    monkeypatch.setattr(evaluations, "run_evaluator", _slow_evaluator)
+    conversation_id = await _seed_finished_interview(sessionmaker)
+
+    claimed_at = (await client.post(f"/api/interviews/{conversation_id}/evaluate")).json()
+    await asyncio.sleep(0.1)
+    later = (await client.get(f"/api/interviews/{conversation_id}")).json()
+    assert later["status"] == "evaluating"
+    assert datetime.fromisoformat(later["updated_at"]) > datetime.fromisoformat(
+        claimed_at["updated_at"]
+    )
+
+    release.set()
+    assert (await _settled(client, conversation_id))["status"] == "evaluated"
+
+
+async def test_shutdown_marks_a_cancelled_run_failed_so_the_ui_offers_a_retry(
+    client_and_sessionmaker, monkeypatch
+):
+    _, sessionmaker = client_and_sessionmaker
+    reached = asyncio.Event()
+
+    async def _hanging_evaluator(settings, **kwargs):
+        reached.set()
+        await asyncio.Event().wait()  # never returns on its own
+
+    monkeypatch.setattr(evaluations, "run_evaluator", _hanging_evaluator)
+    conversation_id = await _seed_finished_interview(sessionmaker)
+    runner = evaluations.EvaluationRunner(sessionmaker, object())
+    async with sessionmaker() as session:
+        assert await db.claim_evaluation(session, conversation_id, evaluations.STALE_AFTER)
+    runner.start(conversation_id)
+    await asyncio.wait_for(reached.wait(), 5)
+    assert runner.running == 1
+
+    await runner.shutdown()
+    assert runner.running == 0
+    async with sessionmaker() as session:
+        conversation = await db.get_conversation(session, conversation_id)
+    assert conversation is not None
+    assert conversation.status == "evaluation_failed"
 
 
 async def test_evaluate_without_transcript_409(client_and_sessionmaker, monkeypatch):
     client, sessionmaker = client_and_sessionmaker
-    monkeypatch.setattr(routes, "run_evaluator", _fake_evaluator)
+    monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
     conversation_id = uuid.uuid4()
     async with sessionmaker() as session:
         session.add(
@@ -378,7 +530,7 @@ async def test_evaluate_refuses_a_live_interview(client_and_sessionmaker, monkey
     # the resume chunks from Qdrant — blinding search_resume for the rest of
     # the live interview. The worker only POSTs here after marking "completed".
     client, sessionmaker = client_and_sessionmaker
-    monkeypatch.setattr(routes, "run_evaluator", _fake_evaluator)
+    monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
     conversation_id = uuid.uuid4()
     async with sessionmaker() as session:
         session.add(
@@ -397,6 +549,87 @@ async def test_evaluate_refuses_a_live_interview(client_and_sessionmaker, monkey
     assert "in progress" in res.json()["detail"]
 
 
+async def test_an_interrupted_interview_is_evaluable_once_its_window_closes(
+    client_and_sessionmaker, monkeypatch
+):
+    # A crashed worker leaves "interviewing" behind. /token stops offering a
+    # rejoin after the reconnect window, and /evaluate used to refuse the row
+    # forever — a full transcript nobody could score.
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
+    conversation_id = uuid.uuid4()
+    async with sessionmaker() as session:
+        session.add(
+            db.Conversation(
+                id=conversation_id,
+                status="interviewing",
+                job_offer="o",
+                resume_markdown="r",
+                max_minutes=8,
+            )
+        )
+        await session.commit()
+        await db.insert_message(session, conversation_id, "assistant", "Tell me about X.", seq=0)
+        await db.insert_message(session, conversation_id, "user", "I built X.", seq=1)
+
+    # Inside the window it is a live interview: rejoinable, not evaluable.
+    body = (await client.get(f"/api/interviews/{conversation_id}")).json()
+    assert body["can_start"] is True
+    assert datetime.fromisoformat(body["reconnect_until"]) > datetime.now(UTC)
+    assert (await client.post(f"/api/interviews/{conversation_id}/evaluate")).status_code == 409
+
+    async with sessionmaker() as session:
+        await session.execute(
+            update(db.Conversation)
+            .where(db.Conversation.id == conversation_id)
+            .values(updated_at=datetime.now(UTC) - timedelta(minutes=8 + 5 + 1))
+        )
+        await session.commit()
+
+    body = (await client.get(f"/api/interviews/{conversation_id}")).json()
+    assert body["can_start"] is False
+    assert datetime.fromisoformat(body["reconnect_until"]) < datetime.now(UTC)
+
+    res = await client.post(f"/api/interviews/{conversation_id}/evaluate")
+    assert res.status_code == 202
+    assert res.json()["status"] == "evaluating"
+    assert res.json()["ended_reason"] == "connection_lost"
+    body = await _settled(client, conversation_id)
+    assert body["status"] == "evaluated"
+    assert body["evaluation"]["ended_by"] == "connection_lost"
+    assert body["can_start"] is False
+    assert body["reconnect_until"] is None
+
+
+async def test_lifecycle_fields_follow_the_status(client_and_sessionmaker):
+    client, sessionmaker = client_and_sessionmaker
+    ids: dict[str, uuid.UUID] = {}
+    async with sessionmaker() as session:
+        for status in ("planned", "completed", "evaluating", "evaluated"):
+            ids[status] = uuid.uuid4()
+            session.add(
+                db.Conversation(id=ids[status], status=status, job_offer="o", resume_markdown="r")
+            )
+        await session.commit()
+
+    for status, expected in (
+        ("planned", True),
+        ("completed", False),
+        ("evaluating", False),
+        ("evaluated", False),
+    ):
+        body = (await client.get(f"/api/interviews/{ids[status]}")).json()
+        assert (body["can_start"], body["reconnect_until"]) == (expected, None), status
+
+    # The history rows carry the same two fields, and the new status filters.
+    page = (await client.get("/api/interviews?status=planned")).json()
+    row = next(item for item in page["items"] if item["id"] == str(ids["planned"]))
+    assert row["can_start"] is True
+    assert row["reconnect_until"] is None
+    page = (await client.get("/api/interviews?status=evaluating")).json()
+    assert str(ids["evaluating"]) in {item["id"] for item in page["items"]}
+
+
 async def test_evaluate_failure_sets_status_and_retry_recovers(
     client_and_sessionmaker, monkeypatch
 ):
@@ -406,17 +639,14 @@ async def test_evaluate_failure_sets_status_and_retry_recovers(
     async def _boom(*args, **kwargs):
         raise RuntimeError("LLM down")
 
-    monkeypatch.setattr(routes, "run_evaluator", _boom)
-    res = await client.post(f"/api/interviews/{conversation_id}/evaluate")
-    assert res.status_code == 502
-    status = (await client.get(f"/api/interviews/{conversation_id}")).json()["status"]
-    assert status == "evaluation_failed"
+    monkeypatch.setattr(evaluations, "run_evaluator", _boom)
+    assert (await client.post(f"/api/interviews/{conversation_id}/evaluate")).status_code == 202
+    assert (await _settled(client, conversation_id))["status"] == "evaluation_failed"
 
     # The endpoint stays re-invocable: a later retry succeeds.
-    monkeypatch.setattr(routes, "run_evaluator", _fake_evaluator)
-    res2 = await client.post(f"/api/interviews/{conversation_id}/evaluate")
-    assert res2.status_code == 200
-    assert res2.json()["status"] == "evaluated"
+    monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
+    assert (await client.post(f"/api/interviews/{conversation_id}/evaluate")).status_code == 202
+    assert (await _settled(client, conversation_id))["status"] == "evaluated"
 
 
 async def test_a_failed_evaluation_still_books_its_tokens(client_and_sessionmaker, monkeypatch):
@@ -429,9 +659,9 @@ async def test_a_failed_evaluation_still_books_its_tokens(client_and_sessionmake
         }
         raise RuntimeError("could not parse the verdict")
 
-    monkeypatch.setattr(routes, "run_evaluator", _spent_then_failed)
-    assert (await client.post(f"/api/interviews/{conversation_id}/evaluate")).status_code == 502
-    body = (await client.get(f"/api/interviews/{conversation_id}")).json()
+    monkeypatch.setattr(evaluations, "run_evaluator", _spent_then_failed)
+    assert (await client.post(f"/api/interviews/{conversation_id}/evaluate")).status_code == 202
+    body = await _settled(client, conversation_id)
     assert body["status"] == "evaluation_failed"
     assert body["token_usage"]["evaluator"]["total_tokens"] == 6
 
@@ -442,8 +672,9 @@ async def test_a_failed_evaluation_still_books_its_tokens(client_and_sessionmake
         }
         return _evaluation()
 
-    monkeypatch.setattr(routes, "run_evaluator", _spent_and_succeeded)
-    body = (await client.post(f"/api/interviews/{conversation_id}/evaluate")).json()
+    monkeypatch.setattr(evaluations, "run_evaluator", _spent_and_succeeded)
+    assert (await client.post(f"/api/interviews/{conversation_id}/evaluate")).status_code == 202
+    body = await _settled(client, conversation_id)
     assert body["status"] == "evaluated"
     assert body["token_usage"]["evaluator"]["total_tokens"] == 20
 
@@ -858,9 +1089,10 @@ async def test_history_paginates_and_filters_by_status(client_and_sessionmaker):
 
 async def test_history_row_carries_the_score(client_and_sessionmaker, monkeypatch):
     client, sessionmaker = client_and_sessionmaker
-    monkeypatch.setattr(routes, "run_evaluator", _fake_evaluator)
+    monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
     conversation_id = await _seed_finished_interview(sessionmaker)
     await client.post(f"/api/interviews/{conversation_id}/evaluate")
+    await _settled(client, conversation_id)
 
     body = (await client.get("/api/interviews")).json()
     row = next(item for item in body["items"] if item["id"] == str(conversation_id))
@@ -1113,12 +1345,13 @@ async def test_evaluate_judges_against_the_pinned_level(client_and_sessionmaker,
         seen.update(kwargs)
         return _evaluation()
 
-    monkeypatch.setattr(routes, "run_evaluator", _capturing_evaluator)
+    monkeypatch.setattr(evaluations, "run_evaluator", _capturing_evaluator)
     res = await client.post(f"/api/interviews/{interview_id}/evaluate")
-    assert res.status_code == 200
+    assert res.status_code == 202
+    body = await _settled(client, interview_id)
     assert seen["seniority"] == "junior"
     assert all("expected_evidence" in m for m in seen["milestones"])
 
-    evaluation = res.json()["evaluation"]
+    evaluation = body["evaluation"]
     assert evaluation["seniority_evaluated"] == "mid"  # what the fake returned
     assert evaluation["calibration_notes"] == ["Skipped trade-off depth: above this level."]

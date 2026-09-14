@@ -6,16 +6,19 @@ import type { Interview, InterviewStatus } from "@/lib/api"
 type InterviewStatusValue = Interview["status"]
 
 // Statuses where the poll should keep going: the room may still be
-// connected (created/planned/interviewing) or the auto-triggered evaluation
-// hasn't landed yet (completed). Terminal states (evaluated,
-// evaluation_failed, error) stop the interval — Fase 4's Retry flow
-// re-invokes POST .../evaluate directly and calls `setQueryData` with the
-// response instead of resuming polling.
+// connected (created/planned/interviewing), the auto-triggered evaluation
+// hasn't been claimed yet (completed), or it is running in the background
+// (evaluating — the row's updated_at moves with its 30 s heartbeat).
+// Terminal states (evaluated, evaluation_failed, error) stop the interval.
+// The Retry flow re-invokes POST .../evaluate, which answers 202 with the
+// row back in `evaluating`; seeding that row with `setQueryData` is what
+// resumes the poll — the verdict arrives through it, not in the response.
 const POLLING_STATUSES: ReadonlySet<InterviewStatusValue> = new Set([
   "created",
   "planned",
   "interviewing",
   "completed",
+  "evaluating",
 ])
 
 export function interviewQueryOptions(interviewId: string) {

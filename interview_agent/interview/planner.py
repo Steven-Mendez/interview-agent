@@ -25,6 +25,9 @@ async def run_planner(
     # whole pipeline. Anything else is authoritative and the planner is told so.
     seniority: Seniority | None = None,
     interview_length: InterviewLength = InterviewLength.STANDARD,
+    # The cap this interview will actually run under (the length's minutes
+    # clamped by INTERVIEW_MAX_MINUTES). None plans the length's full profile.
+    max_minutes: int | None = None,
     persona: str | None = None,
     custom_instructions: str | None = None,
     usage_callback: UsageMetadataCallbackHandler | None = None,
@@ -59,7 +62,7 @@ async def run_planner(
     config = {"callbacks": [usage_callback]} if usage_callback else None
     result = await llm.ainvoke(
         [
-            SystemMessage(content=build_planner_prompt(seniority, interview_length)),
+            SystemMessage(content=build_planner_prompt(seniority, interview_length, max_minutes)),
             HumanMessage(content=content),
         ],
         config=config,

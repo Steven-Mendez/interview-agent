@@ -52,9 +52,7 @@ def settings() -> Settings:
     return Settings(_env_file=None)
 
 
-async def test_run_planner_returns_plan_and_includes_optional_inputs(
-    settings, monkeypatch
-):
+async def test_run_planner_returns_plan_and_includes_optional_inputs(settings, monkeypatch):
     fake = _FakeChain(_plan())
     monkeypatch.setattr(planner, "build_chat_model", lambda *a, **k: fake)
 
@@ -129,9 +127,7 @@ async def test_run_planner_pins_an_explicit_level(settings, monkeypatch):
     assert "about\n8 minutes" in system
 
 
-async def test_run_planner_asks_for_classification_when_level_is_auto(
-    settings, monkeypatch
-):
+async def test_run_planner_asks_for_classification_when_level_is_auto(settings, monkeypatch):
     fake = _FakeChain(_plan())
     monkeypatch.setattr(planner, "build_chat_model", lambda *a, **k: fake)
 
@@ -147,6 +143,24 @@ async def test_run_planner_asks_for_classification_when_level_is_auto(
     system = fake.messages[0].content
     assert "CLASSIFY IT FIRST" in system
     assert "Do NOT classify by the technologies mentioned" in system
+
+
+async def test_run_planner_sizes_the_plan_to_the_cap(settings, monkeypatch):
+    fake = _FakeChain(_plan())
+    monkeypatch.setattr(planner, "build_chat_model", lambda *a, **k: fake)
+
+    await planner.run_planner(
+        settings,
+        resume_markdown="# Resume",
+        job_offer="Backend engineer.",
+        language="en",
+        agent_name="Alex",
+        interview_length=InterviewLength.DEEP,
+        max_minutes=15,
+    )
+    system = fake.messages[0].content
+    assert "between 4 and 6 milestones" in system
+    assert "about\n15 minutes" in system
 
 
 async def test_run_planner_defaults_to_a_standard_length(settings, monkeypatch):

@@ -24,6 +24,13 @@ export interface ChatMessage {
  *  interview is published through the microphone the candidate just tested. */
 export interface StartOptions {
   audioDeviceId?: string
+  /** Runs once the room is connected, right before the microphone is
+   *  published — the moment for the pre-join check to let go of the device.
+   *  Anything that fails before this leaves the check untouched. */
+  beforePublish?: () => void
+  /** Runs when start() fails AFTER beforePublish ran: the microphone was let
+   *  go of for nothing, so the check can take it back. */
+  onPublishFailed?: () => void
 }
 
 export interface InterviewSession {
@@ -72,6 +79,9 @@ export function useInterviewSession(interviewId: string): InterviewSession {
   const orderRef = React.useRef<string[]>([]) // render order of segment ids
   const phaseRef = React.useRef<SessionPhase>("idle")
   const roomRef = React.useRef<Room | null>(null)
+  // Set on unmount so a start() still in flight stops short of joining a
+  // room (or reclaiming a microphone) for a page that is gone.
+  const disposedRef = React.useRef(false)
 
   phaseRef.current = phase
 
@@ -224,15 +234,21 @@ export function useInterviewSession(interviewId: string): InterviewSession {
       void (async () => {
         setPhase("connecting")
         setError(null)
+        let r: Room | null = null
+        let handedOver = false
         try {
           const {
             server_url,
             token,
             room: roomName,
           } = await getInterviewToken(interviewId)
+          // Navigated away while the token was in flight: the unmount
+          // cleanup ran before there was a room to disconnect, so creating
+          // one now would join it for nobody.
+          if (disposedRef.current) return
           log("token received, connecting to room:", roomName)
 
-          const r = new Room({
+          r = new Room({
             // Cleaner mic input = better STT = better interview.
             audioCaptureDefaults: {
               // The device chosen in the pre-join check; omitted falls back to
@@ -247,7 +263,16 @@ export function useInterviewSession(interviewId: string): InterviewSession {
           roomRef.current = r
           registerTranscriptionHandler(r)
           registerAgentStateHandler(r)
+          // Until start() hands the room to the UI, a disconnect is a start
+          // failure and the catch below owns the phase — including the
+          // disconnect the catch itself issues. Flipping to "ended" here
+          // would show "Evaluating…" for an interview that never began.
+          const link = { live: false, lost: false }
           r.on(RoomEvent.Disconnected, (reason) => {
+            if (!link.live) {
+              link.lost = true
+              return
+            }
             // Interview over (agent deleted the room, or connection lost).
             log(
               "disconnected from room (reason:",
@@ -260,7 +285,18 @@ export function useInterviewSession(interviewId: string): InterviewSession {
           })
 
           await r.connect(server_url, token)
+          // Only now, with a room to publish into, does the pre-join check
+          // let go of the microphone: a 409/429 on the token or a failed
+          // connect returns to a check that is still running.
+          handedOver = true
+          options?.beforePublish?.()
           await r.localParticipant.setMicrophoneEnabled(true)
+          if (link.lost) {
+            throw new Error(
+              "The connection dropped before the interview started."
+            )
+          }
+          link.live = true
           log("connected, microphone enabled")
           // Expose the room only now: <RoomAudioRenderer> mounts after the mic
           // gesture and still picks up the agent's (later) audio track.
@@ -270,7 +306,13 @@ export function useInterviewSession(interviewId: string): InterviewSession {
           console.error("[app] could not start the interview:", err)
           setError(errorMessage(err))
           roomRef.current = null
+          // A room that did connect (the microphone failed after) would
+          // otherwise stay joined — agent dispatched, nobody left to hang
+          // up — behind a panel that says idle. A no-op on a room that
+          // never connected.
+          void r?.disconnect()
           setPhase("idle")
+          if (handedOver && !disposedRef.current) options?.onPublishFailed?.()
         }
       })()
     },
@@ -281,7 +323,9 @@ export function useInterviewSession(interviewId: string): InterviewSession {
   // click-driven, so StrictMode's mount/unmount/mount cycle runs before any
   // room exists and this cleanup is a no-op there.
   React.useEffect(() => {
+    disposedRef.current = false
     return () => {
+      disposedRef.current = true
       void roomRef.current?.disconnect()
     }
   }, [])

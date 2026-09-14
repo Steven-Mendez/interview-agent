@@ -143,6 +143,10 @@ function InterviewSessionPage({ interviewId }: { interviewId: string }) {
       interviewId={interviewId}
       endedAt={session.endedAt}
     />
+  ) : interview.status === "error" ? (
+    // Planning failed: there is nothing to start (the token endpoint would
+    // 409), so the pre-join check would only lead to a Start that fails.
+    <FailedPanel interview={interview} />
   ) : (
     <InterviewPanel session={session} interview={interview} />
   )
@@ -180,11 +184,17 @@ function InterviewPanel({
       <PreJoinPanel
         preview={preview}
         error={error}
-        onStart={() => {
-          // LiveKit reopens the same microphone, so hand it over first.
-          preview.releaseMic()
-          start({ audioDeviceId: preview.micId || undefined })
-        }}
+        onStart={() =>
+          start({
+            audioDeviceId: preview.micId || undefined,
+            // The check holds the microphone LiveKit is about to reopen, so
+            // it lets go right before the publish — and takes it back should
+            // the start fall through, so the meter is live on the way back
+            // instead of a bar that never moves.
+            beforePublish: preview.releaseMic,
+            onPublishFailed: preview.reclaimMic,
+          })
+        }
       />
     )
   }
@@ -732,6 +742,9 @@ function ResultsPanel({
         interviewQueryOptions(interviewId).queryKey,
         updated
       )
+      // The history row for this interview still reads "Evaluating…" in any
+      // cached page — and a page is fresh for 10 s after it was fetched.
+      void queryClient.invalidateQueries({ queryKey: ["interviews"] })
       setTimedOut(false)
       log(
         "evaluation received:",
@@ -784,14 +797,20 @@ function ResultsPanel({
   )
 }
 
-function Evaluation({ interview }: { interview: Interview }) {
+/** Same role, same resume, same bar — replanned. Lands on the new interview
+ *  exactly like creating one from the upload form does. */
+function useRepeatInterview(interviewId: string) {
   const navigate = useNavigate()
-  // Same role, same resume, same bar — replanned. Lands on the new interview
-  // exactly like creating one from the upload form does.
-  const repeat = useMutation({
-    mutationFn: () => repeatInterview(interview.id),
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: () => repeatInterview(interviewId),
     onSuccess: (next) => {
       log("interview repeated:", next.id)
+      // The response is the new row: seed its detail so the landing needs no
+      // fetch, and drop every cached history page — the one on screen a
+      // moment ago stays fresh for 10 s and would come back without it.
+      queryClient.setQueryData(interviewQueryOptions(next.id).queryKey, next)
+      void queryClient.invalidateQueries({ queryKey: ["interviews"] })
       void navigate({
         to: "/interviews/$interviewId",
         params: { interviewId: next.id },
@@ -801,6 +820,51 @@ function Evaluation({ interview }: { interview: Interview }) {
       console.error("[app] repeat failed:", error)
     },
   })
+}
+
+/** A row whose planning failed. Nothing about it can run, so the one thing
+ *  on offer is a fresh plan off the same resume and offer. */
+function FailedPanel({ interview }: { interview: Interview }) {
+  const repeat = useRepeatInterview(interview.id)
+  return (
+    <PageShell center>
+      <PageContainer
+        variant="narrow"
+        className="flex flex-col items-center gap-4 text-center"
+      >
+        <span className="flex size-12 items-center justify-center rounded-full bg-destructive/10 text-destructive">
+          <AlertCircleIcon className="size-6" />
+        </span>
+        <h1 className="text-lg font-medium">
+          This interview could not be planned
+        </h1>
+        <p className="text-sm text-muted-foreground">
+          {interview.ended_reason ??
+            "Something went wrong while preparing the questions."}{" "}
+          Repeating it plans a new interview from the same resume and offer.
+        </p>
+        {repeat.isError && (
+          <Alert variant="destructive" className="w-full text-left">
+            <AlertDescription>{errorMessage(repeat.error)}</AlertDescription>
+          </Alert>
+        )}
+        <div className="flex flex-col gap-2 @xl/main:flex-row">
+          <Button variant="ghost" render={<Link to="/interviews" />}>
+            <HistoryIcon />
+            History
+          </Button>
+          <Button onClick={() => repeat.mutate()} disabled={repeat.isPending}>
+            <RotateCcwIcon />
+            {repeat.isPending ? "Planning…" : "Repeat this interview"}
+          </Button>
+        </div>
+      </PageContainer>
+    </PageShell>
+  )
+}
+
+function Evaluation({ interview }: { interview: Interview }) {
+  const repeat = useRepeatInterview(interview.id)
 
   const ev = interview.evaluation
   if (!ev) return null

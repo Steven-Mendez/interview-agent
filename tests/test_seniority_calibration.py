@@ -20,6 +20,7 @@ from interview_agent.prompts import (
     build_evaluator_prompt,
     build_interviewer_prompt,
     build_planner_prompt,
+    fit_length,
     followup_budget,
     length_for,
     profile_for,
@@ -85,9 +86,7 @@ def test_junior_levels_put_metrics_and_tradeoffs_out_of_scope(level):
 def test_senior_expects_what_junior_does_not():
     senior = SENIORITY_CALIBRATION[Seniority.SENIOR].expected_evidence
     assert "two viable options" in _flat(senior)
-    assert "trade-off" not in _flat(
-        SENIORITY_CALIBRATION[Seniority.JUNIOR].expected_evidence
-    )
+    assert "trade-off" not in _flat(SENIORITY_CALIBRATION[Seniority.JUNIOR].expected_evidence)
 
 
 def test_profile_and_length_lookups_fall_back_instead_of_raising():
@@ -143,6 +142,35 @@ def test_planner_prompt_carries_the_length_axis(length, lo, hi, minutes):
     assert f"about {minutes} minutes" in prompt
 
 
+def test_fit_length_falls_back_to_the_largest_profile_that_fits():
+    """The global cap clamps the minutes; the plan must shrink with them."""
+    assert fit_length(InterviewLength.DEEP, 25) is InterviewLength.DEEP
+    assert fit_length(InterviewLength.DEEP, 15) is InterviewLength.STANDARD
+    assert fit_length(InterviewLength.DEEP, 12) is InterviewLength.SHORT
+    # Nothing fits a 5-minute cap: the shortest profile, not a crash.
+    assert fit_length(InterviewLength.DEEP, 5) is InterviewLength.SHORT
+    # No cap (legacy rows) and bad values are tolerated like length_for.
+    assert fit_length("deep", None) is InterviewLength.DEEP
+    assert fit_length("epic", 15) is InterviewLength.STANDARD
+    assert fit_length(None, 8) is InterviewLength.SHORT
+
+
+def test_planner_prompt_plans_for_the_clamped_cap_not_the_requested_length():
+    # "deep" under a 15-minute cap used to ask for 6-8 milestones over 25
+    # minutes and then get cut off at 15, mid-plan.
+    prompt = _flat(build_planner_prompt(Seniority.MID, "deep", max_minutes=15))
+    assert "between 4 and 6 milestones" in prompt
+    assert "about 15 minutes" in prompt
+    # An in-between cap: the fitting profile's range, the real minutes.
+    prompt = _flat(build_planner_prompt(Seniority.MID, "deep", max_minutes=12))
+    assert "between 3 and 4 milestones" in prompt
+    assert "about 12 minutes" in prompt
+    # A cap above the length changes nothing.
+    prompt = _flat(build_planner_prompt(Seniority.MID, "deep", max_minutes=30))
+    assert "between 6 and 8 milestones" in prompt
+    assert "about 25 minutes" in prompt
+
+
 def test_planner_prompt_always_demands_a_per_milestone_bar():
     for seniority in (None, Seniority.SENIOR):
         assert "expected_evidence" in build_planner_prompt(seniority, "standard")
@@ -174,6 +202,12 @@ def test_interviewer_prompt_states_the_follow_up_budget():
         build_interviewer_prompt(_Conv(seniority="senior", interview_length="deep"), [], 25)
     )
     assert "budget of 2 follow-up(s)" in senior
+    # A "deep" interview clamped to 15 minutes was planned as standard, so it
+    # runs with standard's budget too.
+    clamped = _flat(
+        build_interviewer_prompt(_Conv(seniority="senior", interview_length="deep"), [], 15)
+    )
+    assert "budget of 1 follow-up(s)" in clamped
 
 
 def test_interviewer_prompt_carries_each_milestone_bar():
@@ -188,9 +222,7 @@ def test_interviewer_prompt_carries_each_milestone_bar():
 
 
 def test_interviewer_prompt_tolerates_a_legacy_row_without_a_level():
-    prompt = _flat(
-        build_interviewer_prompt(_Conv(seniority=None, interview_length=None), [], 15)
-    )
+    prompt = _flat(build_interviewer_prompt(_Conv(seniority=None, interview_length=None), [], 15))
     assert SENIORITY_CALIBRATION[DEFAULT_SENIORITY].label in prompt
 
 

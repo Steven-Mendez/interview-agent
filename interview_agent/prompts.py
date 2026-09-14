@@ -62,8 +62,7 @@ SENIORITY_CALIBRATION: dict[Seniority, SeniorityProfile] = {
             "correctly and giving one example is already a complete answer"
         ),
         pass_bar=(
-            "the concept is not new to them and they can reason one step past a "
-            "textbook definition"
+            "the concept is not new to them and they can reason one step past a textbook definition"
         ),
         followup_cap=0,
     ),
@@ -91,8 +90,7 @@ SENIORITY_CALIBRATION: dict[Seniority, SeniorityProfile] = {
             "are expected"
         ),
         pass_bar=(
-            "they would get the task done with normal supervision and know when "
-            "to ask for help"
+            "they would get the task done with normal supervision and know when to ask for help"
         ),
         followup_cap=1,
     ),
@@ -118,8 +116,7 @@ SENIORITY_CALIBRATION: dict[Seniority, SeniorityProfile] = {
             "exhaustive comparison is not expected at this level"
         ),
         pass_bar=(
-            "they work autonomously on a component and can justify their "
-            "decisions afterwards"
+            "they work autonomously on a component and can justify their decisions afterwards"
         ),
         followup_cap=1,
     ),
@@ -145,8 +142,7 @@ SENIORITY_CALIBRATION: dict[Seniority, SeniorityProfile] = {
             "criterion"
         ),
         pass_bar=(
-            "they can own an ambiguous problem end to end and defend the "
-            "decision under pushback"
+            "they can own an ambiguous problem end to end and defend the decision under pushback"
         ),
         followup_cap=2,
     ),
@@ -167,8 +163,7 @@ SENIORITY_CALIBRATION: dict[Seniority, SeniorityProfile] = {
             "main subject, tooling trivia"
         ),
         answer_shape=(
-            "structured, and it separates the technical call from the "
-            "organizational one"
+            "structured, and it separates the technical call from the organizational one"
         ),
         pass_bar=(
             "they set a direction others follow and can justify it to engineers "
@@ -220,9 +215,28 @@ def length_for(length: InterviewLength | str | None) -> dict[str, int]:
         return LENGTH_PROFILE[DEFAULT_LENGTH]
 
 
-def followup_budget(
-    seniority: Seniority | str | None, length: InterviewLength | str | None
-) -> int:
+def fit_length(length: InterviewLength | str | None, max_minutes: int | None) -> InterviewLength:
+    """The length profile that actually fits in `max_minutes`.
+
+    `interview_length` is stored as requested, but the global
+    INTERVIEW_MAX_MINUTES clamps every interview's cap. Planning "deep" (6-8
+    milestones for 25 minutes) into a 15-minute cap cuts the interview off
+    mid-plan, so the milestone range and the follow-up budget come from the
+    largest profile whose minutes fit — or the shortest profile when none
+    does. `None` (legacy rows with no cap) fits everything.
+    """
+    try:
+        requested = InterviewLength(length)
+    except ValueError:
+        requested = DEFAULT_LENGTH
+    if max_minutes is None or LENGTH_PROFILE[requested]["minutes"] <= max_minutes:
+        return requested
+    by_minutes = sorted(InterviewLength, key=lambda v: LENGTH_PROFILE[v]["minutes"])
+    fitting = [v for v in by_minutes if LENGTH_PROFILE[v]["minutes"] <= max_minutes]
+    return fitting[-1] if fitting else by_minutes[0]
+
+
+def followup_budget(seniority: Seniority | str | None, length: InterviewLength | str | None) -> int:
     """The stricter of the two axes wins: a deep interview never turns a
     junior conversation into a senior one, it just covers more ground."""
     return min(profile_for(seniority).followup_cap, length_for(length)["followups"])
@@ -343,15 +357,24 @@ are written in another one."""
 def build_planner_prompt(
     seniority: Seniority | str | None,
     length: InterviewLength | str | None,
+    max_minutes: int | None = None,
 ) -> str:
-    """Planner system prompt. `seniority=None` means "classify it yourself"."""
+    """Planner system prompt. `seniority=None` means "classify it yourself".
+
+    `max_minutes` is the cap this interview will actually run under: when it
+    is below the requested length's minutes, the plan is sized for the time
+    the interview really gets (see `fit_length`), not for the length's ideal.
+    """
     calibration = (
         _AUTO_SENIORITY_BLOCK
         if seniority is None
         else build_calibration_block(seniority, "planner")
     )
-    spec = length_for(length)
-    lo, hi, minutes = spec["min_milestones"], spec["max_milestones"], spec["minutes"]
+    spec = length_for(fit_length(length, max_minutes))
+    lo, hi = spec["min_milestones"], spec["max_milestones"]
+    minutes = length_for(length)["minutes"]
+    if max_minutes is not None:
+        minutes = min(minutes, max_minutes)
     fmt = f"""\
 ## Interview format
 Produce between {lo} and {hi} milestones, for a spoken interview of about
@@ -425,7 +448,12 @@ def build_interviewer_prompt(
     conversation: db.Conversation, milestones: list[db.Milestone], max_minutes: int
 ) -> str:
     plan = conversation.plan or {}
-    budget = followup_budget(conversation.seniority, conversation.interview_length)
+    # The budget follows the length the interview was actually planned for:
+    # a "deep" request clamped to a shorter cap was planned (and must be
+    # run) as the profile that fits, not as deep.
+    budget = followup_budget(
+        conversation.seniority, fit_length(conversation.interview_length, max_minutes)
+    )
     # Numbers, not UUIDs: the voice model must echo the identifier into
     # complete_milestone, and a mini model copies "3" far more reliably than
     # a 36-char UUID. No DONE/PENDING markers here — this prompt is built
@@ -447,8 +475,8 @@ The candidate asked for the following. Honor these requests as long as they
 do not conflict with the rules above:
 {conversation.custom_instructions}"""
     followup_rule = (
-        "- You have NO follow-up budget at this level: ask your question, take "
-        "the answer, close the milestone and move on."
+        "- You have NO follow-up budget in this interview: ask your question, "
+        "take the answer, close the milestone and move on."
         if budget == 0
         else f"- You have a budget of {budget} follow-up(s) per milestone. Once "
         "spent, close the milestone with what you have and move on."
@@ -523,8 +551,7 @@ def build_milestone_status(milestones: list[db.Milestone]) -> str:
     model's only reliable view of what is already covered.
     """
     lines = "\n".join(
-        f"{m.position + 1}. [{'DONE' if m.completed else 'PENDING'}] {m.title}"
-        for m in milestones
+        f"{m.position + 1}. [{'DONE' if m.completed else 'PENDING'}] {m.title}" for m in milestones
     )
     return f"""\
 ## Live milestone status (refreshed this turn)

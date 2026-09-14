@@ -21,7 +21,7 @@ import time
 import unicodedata
 import uuid
 from collections import deque
-from collections.abc import AsyncIterable, Callable, Sequence
+from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 
 import httpx
@@ -61,17 +61,18 @@ _WRAP_UP_SECONDS = 120  # warning-to-forced-close window inside the time cap
 _DEDUPE_MIN_WORDS = 8  # shortest real duplicate seen was 18 words
 _DEDUPE_MAX_LAG_SECONDS = 5.0  # an aggregate lands 0-0.5s after the final it repeats
 _DEDUPE_HISTORY_SECONDS = 60.0  # longest stretch one aggregate spanned was 11s
-_DEDUPE_MAX_FINALS = 64  # memory guard for a 15-minute interview
+_DEDUPE_MAX_FINALS = 64  # memory guard; bounds the 60s window, not the interview
 
 _NON_WORD = re.compile(r"[^\w\s]", re.UNICODE)
 
 # How much of an interrupted interview is replayed into the interviewer's
-# context on resume. A 15-minute interview runs ~28 exchanges (~56 messages),
-# so this never trims a legitimate resume — it only bounds the pathological
-# case. It is not the cost control either: the replay is a one-off ~4% of an
-# interview's tokens, whereas charging the elapsed time (see time_cap) is what
-# stops a resume from doubling the interview and quadrupling LLM input.
-_RESUME_MAX_MESSAGES = 80
+# context on resume. An interview runs ~2 exchanges (~4 messages) a minute, so
+# a 25-minute "deep" one is ~100 messages: this never trims a legitimate
+# resume — it only bounds the pathological case. It is not the cost control
+# either: the replay is a one-off ~4% of an interview's tokens, whereas
+# charging the elapsed time (see time_cap) is what stops a resume from
+# doubling the interview and quadrupling LLM input.
+_RESUME_MAX_MESSAGES = 160
 
 
 def prewarm(proc: JobProcess) -> None:
@@ -264,6 +265,69 @@ class InterviewAgent(Agent):
                     )
                     continue
             yield event
+
+
+# Backoff between evaluation-trigger attempts; the trailing 0 is the last try.
+_TRIGGER_BACKOFF_SECONDS = (2, 5, 10, 0)
+# The evaluator runs INLINE in the request (see routes.evaluate_interview), so
+# the read side waits for a whole high-reasoning LLM call; the connect side
+# does not — a black-holed host must fail fast, not burn minutes per attempt.
+_TRIGGER_TIMEOUT = httpx.Timeout(300.0, connect=5.0)
+
+
+async def _trigger_evaluation(
+    url: str,
+    conversation_id: uuid.UUID,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> None:
+    """POST the evaluation trigger, retrying ONLY when the API could not be
+    reached at all.
+
+    Being briefly unreachable (restart, boot ordering) is the one failure
+    that leaves nothing behind: the row sits in "completed" forever and no
+    one ever asks again. Everything else means the request got through and
+    must NOT be re-sent — the endpoint runs the evaluator inline, so:
+    - a response, even a 502, means it ran and marked the row
+      evaluation_failed, which the frontend offers to retry;
+    - a read timeout means it is STILL RUNNING (an evaluation slower than
+      the timeout); posting again would start a second, concurrent
+      evaluation of the same transcript and spend the tokens twice.
+    Only a connect failure is safe to retry, so that is the whole list.
+
+    `transport` and `sleep` exist for the tests.
+    """
+    for attempt, backoff in enumerate(_TRIGGER_BACKOFF_SECONDS, start=1):
+        try:
+            async with httpx.AsyncClient(transport=transport, timeout=_TRIGGER_TIMEOUT) as client:
+                response = await client.post(url)
+            logger.info("auto-evaluation triggered: HTTP %s", response.status_code)
+            break
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            logger.warning("evaluation trigger unreachable (attempt %s): %s", attempt, exc)
+            if backoff:
+                await sleep(backoff)
+        except httpx.TimeoutException as exc:
+            # Read/write timeout: the request reached the API and the
+            # evaluation is most likely still running there. Not retried.
+            logger.warning(
+                "evaluation trigger for %s timed out waiting for the response "
+                "(%s); the evaluation is probably still running — not re-sent",
+                conversation_id,
+                exc,
+            )
+            break
+        except Exception:
+            logger.exception("failed to auto-trigger evaluation")
+            break
+    else:
+        # Out of attempts: say so loudly, the interview is now orphaned
+        # until someone hits Retry in the UI.
+        logger.error(
+            "evaluation never triggered for %s; retry it from the UI",
+            conversation_id,
+        )
 
 
 async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
@@ -459,40 +523,13 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
         if any(interviewer_usage.values()):
             try:
                 async with sessionmaker() as s:
-                    await db.add_token_usage(
-                        s, conversation_id, "interviewer", interviewer_usage
-                    )
+                    await db.add_token_usage(s, conversation_id, "interviewer", interviewer_usage)
             except Exception:
                 logger.exception("failed to persist interviewer token usage")
-        # Retried on TRANSPORT errors only — the API being briefly unreachable
-        # (restart, boot ordering) is the one failure that leaves nothing
-        # behind: the row sits in "completed" forever and no one ever asks
-        # again. A response, even a 502, means the endpoint ran and marked
-        # the row evaluation_failed, which the frontend offers to retry — so
-        # re-POSTing that would only spend the tokens twice.
-        url = f"{settings.app_base_url}/api/interviews/{conversation_id}/evaluate"
-        for attempt, backoff in enumerate((2, 5, 10, 0), start=1):
-            try:
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(url, timeout=300)
-                logger.info("auto-evaluation triggered: HTTP %s", response.status_code)
-                break
-            except httpx.RequestError as exc:
-                logger.warning(
-                    "evaluation trigger unreachable (attempt %s): %s", attempt, exc
-                )
-                if backoff:
-                    await asyncio.sleep(backoff)
-            except Exception:
-                logger.exception("failed to auto-trigger evaluation")
-                break
-        else:
-            # Out of attempts: say so loudly, the interview is now orphaned
-            # until someone hits Retry in the UI.
-            logger.error(
-                "evaluation never triggered for %s; retry it from the UI",
-                conversation_id,
-            )
+        await _trigger_evaluation(
+            f"{settings.app_base_url}/api/interviews/{conversation_id}/evaluate",
+            conversation_id,
+        )
         await qdrant.close()
         await engine.dispose()
 
@@ -503,9 +540,7 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
 
     await session.start(
         room=ctx.room,
-        agent=InterviewAgent(
-            instructions=prompt, chat_ctx=_chat_ctx_from_messages(prior_messages)
-        ),
+        agent=InterviewAgent(instructions=prompt, chat_ctx=_chat_ctx_from_messages(prior_messages)),
     )
     watcher_task = asyncio.create_task(watch_end_event())
     timer_task = asyncio.create_task(time_cap())

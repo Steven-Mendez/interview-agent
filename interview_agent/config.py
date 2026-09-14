@@ -29,9 +29,7 @@ class Settings(BaseSettings):
     # GPT-5-family models take reasoning effort ("none" = no reasoning, lowest
     # time-to-first-token — what a voice agent wants) and reject temperature;
     # pre-GPT-5 models take temperature and ignore reasoning effort.
-    interviewer_reasoning_effort: str = Field(
-        default="none", alias="INTERVIEWER_REASONING_EFFORT"
-    )
+    interviewer_reasoning_effort: str = Field(default="none", alias="INTERVIEWER_REASONING_EFFORT")
     interviewer_temperature: float = Field(default=0.7, alias="INTERVIEWER_TEMPERATURE")
 
     # Interview planner/evaluator: run once per interview with no latency
@@ -39,9 +37,7 @@ class Settings(BaseSettings):
     planner_model: str = Field(default="gpt-5.5", alias="PLANNER_MODEL")
     planner_reasoning_effort: str = Field(default="high", alias="PLANNER_REASONING_EFFORT")
     evaluator_model: str = Field(default="gpt-5.5", alias="EVALUATOR_MODEL")
-    evaluator_reasoning_effort: str = Field(
-        default="high", alias="EVALUATOR_REASONING_EFFORT"
-    )
+    evaluator_reasoning_effort: str = Field(default="high", alias="EVALUATOR_REASONING_EFFORT")
 
     # RAG storage. text-embedding-3-small → 1536 dims (must match the Qdrant
     # collection's vector size).
@@ -60,8 +56,12 @@ class Settings(BaseSettings):
     # Qdrant points are purged once older than this. 0 disables the purge.
     retention_days: int = Field(default=30, alias="RETENTION_DAYS")
 
-    # Interview session limits and wiring.
-    interview_max_minutes: int = Field(default=15, alias="INTERVIEW_MAX_MINUTES")
+    # Interview session limits and wiring. The global cap clamps every
+    # interview's own cap (derived from its interview_length); 25 is the
+    # longest shipped length ("deep"), so the default lets every option run
+    # to its planned length. Lowering it is allowed: the planner then plans
+    # for the clamped time (see prompts.fit_length).
+    interview_max_minutes: int = Field(default=25, alias="INTERVIEW_MAX_MINUTES")
     # Soft cap on simultaneous interviews: each one burns LLM/STT/TTS budget,
     # so /token returns 429 once this many are in progress.
     max_concurrent_interviews: int = Field(default=3, alias="MAX_CONCURRENT_INTERVIEWS")
@@ -75,9 +75,7 @@ class Settings(BaseSettings):
     # STT via LiveKit Inference. The transcription language is pinned to the
     # interview language chosen in the in-app Settings screen; the TTS model
     # and voice come from the same screen (see interview_agent/voices.py).
-    stt_model: str = Field(
-        default="assemblyai/universal-streaming-multilingual", alias="STT_MODEL"
-    )
+    stt_model: str = Field(default="assemblyai/universal-streaming-multilingual", alias="STT_MODEL")
 
     # LiveKit: key/secret auth the Inference gateway (STT/TTS); the server URL
     # is where the worker and the browser join interview rooms.

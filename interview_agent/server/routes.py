@@ -97,6 +97,16 @@ def _validate_voice(language: str, voice: str) -> dict[str, Any]:
     return voice_cfg
 
 
+def _default_voice_for(language: str, like: str | None = None) -> str:
+    """The catalog voice for `language` when none was chosen: the one with
+    the same gender as `like` (the voice being replaced) when there is one,
+    else the first listed. `language` must be supported."""
+    candidates = [key for key, cfg in VOICES.items() if cfg["language"] == language]
+    gender = VOICES.get(like or "", {}).get("gender")
+    same_gender = [key for key in candidates if VOICES[key]["gender"] == gender]
+    return (same_gender or candidates)[0]
+
+
 def _resolve_interviewer(
     app_settings: db.AppSettings, overrides: dict[str, str | None] | None
 ) -> dict[str, Any]:
@@ -108,6 +118,10 @@ def _resolve_interviewer(
     instructions an empty string is a real answer — this interview runs with
     none — while for the name, language and voice (which cannot be empty) it
     falls back to the global value too.
+
+    Overriding the language without a voice inherits a voice that may speak
+    another language; rather than rejecting the request for a pair the caller
+    never chose, the voice falls back to one for the requested language.
     """
     values = overrides or {}
 
@@ -116,7 +130,14 @@ def _resolve_interviewer(
 
     agent_name = _pick("agent_name", app_settings.agent_name)
     language = _pick("language", app_settings.language)
-    voice = _pick("voice", app_settings.voice)
+    voice_override = _pick("voice", "")
+    voice = voice_override or app_settings.voice
+    if (
+        not voice_override
+        and language in SUPPORTED_LANGUAGES
+        and VOICES.get(voice, {}).get("language") != language
+    ):
+        voice = _default_voice_for(language, like=voice)
     voice_cfg = _validate_voice(language, voice)
 
     def _pick_optional(key: str, fallback: str | None) -> str | None:
@@ -160,7 +181,9 @@ def _parse_interviewer(raw: str | None) -> dict[str, str | None] | None:
         raise HTTPException(
             status_code=400, detail=f"interviewer must be a JSON object: {exc}"
         ) from None
-    # exclude_unset keeps "absent" distinct from an explicit null/"".
+    # exclude_unset drops the keys that were not sent. An explicit null does
+    # survive the dump, but _resolve_interviewer treats None as "inherit" —
+    # so null and absent both inherit the global value; only "" clears.
     return override.model_dump(exclude_unset=True)
 
 
@@ -277,9 +300,7 @@ def _serialize(conversation: db.Conversation) -> dict[str, Any]:
         "job_offer": conversation.job_offer,
         "resume_filename": conversation.resume_filename,
         # Root of the re-run chain, NULL on a first attempt.
-        "repeat_of_id": (
-            str(conversation.repeat_of_id) if conversation.repeat_of_id else None
-        ),
+        "repeat_of_id": (str(conversation.repeat_of_id) if conversation.repeat_of_id else None),
         "plan": conversation.plan,
         "seniority": conversation.seniority,
         "seniority_source": conversation.seniority_source,
@@ -342,17 +363,28 @@ def _serialize_summary(conversation: db.Conversation) -> dict[str, Any]:
         "seniority_source": conversation.seniority_source,
         "interview_length": conversation.interview_length,
         "max_minutes": conversation.max_minutes,
-        "repeat_of_id": (
-            str(conversation.repeat_of_id) if conversation.repeat_of_id else None
-        ),
+        "repeat_of_id": (str(conversation.repeat_of_id) if conversation.repeat_of_id else None),
         "milestones_total": len(milestones),
         "milestones_completed": sum(1 for m in milestones if m.completed),
         "evaluation": (
-            {"hired": evaluation.hired, "score": evaluation.score}
-            if evaluation
-            else None
+            {"hired": evaluation.hired, "score": evaluation.score} if evaluation else None
         ),
     }
+
+
+async def _record_spent_usage(
+    session: AsyncSession,
+    conversation_id: uuid.UUID,
+    component: str,
+    handler: UsageMetadataCallbackHandler,
+) -> None:
+    """Book the tokens a FAILED planner/evaluator run consumed. The callback
+    fires per retry attempt, so a run that never produced a usable result
+    still spent whatever it reports; only a run that never reached the model
+    (nothing to book) is skipped."""
+    usage = summarize_usage(handler.usage_metadata)
+    if any(usage.values()):
+        await db.add_token_usage(session, conversation_id, component, usage)
 
 
 async def _load_or_404(session: AsyncSession, interview_id: uuid.UUID) -> db.Conversation:
@@ -392,9 +424,7 @@ async def create_interview(
     if len(data) > _MAX_RESUME_BYTES:
         logger.warning("resume rejected: %s exceeds 10 MB", resume.filename)
         raise HTTPException(status_code=413, detail="Resume PDF exceeds the 10 MB limit")
-    logger.info(
-        "creating interview", extra={"resume": resume.filename, "bytes": len(data)}
-    )
+    logger.info("creating interview", extra={"resume": resume.filename, "bytes": len(data)})
     try:
         # In a worker thread: the conversion is CPU-bound pure Python and
         # would otherwise stall every other request on this event loop.
@@ -444,6 +474,11 @@ async def _plan_and_persist(
     None inherits the global settings, a value wins for this interview only.
     """
     conversation_id = uuid.uuid4()
+    # This interview's own time cap: the requested length's minutes, clamped
+    # by the global setting. Stored on the row AND handed to the planner, so
+    # a "deep" request under a 15-minute cap is planned for 15 minutes
+    # instead of being cut off mid-plan (`interview_length` stays "deep").
+    max_minutes = min(length_for(length)["minutes"], settings.interview_max_minutes)
     async with _sessionmaker(request)() as session:
         # Snapshot the interviewer NOW: this interview keeps this
         # persona/language/voice even if the settings change later.
@@ -472,13 +507,12 @@ async def _plan_and_persist(
                 ),
                 seniority_evidence=pinned_evidence if requested_seniority else None,
                 interview_length=length.value,
-                max_minutes=min(
-                    length_for(length)["minutes"], settings.interview_max_minutes
-                ),
+                max_minutes=max_minutes,
             )
         )
         await session.commit()
 
+        planner_usage = UsageMetadataCallbackHandler()
         try:
             n_chunks = await rag.index_resume(
                 request.app.state.qdrant,
@@ -491,7 +525,6 @@ async def _plan_and_persist(
                 "resume indexed",
                 extra={"conversation": str(conversation_id), "chunks": n_chunks},
             )
-            planner_usage = UsageMetadataCallbackHandler()
             plan = await run_planner(
                 settings,
                 resume_markdown,
@@ -500,6 +533,7 @@ async def _plan_and_persist(
                 agent_name=interviewer["agent_name"],
                 seniority=requested_seniority,
                 interview_length=length,
+                max_minutes=max_minutes,
                 persona=interviewer["persona"],
                 custom_instructions=interviewer["custom_instructions"],
                 usage_callback=planner_usage,
@@ -507,6 +541,9 @@ async def _plan_and_persist(
         except Exception as exc:
             logger.exception("planning failed for %s", conversation_id)
             await db.set_status(session, conversation_id, "error")
+            # The attempts inside with_retry were real spend even though no
+            # plan came out of them.
+            await _record_spent_usage(session, conversation_id, "planner", planner_usage)
             raise HTTPException(status_code=500, detail=f"Planning failed: {exc}") from exc
 
         await db.add_token_usage(
@@ -530,9 +567,7 @@ async def _plan_and_persist(
         # The seniority fields stay OUT of the plan JSON on purpose: they live
         # in columns, as the single source of truth for every later stage.
         conversation.plan = {
-            **plan.model_dump(
-                exclude={"milestones", "detected_seniority", "seniority_evidence"}
-            ),
+            **plan.model_dump(exclude={"milestones", "detected_seniority", "seniority_evidence"}),
             "language": interviewer["language"],
         }
         # Resolution, once and for all: explicit beats detected beats fallback.
@@ -576,7 +611,9 @@ async def list_interviews(
     offset: int = Query(0, ge=0),
     status: str | None = Query(None),
 ):
-    """Paginated history, newest first. `status` narrows it to one state."""
+    """Paginated history, newest first. `status` narrows it to one state;
+    empty (a form's "all" option) is the same as absent."""
+    status = status or None
     if status is not None and status not in _HISTORY_STATUSES:
         raise HTTPException(
             status_code=400, detail=f"status must be one of {list(_HISTORY_STATUSES)}"
@@ -788,9 +825,7 @@ async def evaluate_interview(request: Request, interview_id: uuid.UUID):
         # at the end of this handler), silently blinding search_resume for the
         # rest of the live interview.
         if conversation.status == "interviewing":
-            raise HTTPException(
-                status_code=409, detail="Interview is still in progress"
-            )
+            raise HTTPException(status_code=409, detail="Interview is still in progress")
         messages = await db.get_messages(session, interview_id)
         if not messages:
             raise HTTPException(status_code=409, detail="No transcript to evaluate yet")
@@ -835,7 +870,20 @@ async def evaluate_interview(request: Request, interview_id: uuid.UUID):
         logger.exception("evaluation failed for %s", interview_id)
         async with sessionmaker() as session:
             await db.set_status(session, interview_id, "evaluation_failed")
+            await _record_spent_usage(session, interview_id, "evaluator", evaluator_usage)
         raise HTTPException(status_code=502, detail=f"Evaluation failed: {exc}") from exc
+
+    if result.seniority_evaluated.value != seniority:
+        # The level is pinned and handed to the evaluator; an echo of a
+        # different one means the calibration did not hold on this run.
+        # Stored as returned (it is what the score was judged against) but
+        # made visible here.
+        logger.warning(
+            "evaluator judged %s against '%s' instead of the pinned '%s'",
+            interview_id,
+            result.seniority_evaluated.value,
+            seniority,
+        )
 
     # Session 2 (write): upsert instead of delete+insert — two overlapping
     # invocations (worker auto-trigger + manual retry) must not race into a
@@ -880,9 +928,7 @@ async def evaluate_interview(request: Request, interview_id: uuid.UUID):
     # evaluation is done, so drop them (PII). Best-effort: the purge job
     # sweeps anything missed here.
     try:
-        await rag.delete_resume_points(
-            request.app.state.qdrant, settings, [interview_id]
-        )
+        await rag.delete_resume_points(request.app.state.qdrant, settings, [interview_id])
     except Exception:
         logger.exception("failed to delete resume points for %s", interview_id)
 

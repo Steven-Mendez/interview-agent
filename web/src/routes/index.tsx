@@ -1,6 +1,6 @@
 import * as React from "react"
 import { createFileRoute, useNavigate } from "@tanstack/react-router"
-import { useMutation, useQuery } from "@tanstack/react-query"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useForm } from "@tanstack/react-form"
 import * as z from "zod"
 import { ArrowLeftIcon, CheckCircle2Icon, UploadIcon } from "lucide-react"
@@ -15,7 +15,8 @@ import {
   getSettings,
   voiceLabel,
 } from "@/lib/api"
-import type { InterviewLength, Seniority } from "@/lib/api"
+import type { InterviewLength, InterviewerInput, Seniority } from "@/lib/api"
+import { interviewQueryOptions } from "@/lib/queries"
 import { log } from "@/lib/log"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -67,15 +68,36 @@ const uploadSchema = z.object({
   // Volume axis, independent of the level: how much ground to cover.
   interview_length: z.enum(["short", "standard", "deep"]),
   // Who conducts it. Pre-filled from the global Settings screen; changing it
-  // here applies to THIS interview only.
-  agent_name: z.string().trim().min(1, "Give the interviewer a name."),
-  language: z.string().min(1, "Pick a language."),
-  voice: z.string().min(1, "Pick a voice."),
+  // here applies to THIS interview only. Blank is allowed here because the
+  // server falls back to the saved value for each of these — see
+  // `interviewerSchema` for when a pick is actually expected.
+  agent_name: z.string().trim(),
+  language: z.string(),
+  voice: z.string(),
   persona: z.string(),
   custom_instructions: z.string(),
 })
 
+/** With the saved settings on screen the interviewer fields are pre-filled,
+ *  so a blank one is a mistake worth flagging. Without them (GET /settings
+ *  failed) the language and voice selects have no options to pick from, and
+ *  blanks are the only way through — the server then uses the saved values. */
+const interviewerSchema = uploadSchema.extend({
+  agent_name: z.string().trim().min(1, "Give the interviewer a name."),
+  language: z.string().min(1, "Pick a language."),
+  voice: z.string().min(1, "Pick a voice."),
+})
+
 type FieldName = keyof z.infer<typeof uploadSchema>
+
+/** The keys of the `interviewer` JSON field, in the order they are shown. */
+const INTERVIEWER_FIELDS = [
+  "agent_name",
+  "language",
+  "voice",
+  "persona",
+  "custom_instructions",
+] as const satisfies ReadonlyArray<keyof InterviewerInput>
 
 /** The wizard, declared once.
  *
@@ -212,6 +234,7 @@ function FilledRow({
 
 function UploadPage() {
   const navigate = useNavigate()
+  const queryClient = useQueryClient()
   const [step, setStep] = React.useState(0)
   // Kept mounted so "Change" can reopen the picker from the collapsed row.
   const resumeInputRef = React.useRef<HTMLInputElement>(null)
@@ -224,6 +247,13 @@ function UploadPage() {
         interview.id,
         `(${interview.milestones.length} milestones)`
       )
+      // Seed the landing page's detail and drop the cached history pages,
+      // which do not have this row yet.
+      queryClient.setQueryData(
+        interviewQueryOptions(interview.id).queryKey,
+        interview
+      )
+      void queryClient.invalidateQueries({ queryKey: ["interviews"] })
       navigate({
         to: "/interviews/$interviewId",
         params: { interviewId: interview.id },
@@ -233,6 +263,20 @@ function UploadPage() {
       console.error("[app] interview creation failed:", error)
     },
   })
+
+  // The global settings are the defaults for this interview. Hydrated once,
+  // and only into fields the user has not already filled in — a late response
+  // must never overwrite what they typed.
+  const settingsQuery = useQuery({
+    queryKey: ["settings"],
+    queryFn: getSettings,
+  })
+  const settings = settingsQuery.data
+  const hydrated = React.useRef(false)
+  // Without the saved settings there is no catalog to pick a language or a
+  // voice from, and no name pre-filled: blanks have to pass, and the server
+  // fills them from the saved settings.
+  const schema = settingsQuery.isError ? uploadSchema : interviewerSchema
 
   const form = useForm({
     defaultValues: {
@@ -246,7 +290,7 @@ function UploadPage() {
       persona: "",
       custom_instructions: "",
     },
-    validators: { onSubmit: uploadSchema },
+    validators: { onSubmit: schema },
     onSubmit: ({ value }) => {
       log("uploading resume and requesting a plan…")
       const formData = new FormData()
@@ -257,29 +301,20 @@ function UploadPage() {
       // One JSON field, not five: an empty multipart field is
       // indistinguishable from an absent one, and here "" (run without a
       // persona) has to stay distinct from "inherit the global one".
-      formData.append(
-        "interviewer",
-        JSON.stringify({
-          agent_name: value.agent_name,
-          language: value.language,
-          voice: value.voice,
-          persona: value.persona,
-          custom_instructions: value.custom_instructions,
-        })
-      )
+      //
+      // That distinction only holds once the saved settings were shown: a
+      // blank the user could never have seen filled is "no answer", not
+      // "none" — left out of the JSON, the server keeps the saved value
+      // instead of clearing the persona for this interview.
+      const interviewer: InterviewerInput = {}
+      for (const key of INTERVIEWER_FIELDS) {
+        if (hydrated.current || value[key]) interviewer[key] = value[key]
+      }
+      formData.append("interviewer", JSON.stringify(interviewer))
       mutation.mutate(formData)
     },
   })
 
-  // The global settings are the defaults for this interview. Hydrated once,
-  // and only into fields the user has not already filled in — a late response
-  // must never overwrite what they typed.
-  const settingsQuery = useQuery({
-    queryKey: ["settings"],
-    queryFn: getSettings,
-  })
-  const settings = settingsQuery.data
-  const hydrated = React.useRef(false)
   React.useEffect(() => {
     if (hydrated.current || !settings) return
     hydrated.current = true
@@ -602,15 +637,16 @@ function UploadPage() {
                       <Alert variant="destructive">
                         <AlertDescription>
                           Could not load your saved settings —{" "}
-                          {errorMessage(settingsQuery.error)}. Pick a language
-                          and a voice below.
+                          {errorMessage(settingsQuery.error)}. The interview
+                          will use the saved name, language and voice; the
+                          fields below only apply if you fill them in.
                         </AlertDescription>
                       </Alert>
                     )}
 
                     <form.Field
                       name="agent_name"
-                      validators={{ onChange: uploadSchema.shape.agent_name }}
+                      validators={{ onChange: schema.shape.agent_name }}
                       children={(field) => {
                         const isInvalid =
                           field.state.meta.isTouched &&
@@ -665,13 +701,21 @@ function UploadPage() {
                                   )
                                 }
                               }}
-                              disabled={mutation.isPending}
+                              // No catalog, no options: a select with
+                              // nothing in it is worse than one that says
+                              // what will be used.
+                              disabled={
+                                mutation.isPending || settingsQuery.isError
+                              }
                             >
                               <SelectTrigger id={field.name} className="w-full">
                                 <SelectValue>
                                   {(value: string) =>
                                     LANGUAGE_LABELS[value] ??
-                                    (value || "Pick one")
+                                    (value ||
+                                      (settingsQuery.isError
+                                        ? "Saved default"
+                                        : "Pick one"))
                                   }
                                 </SelectValue>
                               </SelectTrigger>
@@ -708,7 +752,9 @@ function UploadPage() {
                                   onValueChange={(next) =>
                                     next && field.handleChange(next)
                                   }
-                                  disabled={mutation.isPending}
+                                  disabled={
+                                    mutation.isPending || settingsQuery.isError
+                                  }
                                 >
                                   <SelectTrigger
                                     id={field.name}
@@ -721,7 +767,9 @@ function UploadPage() {
                                         )
                                         return voice
                                           ? voiceLabel(language, voice)
-                                          : "Pick one"
+                                          : settingsQuery.isError
+                                            ? "Saved default"
+                                            : "Pick one"
                                       }}
                                     </SelectValue>
                                   </SelectTrigger>

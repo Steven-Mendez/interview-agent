@@ -287,9 +287,7 @@ async def test_create_interview_rejects_non_pdf(client_and_sessionmaker):
     assert res.status_code == 400
 
 
-async def test_create_interview_planning_failure_marks_error(
-    client_and_sessionmaker, monkeypatch
-):
+async def test_create_interview_planning_failure_marks_error(client_and_sessionmaker, monkeypatch):
     client, sessionmaker = client_and_sessionmaker
 
     async def _boom(*args, **kwargs):
@@ -307,6 +305,28 @@ async def test_create_interview_planning_failure_marks_error(
             {"o": job_offer},
         )
     assert status == "error"
+
+
+async def test_a_failed_planner_run_still_books_its_tokens(client_and_sessionmaker, monkeypatch):
+    client, sessionmaker = client_and_sessionmaker
+
+    async def _spent_then_failed(*args, usage_callback, **kwargs):
+        # The callback fires per retry attempt: the model was called (and
+        # billed) before the structured output failed to validate.
+        usage_callback.usage_metadata = {
+            "gpt": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}
+        }
+        raise RuntimeError("could not parse the plan")
+
+    monkeypatch.setattr(routes, "run_planner", _spent_then_failed)
+    job_offer = f"offer-{uuid.uuid4()}"
+    assert (await client.post("/api/interviews", **_upload(job_offer))).status_code == 500
+    async with sessionmaker() as session:
+        row = await session.scalar(
+            select(db.Conversation).where(db.Conversation.job_offer == job_offer)
+        )
+    assert row.status == "error"
+    assert row.token_usage["planner"]["total_tokens"] == 6
 
 
 async def test_get_interview_404(client_and_sessionmaker):
@@ -397,6 +417,35 @@ async def test_evaluate_failure_sets_status_and_retry_recovers(
     res2 = await client.post(f"/api/interviews/{conversation_id}/evaluate")
     assert res2.status_code == 200
     assert res2.json()["status"] == "evaluated"
+
+
+async def test_a_failed_evaluation_still_books_its_tokens(client_and_sessionmaker, monkeypatch):
+    client, sessionmaker = client_and_sessionmaker
+    conversation_id = await _seed_finished_interview(sessionmaker)
+
+    async def _spent_then_failed(settings, *, usage_callback, **kwargs):
+        usage_callback.usage_metadata = {
+            "gpt": {"input_tokens": 5, "output_tokens": 1, "total_tokens": 6}
+        }
+        raise RuntimeError("could not parse the verdict")
+
+    monkeypatch.setattr(routes, "run_evaluator", _spent_then_failed)
+    assert (await client.post(f"/api/interviews/{conversation_id}/evaluate")).status_code == 502
+    body = (await client.get(f"/api/interviews/{conversation_id}")).json()
+    assert body["status"] == "evaluation_failed"
+    assert body["token_usage"]["evaluator"]["total_tokens"] == 6
+
+    # The successful retry accumulates on top: both runs were paid for.
+    async def _spent_and_succeeded(settings, *, usage_callback, **kwargs):
+        usage_callback.usage_metadata = {
+            "gpt": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14}
+        }
+        return _evaluation()
+
+    monkeypatch.setattr(routes, "run_evaluator", _spent_and_succeeded)
+    body = (await client.post(f"/api/interviews/{conversation_id}/evaluate")).json()
+    assert body["status"] == "evaluated"
+    assert body["token_usage"]["evaluator"]["total_tokens"] == 20
 
 
 # ---- DB helpers -------------------------------------------------------------
@@ -538,9 +587,7 @@ async def test_resumed_job_appends_instead_of_interleaving(client_and_sessionmak
         resumed_seq = itertools.count(agent._next_seq(prior))
 
         for role, content in [("assistant", "welcome back"), ("user", "answer 2")]:
-            await db.insert_message(
-                session, conversation_id, role, content, seq=next(resumed_seq)
-            )
+            await db.insert_message(session, conversation_id, role, content, seq=next(resumed_seq))
         messages = await db.get_messages(session, conversation_id)
 
     assert [m.content for m in messages] == [
@@ -647,6 +694,37 @@ async def test_an_empty_persona_clears_it_for_this_interview_only(client_and_ses
     assert (await client.get("/api/settings")).json()["persona"] == "a global persona"
 
 
+async def test_overriding_the_language_alone_picks_a_voice_for_it(client_and_sessionmaker):
+    client, sessionmaker = client_and_sessionmaker
+    # Global voice speaks English; this interview only asks for Spanish.
+    await client.put(
+        "/api/settings", json={"agent_name": "Emma", "language": "en", "voice": "en_female"}
+    )
+    res = await client.post("/api/interviews", **_upload(interviewer=_interviewer(language="es")))
+    assert res.status_code == 200, res.json()
+    body = res.json()
+    # A Spanish voice of the same gender as the one it replaces.
+    assert body["interviewer"] == {"agent_name": "Emma", "language": "es", "voice": "es_female"}
+    assert body["plan"]["language"] == "es"
+    async with sessionmaker() as session:
+        row = await db.get_conversation(session, uuid.UUID(body["id"]))
+        assert row is not None
+        assert row.agent_settings["tts_voice"] == VOICES["es_female"]["tts_voice"]
+
+    # Same with a male global voice; and an explicit mismatch still fails.
+    await client.put(
+        "/api/settings", json={"agent_name": "Blake", "language": "en", "voice": "en_male"}
+    )
+    body = (
+        await client.post("/api/interviews", **_upload(interviewer=_interviewer(language="es")))
+    ).json()
+    assert body["interviewer"]["voice"] == "es_male"
+    res = await client.post(
+        "/api/interviews", **_upload(interviewer=_interviewer(language="es", voice="en_male"))
+    )
+    assert res.status_code == 400
+
+
 async def test_create_interview_rejects_an_impossible_voice(client_and_sessionmaker):
     client, _ = client_and_sessionmaker
     res = await client.post(
@@ -655,9 +733,7 @@ async def test_create_interview_rejects_an_impossible_voice(client_and_sessionma
     assert res.status_code == 400
     assert "not available" in res.json()["detail"]
 
-    res = await client.post(
-        "/api/interviews", **_upload(interviewer=_interviewer(voice="klingon"))
-    )
+    res = await client.post("/api/interviews", **_upload(interviewer=_interviewer(voice="klingon")))
     assert res.status_code == 400
     res = await client.post(
         "/api/interviews", **_upload(interviewer=_interviewer(language="fr", voice="en_female"))
@@ -774,6 +850,9 @@ async def test_history_paginates_and_filters_by_status(client_and_sessionmaker):
     assert filtered["total"] == 1
 
     assert (await client.get("/api/interviews", params={"status": "nope"})).status_code == 400
+    # An empty filter (a form's "all" option) is not an unknown status.
+    everything = (await client.get("/api/interviews", params={"status": ""})).json()
+    assert everything["total"] == 3
     assert (await client.get("/api/interviews", params={"limit": 0})).status_code == 422
 
 
@@ -871,9 +950,7 @@ async def test_repeat_keeps_an_auto_detected_level_marked_as_auto(
 
 async def test_repeat_accepts_overrides_and_404s_on_an_unknown_id(client_and_sessionmaker):
     client, _ = client_and_sessionmaker
-    source = (
-        await client.post("/api/interviews", **_upload("Offer.", seniority="lead"))
-    ).json()
+    source = (await client.post("/api/interviews", **_upload("Offer.", seniority="lead"))).json()
 
     repeat = (
         await client.post(
@@ -889,9 +966,7 @@ async def test_repeat_accepts_overrides_and_404s_on_an_unknown_id(client_and_ses
         length_for(InterviewLength.SHORT)["minutes"], settings.interview_max_minutes
     )
 
-    bad = await client.post(
-        f"/api/interviews/{source['id']}/repeat", json={"seniority": "wizard"}
-    )
+    bad = await client.post(f"/api/interviews/{source['id']}/repeat", json={"seniority": "wizard"})
     assert bad.status_code == 400
     assert (await client.post(f"/api/interviews/{uuid.uuid4()}/repeat")).status_code == 404
 
@@ -967,13 +1042,46 @@ async def test_interview_length_sets_this_interviews_own_time_cap(
     assert body["max_minutes"] == min(8, settings.interview_max_minutes)
 
 
+async def test_deep_under_a_lower_cap_is_planned_for_the_cap(client_and_sessionmaker, monkeypatch):
+    """`max_minutes` clamps the row; the planner must be sized for the SAME
+    clamped value, or the interview is cut off mid-plan. The requested length
+    is still stored as requested."""
+    monkeypatch.setattr(settings, "interview_max_minutes", 15)
+    seen: list[dict] = []
+
+    async def _planner(settings, resume_markdown, job_offer, **kwargs):
+        seen.append(kwargs)
+        return _plan()
+
+    monkeypatch.setattr(routes, "run_planner", _planner)
+    client, _ = client_and_sessionmaker
+    res = await client.post("/api/interviews", **_upload(interview_length="deep"))
+    assert res.status_code == 200
+    body = res.json()
+    assert body["interview_length"] == "deep"
+    assert body["max_minutes"] == 15
+    assert seen[-1]["interview_length"] is InterviewLength.DEEP
+    assert seen[-1]["max_minutes"] == 15
+
+    # The repeat replans under the same rule.
+    repeat = await client.post(f"/api/interviews/{body['id']}/repeat")
+    assert repeat.status_code == 200
+    assert repeat.json()["max_minutes"] == 15
+    assert seen[-1]["interview_length"] is InterviewLength.DEEP
+    assert seen[-1]["max_minutes"] == 15
+
+    # With the shipped default the deep profile fits untouched.
+    monkeypatch.setattr(settings, "interview_max_minutes", 25)
+    body = (await client.post("/api/interviews", **_upload(interview_length="deep"))).json()
+    assert body["max_minutes"] == 25
+    assert seen[-1]["max_minutes"] == 25
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [("seniority", "archmage"), ("interview_length", "epic")],
 )
-async def test_create_interview_rejects_unknown_axis_values(
-    client_and_sessionmaker, field, value
-):
+async def test_create_interview_rejects_unknown_axis_values(client_and_sessionmaker, field, value):
     client, _ = client_and_sessionmaker
     res = await client.post("/api/interviews", **_upload(**{field: value}))
     assert res.status_code == 400
@@ -986,9 +1094,7 @@ async def test_milestones_carry_their_bar_to_the_api(client_and_sessionmaker):
     assert all(m["expected_evidence"] == "Names one index." for m in res.json()["milestones"])
 
 
-async def test_evaluate_judges_against_the_pinned_level(
-    client_and_sessionmaker, monkeypatch
-):
+async def test_evaluate_judges_against_the_pinned_level(client_and_sessionmaker, monkeypatch):
     """The evaluator is HANDED the level and the per-milestone bars; it never
     re-infers seniority from how advanced the stack sounds."""
     client, sessionmaker = client_and_sessionmaker
@@ -1015,6 +1121,4 @@ async def test_evaluate_judges_against_the_pinned_level(
 
     evaluation = res.json()["evaluation"]
     assert evaluation["seniority_evaluated"] == "mid"  # what the fake returned
-    assert evaluation["calibration_notes"] == [
-        "Skipped trade-off depth: above this level."
-    ]
+    assert evaluation["calibration_notes"] == ["Skipped trade-off depth: above this level."]

@@ -1,5 +1,10 @@
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router"
-import { keepPreviousData, useMutation, useQuery } from "@tanstack/react-query"
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query"
 import {
   ArrowRightIcon,
   ChevronLeftIcon,
@@ -19,7 +24,11 @@ import {
   repeatInterview,
 } from "@/lib/api"
 import type { InterviewStatus, InterviewSummary } from "@/lib/api"
-import { HISTORY_PAGE_SIZE, interviewsQueryOptions } from "@/lib/queries"
+import {
+  HISTORY_PAGE_SIZE,
+  interviewQueryOptions,
+  interviewsQueryOptions,
+} from "@/lib/queries"
 import { log } from "@/lib/log"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -100,6 +109,7 @@ function errorMessage(error: unknown): string {
 function HistoryPage() {
   const { offset = 0, status } = Route.useSearch()
   const navigate = useNavigate({ from: Route.fullPath })
+  const queryClient = useQueryClient()
 
   const query = useQuery({
     ...interviewsQueryOptions({ offset, status }),
@@ -114,6 +124,15 @@ function HistoryPage() {
     mutationFn: (interviewId: string) => repeatInterview(interviewId),
     onSuccess: (interview) => {
       log("interview repeated:", interview.id)
+      // The response is the new row: seed its detail so the landing needs no
+      // fetch, and drop every cached page of this list — the one on screen
+      // right now stays fresh for 10 s, and Back would show it without the
+      // interview just planned.
+      queryClient.setQueryData(
+        interviewQueryOptions(interview.id).queryKey,
+        interview
+      )
+      void queryClient.invalidateQueries({ queryKey: ["interviews"] })
       void navigate({
         to: "/interviews/$interviewId",
         params: { interviewId: interview.id },
@@ -128,6 +147,17 @@ function HistoryPage() {
   const total = page?.total ?? 0
   const from = total === 0 ? 0 : offset + 1
   const to = Math.min(offset + HISTORY_PAGE_SIZE, total)
+  // The URL can name any page — one beyond the end (a stale link, a row
+  // deleted since) comes back empty although the history is not.
+  const lastOffset =
+    total > 0
+      ? Math.floor((total - 1) / HISTORY_PAGE_SIZE) * HISTORY_PAGE_SIZE
+      : 0
+  const pastEnd =
+    page !== undefined &&
+    !query.isPlaceholderData &&
+    page.items.length === 0 &&
+    total > 0
 
   const goTo = (nextOffset: number) =>
     void navigate({
@@ -205,6 +235,19 @@ function HistoryPage() {
               </Card>
             ))}
           </div>
+        ) : pastEnd ? (
+          <Card>
+            <CardContent className="flex flex-col items-center gap-4 py-12 text-center">
+              <p className="text-sm text-muted-foreground">
+                There is nothing this far down — the history ends at page{" "}
+                {Math.floor(lastOffset / HISTORY_PAGE_SIZE) + 1}.
+              </p>
+              <Button variant="outline" onClick={() => goTo(lastOffset)}>
+                <ChevronLeftIcon />
+                Go to the last page
+              </Button>
+            </CardContent>
+          </Card>
         ) : page && page.items.length === 0 ? (
           <EmptyState filtered={status !== undefined} />
         ) : (
@@ -226,7 +269,7 @@ function HistoryPage() {
           </div>
         )}
 
-        {total > HISTORY_PAGE_SIZE && (
+        {total > HISTORY_PAGE_SIZE && !pastEnd && (
           <div className="flex items-center justify-between gap-2">
             <span className="text-sm text-muted-foreground tabular-nums">
               {from}–{to} of {total}

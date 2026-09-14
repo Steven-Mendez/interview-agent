@@ -103,20 +103,13 @@ def build_interviewer_graph(
                 if target is None:
                     return f"Unknown milestone number: {milestone_number}."
                 await db.complete_milestone(session, target.id, notes)
-                remaining = [
-                    m.title
-                    for m in milestones
-                    if not m.completed and m.id != target.id
-                ]
+                remaining = [m.title for m in milestones if not m.completed and m.id != target.id]
         except Exception as exc:
             logger.exception("complete_milestone failed for %s", conversation_id)
             return _TOOL_FAILED.format(exc=exc)
         if remaining:
             return f"Milestone marked complete. Still pending: {', '.join(remaining)}."
-        return (
-            "Milestone marked complete. All milestones are done — call "
-            "end_interview now."
-        )
+        return "Milestone marked complete. All milestones are done — call end_interview now."
 
     @tool
     async def end_interview(reason: str) -> str:

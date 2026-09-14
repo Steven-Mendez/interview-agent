@@ -31,8 +31,7 @@ T2_A = (
     "Laby de Kipa para tener precio y disponibilidad en Amazon Walmart."
 )
 T2_B = (
-    "EBay. Aproveché la naturaleza nativa de Icing Await FCPI para paralizar "
-    "estas peticiones web."
+    "EBay. Aproveché la naturaleza nativa de Icing Await FCPI para paralizar estas peticiones web."
 )
 T2_AGGREGATE = (
     "sobre la concurrencia principal desafío era que dependíamos de múltiples "

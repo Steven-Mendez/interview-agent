@@ -27,9 +27,7 @@ def _tool_message(name: str) -> ToolMessage:
 
 
 def test_milestone_status_numbers_and_markers():
-    out = build_milestone_status(
-        [_milestone(0, "K8s", True), _milestone(1, "SQL", False)]
-    )
+    out = build_milestone_status([_milestone(0, "K8s", True), _milestone(1, "SQL", False)])
     assert "1. [DONE] K8s" in out
     assert "2. [PENDING] SQL" in out
     assert "end_interview" in out  # the all-done instruction is present

@@ -19,9 +19,7 @@ from pydantic import SecretStr
 from interview_agent.config import Settings
 
 
-def chat_model_tuning(
-    model: str, *, reasoning_effort: str, temperature: float
-) -> dict[str, Any]:
+def chat_model_tuning(model: str, *, reasoning_effort: str, temperature: float) -> dict[str, Any]:
     """GPT-5-family models reject custom temperature and are tuned via
     reasoning effort instead; pre-GPT-5 models are the reverse. The
     `reasoning` dict routes the call to the Responses API — required, since

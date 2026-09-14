@@ -11,9 +11,11 @@ from pathlib import Path
 _HANDLER_TAG = "interview_agent_file_log"
 
 # Attributes every LogRecord carries; anything beyond these came from `extra=`.
-_STANDARD_ATTRS = frozenset(
-    vars(logging.LogRecord("", 0, "", 0, "", None, None))
-) | {"message", "asctime", "taskName"}
+_STANDARD_ATTRS = frozenset(vars(logging.LogRecord("", 0, "", 0, "", None, None))) | {
+    "message",
+    "asctime",
+    "taskName",
+}
 
 
 def _rotated_name(default_name: str) -> str:
@@ -32,9 +34,7 @@ class _ExtraFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         base = super().format(record)
-        extras = {
-            k: v for k, v in record.__dict__.items() if k not in _STANDARD_ATTRS
-        }
+        extras = {k: v for k, v in record.__dict__.items() if k not in _STANDARD_ATTRS}
         if not extras:
             return base
         try:
@@ -43,9 +43,7 @@ class _ExtraFormatter(logging.Formatter):
             return f"{base} | {extras!r}"
 
 
-def setup_file_logging(
-    path: str = "logs/agent.log", level: int = logging.DEBUG
-) -> Path:
+def setup_file_logging(path: str = "logs/agent.log", level: int = logging.DEBUG) -> Path:
     """Write all logs (DEBUG and up) to a rotating file (~5 MB, 3 backups)."""
     log_path = Path(path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,9 +55,7 @@ def setup_file_logging(
         if getattr(h, "_tag", None) == _HANDLER_TAG:
             return log_path
 
-    handler = RotatingFileHandler(
-        log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
-    )
+    handler = RotatingFileHandler(log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
     # Rotate to `server-1.log` instead of the default `server.log.1`, so
     # editors keep recognizing (and highlighting) rotated files as logs.
     handler.namer = _rotated_name

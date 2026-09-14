@@ -84,7 +84,5 @@ async def run_evaluator(
         config=config,
     )
     if not isinstance(result, EvaluationResult):
-        raise TypeError(
-            f"Evaluator returned {type(result).__name__}, expected EvaluationResult"
-        )
+        raise TypeError(f"Evaluator returned {type(result).__name__}, expected EvaluationResult")
     return result

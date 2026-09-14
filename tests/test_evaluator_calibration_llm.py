@@ -18,22 +18,18 @@ from interview_agent.config import Settings
 from interview_agent.interview.evaluator import run_evaluator
 from interview_agent.interview.models import Seniority
 
-pytestmark = pytest.mark.skipif(
-    not os.getenv("OPENAI_API_KEY"), reason="needs a real OpenAI key"
-)
+pytestmark = pytest.mark.skipif(not os.getenv("OPENAI_API_KEY"), reason="needs a real OpenAI key")
 
 # Short, correct, specific answers about database optimization — exactly the
 # shape the old prompt punished as "lacking depth, metrics or trade-offs".
 TRANSCRIPT = [
     (
         "assistant",
-        "Hi, I'm Emma. A query listing a user's orders is slow. "
-        "What would you look at first?",
+        "Hi, I'm Emma. A query listing a user's orders is slow. What would you look at first?",
     ),
     (
         "user",
-        "I'd check whether user_id has an index, and run EXPLAIN to confirm "
-        "the query is using it.",
+        "I'd check whether user_id has an index, and run EXPLAIN to confirm the query is using it.",
     ),
     ("assistant", "Good. And how would you know your change actually helped?"),
     ("user", "I'd run EXPLAIN again and compare the query time before and after."),
@@ -46,8 +42,7 @@ TRANSCRIPT = [
     ("assistant", "How do you test something like that?"),
     (
         "user",
-        "A unit test for the empty case, plus one for the normal case so I "
-        "don't break it.",
+        "A unit test for the empty case, plus one for the normal case so I don't break it.",
     ),
 ]
 
@@ -61,8 +56,7 @@ MILESTONES = [
         "title": "Diagnosing a slow query",
         "description": "Probe how they approach a slow query.",
         "expected_evidence": (
-            "Identifies a missing index on the filtered column and knows "
-            "EXPLAIN shows it."
+            "Identifies a missing index on the filtered column and knows EXPLAIN shows it."
         ),
         "completed": True,
         "notes": "Named the index and EXPLAIN.",

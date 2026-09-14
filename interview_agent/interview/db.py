@@ -52,9 +52,7 @@ class Conversation(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     # Bumped on every UPDATE (status changes included); the capacity check
     # uses it to ignore orphaned "interviewing" rows from crashed workers.
-    updated_at: Mapped[datetime] = mapped_column(
-        server_default=func.now(), onupdate=func.now()
-    )
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
     # created | planned | interviewing | completed | evaluation_failed
     # | evaluated | error
     status: Mapped[str] = mapped_column(Text, default="created", server_default="created")
@@ -200,14 +198,10 @@ class AppSettings(Base):
     language: Mapped[str] = mapped_column(
         Text, default=DEFAULT_LANGUAGE, server_default=DEFAULT_LANGUAGE
     )
-    voice: Mapped[str] = mapped_column(
-        Text, default=DEFAULT_VOICE, server_default=DEFAULT_VOICE
-    )
+    voice: Mapped[str] = mapped_column(Text, default=DEFAULT_VOICE, server_default=DEFAULT_VOICE)
     persona: Mapped[str | None] = mapped_column(Text)
     custom_instructions: Mapped[str | None] = mapped_column(Text)
-    updated_at: Mapped[datetime] = mapped_column(
-        server_default=func.now(), onupdate=func.now()
-    )
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
 # --- Engine / session helpers -------------------------------------------------
@@ -243,9 +237,7 @@ async def list_conversations(
     evaluation of the whole page load in two extra queries — not one per row.
     """
     filters = [Conversation.status == status] if status else []
-    total = await session.scalar(
-        select(func.count()).select_from(Conversation).where(*filters)
-    )
+    total = await session.scalar(select(func.count()).select_from(Conversation).where(*filters))
     rows = await session.scalars(
         select(Conversation)
         .where(*filters)
@@ -258,9 +250,7 @@ async def list_conversations(
     return list(rows), int(total or 0)
 
 
-async def get_milestones(
-    session: AsyncSession, conversation_id: uuid.UUID
-) -> list[Milestone]:
+async def get_milestones(session: AsyncSession, conversation_id: uuid.UUID) -> list[Milestone]:
     result = await session.scalars(
         select(Milestone)
         .where(Milestone.conversation_id == conversation_id)
@@ -269,9 +259,7 @@ async def get_milestones(
     return list(result)
 
 
-async def get_messages(
-    session: AsyncSession, conversation_id: uuid.UUID
-) -> list[Message]:
+async def get_messages(session: AsyncSession, conversation_id: uuid.UUID) -> list[Message]:
     result = await session.scalars(
         select(Message)
         .where(Message.conversation_id == conversation_id)
@@ -289,9 +277,7 @@ async def insert_message(
     content: str,
     seq: int | None = None,
 ) -> None:
-    session.add(
-        Message(conversation_id=conversation_id, role=role, content=content, seq=seq)
-    )
+    session.add(Message(conversation_id=conversation_id, role=role, content=content, seq=seq))
     await session.commit()
 
 
@@ -394,17 +380,13 @@ async def upsert_app_settings(session: AsyncSession, values: dict[str, Any]) -> 
     return await get_app_settings(session)
 
 
-async def delete_conversations_older_than(
-    session: AsyncSession, days: int
-) -> list[uuid.UUID]:
+async def delete_conversations_older_than(session: AsyncSession, days: int) -> list[uuid.UUID]:
     """Purge conversations (and, via CASCADE, their milestones, messages and
     evaluations) older than `days`. Returns the deleted ids so the caller can
     clean up the matching Qdrant points."""
     cutoff = func.now() - timedelta(days=days)
     ids = list(
-        await session.scalars(
-            select(Conversation.id).where(Conversation.created_at < cutoff)
-        )
+        await session.scalars(select(Conversation.id).where(Conversation.created_at < cutoff))
     )
     if ids:
         await session.execute(delete(Conversation).where(Conversation.id.in_(ids)))

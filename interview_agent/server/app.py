@@ -58,9 +58,7 @@ async def _purge_loop(sessionmaker, qdrant: AsyncQdrantClient) -> None:
     while True:
         try:
             async with sessionmaker() as session:
-                deleted = await db.delete_conversations_older_than(
-                    session, settings.retention_days
-                )
+                deleted = await db.delete_conversations_older_than(session, settings.retention_days)
             if deleted:
                 await rag.delete_resume_points(qdrant, settings, deleted)
             logger.info(
@@ -121,8 +119,6 @@ app.include_router(router, prefix="/api")
 # the shell for client-side routes so refreshes/deep links keep working.
 # Backend-only dev without a `cd web && pnpm build` still gets the API.
 if _FRONTEND_DIR.is_dir():
-    app.mount(
-        "/", SpaStaticFiles(directory=_FRONTEND_DIR, html=True), name="frontend"
-    )
+    app.mount("/", SpaStaticFiles(directory=_FRONTEND_DIR, html=True), name="frontend")
 else:
     logger.warning("web/dist/client missing; serving API only (run: cd web && pnpm build)")

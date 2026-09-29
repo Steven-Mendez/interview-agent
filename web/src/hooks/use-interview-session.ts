@@ -10,6 +10,10 @@ import { log } from "@/lib/log"
 export type SessionPhase = "idle" | "connecting" | "live" | "ended"
 export type Who = "user" | "agent"
 
+// This is an inactivity timeout, refreshed by every chunk, not a maximum
+// utterance length. A stalled reader should not stay pending indefinitely.
+const TRANSCRIPTION_IDLE_MS = 30_000
+
 /** One rendered chat bubble. `interim` = STT not finalized yet (opacity-70). */
 export interface ChatMessage {
   segmentId: string
@@ -206,6 +210,20 @@ export function useInterviewSession(interviewId: string): InterviewSession {
             seg.version === version &&
             !seg.confirmed &&
             segmentsRef.current.get(segmentId) === seg
+          const onIdle = () => {
+            if (current()) {
+              finalizeBubble(seg, true)
+              console.warn(
+                "[app] transcription stream timed out waiting for data"
+              )
+            }
+            controller.abort()
+          }
+          let idleTimer = setTimeout(onIdle, TRANSCRIPTION_IDLE_MS)
+          const armIdleTimer = () => {
+            clearTimeout(idleTimer)
+            idleTimer = setTimeout(onIdle, TRANSCRIPTION_IDLE_MS)
+          }
           try {
             // User streams each carry the FULL text, agent streams deltas.
             // Accumulate within this reader, replacing this segment's text:
@@ -214,6 +232,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
             for await (const chunk of reader.withAbortSignal(
               controller.signal
             )) {
+              armIdleTimer()
               text += chunk
               if (current()) setBubbleText(seg, text)
             }
@@ -233,6 +252,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
               console.warn("[app] transcription stream ended before completion")
             }
           } finally {
+            clearTimeout(idleTimer)
             readersRef.current.delete(controller)
           }
         }

@@ -48,7 +48,7 @@ The extracted resume is limited to 30,000 characters and the job offer to 20,000
 
 Speculative generation is disabled because the LangGraph tools persist milestones and signal interview closure. Interrupting an already confirmed response does not roll back tools that have run. AssemblyAI duplicate finals are filtered only when their normalized text and audio boundaries identify previously received speech. When timing evidence is absent, speech is kept and the worker logs one warning per STT stream. Historical text fixtures use synthetic timing in tests; real provider metadata and microphone behavior remain to be verified.
 
-Failed or abandoned transcription streams keep any received text marked **Incomplete transcription**. Brief reconnects can continue the existing stream. The **Enable audio** control appears when the browser blocks playback.
+Failed or abandoned transcription streams keep any received text marked **Incomplete transcription**. Brief reconnects can continue the existing stream; a reader that receives no data for 30 seconds is cancelled and marked incomplete without ending the interview. The **Enable audio** control appears when the browser blocks playback.
 
 ## Upgrading from the Qdrant version
 

@@ -310,6 +310,17 @@ def test_logs_reasons_without_candidate_text(caplog):
     assert T3_A not in caplog.text
 
 
+def test_logs_request_changes_and_ambiguous_boundaries_without_text(caplog):
+    caplog.set_level(logging.DEBUG, logger="interview_agent")
+    keep = _make_duplicate_final_filter(model=MODEL)
+    assert keep(final())
+    assert keep(final(start=9, end=10))
+    assert keep(final(start=9, end=10, request_id="stream-b"))
+    assert "matching text but different audio boundaries" in caplog.text
+    assert "request changed; preserving speech" in caplog.text
+    assert T3_A not in caplog.text
+
+
 @pytest.mark.parametrize("model,expected", [(MODEL, 1), ("deepgram/nova-3", 2)])
 async def test_new_stt_node_resets_history_and_other_models_pass_through(
     monkeypatch, model, expected

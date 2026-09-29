@@ -48,7 +48,7 @@ El texto extraído del currículum admite hasta 30.000 caracteres y la oferta ha
 
 La generación especulativa está desactivada porque las herramientas de LangGraph guardan hitos y activan el cierre. Interrumpir una respuesta ya confirmada no revierte las herramientas ejecutadas. Los finales duplicados de AssemblyAI se filtran solo cuando su texto normalizado y sus intervalos de audio identifican voz ya recibida. Si faltan tiempos válidos, se conserva la frase y el worker registra una advertencia por stream STT. Las fixtures históricas de texto usan tiempos sintéticos en las pruebas; quedan pendientes los metadatos reales del proveedor y la validación con micrófono.
 
-Los streams de transcripción fallidos o abandonados conservan el texto recibido con la marca **Incomplete transcription**. Una reconexión breve puede continuar el stream existente. El control **Enable audio** aparece cuando el navegador bloquea la reproducción.
+Los streams de transcripción fallidos o abandonados conservan el texto recibido con la marca **Incomplete transcription**. Una reconexión breve puede continuar el stream existente; un lector sin datos durante 30 segundos se cancela y queda marcado como incompleto sin terminar la entrevista. El control **Enable audio** aparece cuando el navegador bloquea la reproducción.
 
 ## Actualización desde la versión con Qdrant
 

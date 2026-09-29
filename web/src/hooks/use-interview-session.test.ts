@@ -310,6 +310,58 @@ describe("interview transcription lifecycle", () => {
     })
   })
 
+  it("marks a stalled reader incomplete without ending the interview", async () => {
+    const { room, result } = await connected()
+    const reader = new ControlledReader("stalled")
+    reader.push("Tell me ")
+    let pending!: Promise<void>
+    await act(async () => {
+      pending = room.receive(reader, "agent")
+      await flush()
+      room.emit(RoomEvent.Reconnecting)
+      room.emit(RoomEvent.Reconnected)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(30_000)
+      await pending
+    })
+    expect(reader.signal?.aborted).toBe(true)
+    expect(result.current.messages[0]).toMatchObject({
+      text: "Tell me ",
+      interim: false,
+      incomplete: true,
+    })
+    expect(result.current.phase).toBe("live")
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("refreshes inactivity on every chunk rather than limiting utterance length", async () => {
+    const { room, result } = await connected()
+    const reader = new ControlledReader("long")
+    reader.push("One ")
+    let pending!: Promise<void>
+    await act(async () => {
+      pending = room.receive(reader, "agent")
+      await flush()
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(20_000)
+      reader.push("two ")
+      await flush()
+      vi.advanceTimersByTime(20_000)
+      reader.push("three.")
+      reader.push(null)
+      await pending
+    })
+    expect(reader.signal?.aborted).toBe(false)
+    expect(result.current.messages[0]).toMatchObject({
+      text: "One two three.",
+      interim: false,
+      incomplete: false,
+    })
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it("aborts pending readers on unmount", async () => {
     const { room, unmount } = await connected()
     const reader = new ControlledReader("pending")

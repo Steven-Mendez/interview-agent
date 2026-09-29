@@ -138,6 +138,8 @@ def _make_duplicate_final_filter(
             last_end = None
             return True
         if event.request_id and event.request_id != request_id:
+            if history:
+                logger.debug("reset stt dedupe history: request changed; preserving speech")
             history.clear()
             last_end = None
             request_id = event.request_id
@@ -179,15 +181,18 @@ def _make_duplicate_final_filter(
                 seen = prior_tokens + seen
                 if len(seen) > len(tokens):
                     break
-                if (
-                    seen == tokens
-                    and math.isclose(start, prior_start, abs_tol=_DEDUPE_AUDIO_TOLERANCE, rel_tol=0)
-                    and math.isclose(
+                if seen == tokens:
+                    if math.isclose(
+                        start, prior_start, abs_tol=_DEDUPE_AUDIO_TOLERANCE, rel_tol=0
+                    ) and math.isclose(
                         end, history[-1][2], abs_tol=_DEDUPE_AUDIO_TOLERANCE, rel_tol=0
-                    )
-                ):
-                    logger.info("dropped duplicate stt final: matching text and audio boundaries")
-                    return False
+                    ):
+                        logger.info(
+                            "dropped duplicate stt final: matching text and audio boundaries"
+                        )
+                        return False
+                    logger.debug("kept stt final: matching text but different audio boundaries")
+                    break
         history.append((stamp, start, end, tokens))
         return True
 
@@ -394,7 +399,19 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
         prompt = build_interviewer_prompt(conversation, milestones, max_minutes)
     except ValueError:
         logger.exception("invalid interview source context for %s", conversation_id)
-        await engine.dispose()
+        try:
+            async with sessionmaker() as s:
+                await db.set_status_if(s, conversation_id, conversation.status, "error")
+        except Exception:
+            logger.exception("could not mark invalid source context as failed")
+        try:
+            # The job room name is available before ctx.connect/session.start.
+            await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.job.room.name))
+        except Exception:
+            logger.exception("could not close room for invalid source context")
+        finally:
+            await engine.dispose()
+            ctx.shutdown(reason="invalid_source_context")
         return
 
     # Interviewer token spend accumulates in memory and is flushed once at

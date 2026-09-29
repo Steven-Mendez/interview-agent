@@ -49,3 +49,18 @@ def test_prompt_builder_rejects_oversized_legacy_source():
             [],
             15,
         )
+
+
+def test_quotes_are_preserved_as_source_text_without_entity_expansion():
+    resume = "Bachelor's degree at O'Reilly, C#/.NET \"Core\""
+    conversation = SimpleNamespace(
+        resume_markdown=resume,
+        job_offer='Build "Core" APIs',
+        seniority="mid",
+        interview_length="standard",
+        plan={},
+        custom_instructions=None,
+    )
+    prompt = build_interviewer_prompt(conversation, [], 15)
+    assert resume in prompt
+    assert "&#x27;" not in prompt and "&quot;" not in prompt

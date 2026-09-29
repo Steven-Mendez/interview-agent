@@ -258,7 +258,7 @@ describe("interview transcription lifecycle", () => {
     ])
   })
 
-  it.each([RoomEvent.Reconnecting, RoomEvent.Disconnected])(
+  it.each([RoomEvent.ParticipantDisconnected, RoomEvent.Disconnected])(
     "aborts pending readers on %s and cleans timers",
     async (event) => {
       const { room, result } = await connected()
@@ -280,10 +280,35 @@ describe("interview transcription lifecycle", () => {
         incomplete: true,
       })
       expect(vi.getTimerCount()).toBe(0)
-      if (event === RoomEvent.Reconnecting)
+      if (event === RoomEvent.ParticipantDisconnected)
         expect(result.current.phase).toBe("live")
     }
   )
+
+  it("preserves a stream across a brief offline/reconnecting event", async () => {
+    const { room, result } = await connected()
+    const reader = new ControlledReader("resumable")
+    reader.push("Tell me ")
+    let pending!: Promise<void>
+    await act(async () => {
+      pending = room.receive(reader, "agent")
+      await flush()
+      room.emit(RoomEvent.Reconnecting)
+      await flush()
+    })
+    expect(reader.signal?.aborted).toBe(false)
+    room.emit(RoomEvent.Reconnected)
+    reader.push("about SQL.")
+    reader.push(null)
+    await act(async () => {
+      await pending
+    })
+    expect(result.current.messages[0]).toMatchObject({
+      text: "Tell me about SQL.",
+      interim: false,
+      incomplete: false,
+    })
+  })
 
   it("aborts pending readers on unmount", async () => {
     const { room, unmount } = await connected()

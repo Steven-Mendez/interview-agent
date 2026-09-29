@@ -42,6 +42,27 @@ La pantalla **History** lista todas las entrevistas que corriste, de la más rec
 
 La pantalla **Settings** configura el agente de forma global: su nombre, el idioma de la entrevista (inglés o español, con una voz femenina y una masculina por idioma), una persona opcional para el entrevistador e instrucciones custom. Los cambios aplican a las entrevistas creadas después.
 
+## Contexto de voz y recuperación
+
+El texto extraído del currículum admite hasta 30.000 caracteres y la oferta hasta 20.000. Los documentos mayores reciben HTTP 413 antes de planificar o iniciar la sesión de voz, incluidas las entrevistas guardadas antes de estos límites. El contenido no se trunca silenciosamente. Estos límites acotan el contexto completo para el uso interactivo por voz; la latencia también depende del modelo y de la longitud de la conversación.
+
+La generación especulativa está desactivada porque las herramientas de LangGraph guardan hitos y activan el cierre. Interrumpir una respuesta ya confirmada no revierte las herramientas ejecutadas. Los finales duplicados de AssemblyAI se filtran solo cuando su texto normalizado y sus intervalos de audio identifican voz ya recibida. Si faltan tiempos válidos, se conserva la frase y el worker registra una advertencia por stream STT. Las fixtures históricas de texto usan tiempos sintéticos en las pruebas; quedan pendientes los metadatos reales del proveedor y la validación con micrófono.
+
+Los streams de transcripción fallidos o abandonados conservan el texto recibido con la marca **Incomplete transcription**. Una reconexión breve puede continuar el stream existente. El control **Enable audio** aparece cuando el navegador bloquea la reproducción.
+
+## Actualización desde la versión con Qdrant
+
+Retirar Qdrant de Compose no elimina sus contenedores ni el volumen `qdrant_data` existente. La tarea actual de retención solo gestiona Postgres; los datos vectoriales antiguos requieren una limpieza única por parte del administrador del despliegue.
+
+Identifica el contenedor y el volumen de Qdrant de este despliegue con `docker ps -a` y `docker volume ls` (las etiquetas de Compose indican el proyecto, servicio y volumen). Si ya no necesitas los datos vectoriales antiguos, elimina únicamente esos recursos de Qdrant:
+
+```bash
+docker rm -f <contenedor-qdrant-antiguo>
+docker volume rm <volumen-qdrant-antiguo>
+```
+
+Conserva el contenedor y el volumen de Postgres: guardan los currículums, entrevistas y evaluaciones de esta versión. No uses una limpieza general de volúmenes. Esta actualización no borra automáticamente los datos antiguos de Qdrant.
+
 ## Desarrollo (local)
 
 Para iterar con hot reload, corre solo Postgres en Docker y la app con [uv](https://docs.astral.sh/uv/) (Python 3.12+) y [pnpm](https://pnpm.io/) (Node 22+):

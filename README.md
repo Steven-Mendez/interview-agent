@@ -42,6 +42,27 @@ The **History** screen lists every interview you have run, newest first, with it
 
 The **Settings** screen configures the agent globally: its name, the interview language (English or Spanish, with a feminine and a masculine voice per language), an optional interviewer persona and custom instructions. Changes apply to interviews created afterwards.
 
+## Voice context and recovery
+
+The extracted resume is limited to 30,000 characters and the job offer to 20,000. Oversized sources receive HTTP 413 before planning or starting a voice session, including stored interviews created before these limits. Documents are never silently truncated. These bounds keep the full-document context suitable for interactive voice use; actual response latency still depends on the model and conversation length.
+
+Speculative generation is disabled because the LangGraph tools persist milestones and signal interview closure. Interrupting an already confirmed response does not roll back tools that have run. AssemblyAI duplicate finals are filtered only when their normalized text and audio boundaries identify previously received speech. When timing evidence is absent, speech is kept and the worker logs one warning per STT stream. Historical text fixtures use synthetic timing in tests; real provider metadata and microphone behavior remain to be verified.
+
+Failed or abandoned transcription streams keep any received text marked **Incomplete transcription**. Brief reconnects can continue the existing stream. The **Enable audio** control appears when the browser blocks playback.
+
+## Upgrading from the Qdrant version
+
+Removing Qdrant from Compose does not delete existing containers or the `qdrant_data` volume. The current retention job only manages Postgres; legacy vector data needs a one-time cleanup by the deployment operator.
+
+Identify the old Qdrant container and volume belonging to this deployment with `docker ps -a` and `docker volume ls` (Compose labels identify the project, service and volume). If the old vector data is no longer needed, remove only those Qdrant resources:
+
+```bash
+docker rm -f <legacy-qdrant-container>
+docker volume rm <legacy-qdrant-volume>
+```
+
+Keep the Postgres container and volume: they store the resumes, interviews and evaluations used by this version. Do not use a blanket volume cleanup. This upgrade does not automatically delete legacy Qdrant data.
+
 ## Development (local)
 
 To iterate with hot reload, run only Postgres in Docker and the app with [uv](https://docs.astral.sh/uv/) (Python 3.12+) and [pnpm](https://pnpm.io/) (Node 22+):

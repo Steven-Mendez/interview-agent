@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from interview_agent.config import settings
 from interview_agent.interview import db
 from interview_agent.interview import resume as resume_ingestion
+from interview_agent.interview.context import validate_source_documents
 from interview_agent.interview.models import InterviewLength, Seniority
 from interview_agent.interview.planner import run_planner
 from interview_agent.llm import summarize_usage
@@ -49,6 +50,13 @@ router = APIRouter()
 # `resume.read()` buffers the upload in memory; cap it so a huge (or hostile)
 # file cannot exhaust the process. Real resumes are well under this.
 _MAX_RESUME_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def _validate_sources(resume_markdown: str, job_offer: str) -> None:
+    try:
+        validate_source_documents(resume_markdown, job_offer)
+    except ValueError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
 
 
 def _sessionmaker(request: Request):
@@ -438,6 +446,7 @@ async def create_interview(
         raise HTTPException(status_code=400, detail="resume must be a PDF file")
     if not job_offer.strip():
         raise HTTPException(status_code=400, detail="job_offer must not be empty")
+    _validate_sources("", job_offer)
 
     # Read one byte past the cap: exactly-at-cap passes, anything larger 413s.
     data = await resume.read(_MAX_RESUME_BYTES + 1)
@@ -493,6 +502,7 @@ async def _plan_and_persist(
     `interviewer_overrides` follows the convention in `_resolve_interviewer`:
     None inherits the global settings, a value wins for this interview only.
     """
+    _validate_sources(resume_markdown, job_offer)
     conversation_id = uuid.uuid4()
     # This interview's own time cap: the requested length's minutes, clamped
     # by the global setting. Stored on the row AND handed to the planner, so
@@ -753,6 +763,9 @@ async def get_token(request: Request, interview_id: uuid.UUID):
                 status_code=409,
                 detail=f"Interview is '{conversation.status}', expected 'planned'",
             )
+        # Legacy rows can predate source limits. Refuse before dispatching a
+        # worker rather than let every voice turn fail with excessive context.
+        _validate_sources(conversation.resume_markdown, conversation.job_offer)
         # Reconnect window (see _reconnect_deadline): an "interviewing" row
         # past it is an orphan of a crashed worker, not a live interview.
         if conversation.status == "interviewing" and not _can_reconnect(conversation):

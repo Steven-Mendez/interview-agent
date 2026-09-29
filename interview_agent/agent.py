@@ -127,9 +127,10 @@ def _make_duplicate_final_filter(
     history: deque[tuple[float, float, float, list[str]]] = deque(maxlen=_DEDUPE_MAX_FINALS)
     request_id: str | None = None
     last_end: float | None = None
+    warned_missing_timing = False
 
     def keep(event: stt.SpeechEvent) -> bool:
-        nonlocal request_id, last_end
+        nonlocal request_id, last_end, warned_missing_timing
         if model != _DEDUPE_MODEL or event.type is not stt.SpeechEventType.FINAL_TRANSCRIPT:
             return True
         if not event.alternatives:
@@ -154,7 +155,12 @@ def _make_duplicate_final_filter(
         if not tokens or not valid_times:
             history.clear()
             last_end = None
-            logger.debug("kept stt final: insufficient audio timing evidence")
+            if not warned_missing_timing:
+                logger.warning(
+                    "kept stt final: insufficient audio timing evidence; "
+                    "deduplication requires provider audio boundaries"
+                )
+                warned_missing_timing = True
             return True
         # Aggregate start times go backwards by design; only a regressing END
         # is evidence of a restarted audio clock.
@@ -249,6 +255,7 @@ def _build_session(ctx: JobContext, graph, agent_settings: dict | None) -> Agent
             # LangGraph's internal tools commit milestones and signal closure
             # while the graph runs. They cannot be rolled back when LiveKit
             # discards an unconfirmed response. Accept the latency tradeoff.
+            # Later interruptions of confirmed turns do not roll tools back.
             preemptive_generation={"enabled": False},
             # Keep the audio turn detector's documented endpointing defaults.
             endpointing={"mode": "fixed", "min_delay": 0.3, "max_delay": 2.5},
@@ -383,7 +390,12 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
     # This interview's own cap (derived from interview_length at creation),
     # falling back to the global setting for rows that predate the column.
     max_minutes = conversation.max_minutes or settings.interview_max_minutes
-    prompt = build_interviewer_prompt(conversation, milestones, max_minutes)
+    try:
+        prompt = build_interviewer_prompt(conversation, milestones, max_minutes)
+    except ValueError:
+        logger.exception("invalid interview source context for %s", conversation_id)
+        await engine.dispose()
+        return
 
     # Interviewer token spend accumulates in memory and is flushed once at
     # shutdown: usage is telemetry, so losing it on a hard crash beats a DB

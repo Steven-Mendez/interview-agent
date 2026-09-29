@@ -162,7 +162,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
 
   const cancelTranscriptions = React.useCallback(() => {
     for (const [controller, seg] of readersRef.current) {
-      // Finalize before aborting, since the callback deliberately ignores
+      // Settle cancelled reads here, since the callback deliberately ignores
       // cancelled reads. A newer/confirmed version must not be downgraded.
       controller.abort()
       if (!seg.confirmed) finalizeBubble(seg, true)
@@ -175,7 +175,10 @@ export function useInterviewSession(interviewId: string): InterviewSession {
 
   const registerTranscriptionHandler = React.useCallback(
     (r: Room) => {
-      r.on(RoomEvent.Reconnecting, cancelTranscriptions)
+      // A brief Offline/Reconnecting event can resume the existing stream.
+      // A full restart removes remote participants; loss of the interviewer
+      // invalidates both user and agent transcription streams it produced.
+      r.on(RoomEvent.ParticipantDisconnected, cancelTranscriptions)
       r.on(RoomEvent.Disconnected, cancelTranscriptions)
       // One handler per topic per Room, registered before connect.
       r.registerTextStreamHandler(

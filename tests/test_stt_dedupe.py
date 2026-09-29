@@ -303,8 +303,10 @@ def test_logs_reasons_without_candidate_text(caplog):
     assert keep(final())
     assert not keep(final())
     assert keep(final(start=0, end=0))
+    assert keep(final(start=0, end=0))
     assert "matching text and audio boundaries" in caplog.text
     assert "insufficient audio timing evidence" in caplog.text
+    assert caplog.text.count("insufficient audio timing evidence") == 1
     assert T3_A not in caplog.text
 
 

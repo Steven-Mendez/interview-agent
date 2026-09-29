@@ -27,6 +27,7 @@ from interview_agent import agent
 from interview_agent.config import settings
 from interview_agent.interview import db
 from interview_agent.interview import resume as resume_ingestion
+from interview_agent.interview.context import MAX_JOB_OFFER_CHARS, MAX_RESUME_CHARS
 from interview_agent.interview.models import (
     EvaluationResult,
     InterviewLength,
@@ -135,6 +136,54 @@ def _interviewer(**fields: str) -> str:
     """The `interviewer` form field. Only the keys passed are sent, so the
     test controls exactly what inherits and what overrides."""
     return json.dumps(fields)
+
+
+@pytest.mark.parametrize("field", ["resume", "job_offer"])
+async def test_rejects_oversized_source_before_planning(
+    client_and_sessionmaker, monkeypatch, field
+):
+    client, sessionmaker = client_and_sessionmaker
+    planner_called = False
+
+    async def planner(*args, **kwargs):
+        nonlocal planner_called
+        planner_called = True
+        return _plan()
+
+    monkeypatch.setattr(routes, "run_planner", planner)
+    offer = "offer"
+    if field == "resume":
+        monkeypatch.setattr(
+            resume_ingestion, "pdf_to_markdown", lambda *args: "r" * (MAX_RESUME_CHARS + 1)
+        )
+    else:
+        offer = "o" * (MAX_JOB_OFFER_CHARS + 1)
+    response = await client.post("/api/interviews", **_upload(offer))
+    assert response.status_code == 413
+    assert "character limit" in response.json()["detail"]
+    assert not planner_called
+    async with sessionmaker() as session:
+        assert (await db.list_conversations(session, limit=20, offset=0))[1] == 0
+
+
+async def test_rejects_oversized_legacy_source_on_token_and_repeat(client_and_sessionmaker):
+    client, sessionmaker = client_and_sessionmaker
+    conversation_id = uuid.uuid4()
+    async with sessionmaker() as session:
+        session.add(
+            db.Conversation(
+                id=conversation_id,
+                status="planned",
+                job_offer="offer",
+                resume_markdown="r" * (MAX_RESUME_CHARS + 1),
+            )
+        )
+        await session.commit()
+    assert (await client.get(f"/api/interviews/{conversation_id}/token")).status_code == 413
+    assert (await client.post(f"/api/interviews/{conversation_id}/repeat")).status_code == 413
+    async with sessionmaker() as session:
+        assert (await db.get_conversation(session, conversation_id)).status == "planned"
+        assert (await db.list_conversations(session, limit=20, offset=0))[1] == 1
 
 
 async def _seed_finished_interview(sessionmaker) -> uuid.UUID:

@@ -40,7 +40,11 @@ import {
   repeatInterview,
 } from "@/lib/api"
 import type { Interview } from "@/lib/api"
-import { EVAL_TIMEOUT_MS, evaluationAnchor } from "@/lib/evaluation"
+import {
+  EVAL_TIMEOUT_MS,
+  evaluationAnchor,
+  shouldShowInterviewResults,
+} from "@/lib/evaluation"
 import { cn } from "@/lib/utils"
 import { log } from "@/lib/log"
 import { useInterviewSession } from "@/hooks/use-interview-session"
@@ -108,16 +112,6 @@ const AGENT_STATE_LABELS: Partial<Record<string, string>> = {
   speaking: "Speaking…",
 }
 
-// The interview itself is over — what is left is the verdict, or waiting for
-// it: ended but not yet claimed (completed), being evaluated in the
-// background (evaluating), or done either way.
-const TERMINAL_STATUSES = new Set([
-  "completed",
-  "evaluating",
-  "evaluated",
-  "evaluation_failed",
-])
-
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return error.message
   return error instanceof Error ? error.message : "Something went wrong."
@@ -132,9 +126,10 @@ function InterviewSessionPage({ interviewId }: { interviewId: string }) {
   // Results replace the live panel once the interview ends: either this tab
   // saw the disconnect (phase 'ended'), or we deep-linked into an already
   // finished interview (phase still 'idle', status terminal).
-  const endedByStatus = TERMINAL_STATUSES.has(interview.status)
-  const showResults =
-    session.phase === "ended" || (session.phase === "idle" && endedByStatus)
+  const showResults = shouldShowInterviewResults(
+    session.phase,
+    interview.status
+  )
 
   // Each panel renders its own PageShell so short states (idle / evaluating)
   // can center themselves while the live chat and scorecard fill from the top.
@@ -145,8 +140,8 @@ function InterviewSessionPage({ interviewId }: { interviewId: string }) {
       endedAt={session.endedAt}
     />
   ) : interview.status === "error" ? (
-    // Planning failed: there is nothing to start (the token endpoint would
-    // 409), so the pre-join check would only lead to a Start that fails.
+    // Preparation or the worker failed: a disconnect cannot turn this into
+    // an evaluation that will never run.
     <FailedPanel interview={interview} />
   ) : interview.status === "interviewing" &&
     !interview.can_start &&

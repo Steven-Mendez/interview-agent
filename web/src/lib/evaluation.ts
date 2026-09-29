@@ -1,4 +1,23 @@
 import type { InterviewStatus } from "@/lib/api"
+import type { SessionPhase } from "@/hooks/use-interview-session"
+
+const TERMINAL_STATUSES: ReadonlySet<InterviewStatus> = new Set([
+  "completed",
+  "evaluating",
+  "evaluated",
+  "evaluation_failed",
+])
+
+/** A failed preparation/worker cannot be evaluated, even after disconnect. */
+export function shouldShowInterviewResults(
+  phase: SessionPhase,
+  status: InterviewStatus
+): boolean {
+  return (
+    status !== "error" &&
+    (phase === "ended" || (phase === "idle" && TERMINAL_STATUSES.has(status)))
+  )
+}
 
 // 180 s past the anchor the evaluation is considered stuck; the endpoint is
 // re-invocable, so the results panel then offers to (re)start it by hand —

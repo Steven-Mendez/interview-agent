@@ -1,10 +1,25 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 
-import { evaluationAnchor } from "./evaluation"
+import { evaluationAnchor, shouldShowInterviewResults } from "./evaluation"
 
 const UPDATED_AT = "2026-09-14T10:00:00Z"
 const UPDATED_MS = Date.parse(UPDATED_AT)
 const ENDED_MS = UPDATED_MS - 45_000
+
+describe("interview result routing", () => {
+  it("shows preparation failure instead of waiting for evaluation after room deletion", () => {
+    expect(shouldShowInterviewResults("ended", "error")).toBe(false)
+    expect(shouldShowInterviewResults("idle", "error")).toBe(false)
+  })
+
+  it("keeps normal room closure and deep-linked results working", () => {
+    expect(shouldShowInterviewResults("ended", "completed")).toBe(true)
+    expect(shouldShowInterviewResults("ended", "interviewing")).toBe(true)
+    expect(shouldShowInterviewResults("idle", "evaluating")).toBe(true)
+    expect(shouldShowInterviewResults("idle", "evaluated")).toBe(true)
+    expect(shouldShowInterviewResults("live", "interviewing")).toBe(false)
+  })
+})
 
 describe("evaluationAnchor", () => {
   afterEach(() => {

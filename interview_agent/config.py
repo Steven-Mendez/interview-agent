@@ -39,21 +39,14 @@ class Settings(BaseSettings):
     evaluator_model: str = Field(default="gpt-5.5", alias="EVALUATOR_MODEL")
     evaluator_reasoning_effort: str = Field(default="high", alias="EVALUATOR_REASONING_EFFORT")
 
-    # RAG storage. text-embedding-3-small → 1536 dims (must match the Qdrant
-    # collection's vector size).
-    embedding_model: str = Field(default="text-embedding-3-small", alias="EMBEDDING_MODEL")
-    embedding_dimensions: int = Field(default=1536, alias="EMBEDDING_DIMENSIONS")
-    qdrant_url: str = Field(default="http://localhost:6333", alias="QDRANT_URL")
-    qdrant_collection: str = Field(default="resumes", alias="QDRANT_COLLECTION")
-
     # Postgres (from docker-compose.yml).
     database_url: str = Field(
         default="postgresql+asyncpg://interview:interview@localhost:5432/interview",
         alias="DATABASE_URL",
     )
 
-    # PII retention: conversations (resume, job offer, transcript) and their
-    # Qdrant points are purged once older than this. 0 disables the purge.
+    # PII retention: conversations (resume, job offer, transcript) are purged
+    # once older than this. 0 disables the purge.
     retention_days: int = Field(default=30, alias="RETENTION_DAYS")
 
     # Interview session limits and wiring. The global cap clamps every

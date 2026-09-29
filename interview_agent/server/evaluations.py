@@ -18,13 +18,12 @@ from contextlib import suppress
 from datetime import timedelta
 
 from langchain_core.callbacks import UsageMetadataCallbackHandler
-from qdrant_client import AsyncQdrantClient
 from sqlalchemy import update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from interview_agent.config import settings
-from interview_agent.interview import db, rag
+from interview_agent.interview import db
 from interview_agent.interview.evaluator import run_evaluator
 from interview_agent.llm import summarize_usage
 
@@ -56,11 +55,8 @@ async def record_spent_usage(
 class EvaluationRunner:
     """Owns the in-flight evaluations of one API process."""
 
-    def __init__(
-        self, sessionmaker: async_sessionmaker[AsyncSession], qdrant: AsyncQdrantClient
-    ) -> None:
+    def __init__(self, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
         self._sessionmaker = sessionmaker
-        self._qdrant = qdrant
         self._tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
 
     @property
@@ -250,11 +246,3 @@ class EvaluationRunner:
                 "seniority": result.seniority_evaluated.value,
             },
         )
-
-        # The resume chunks only exist for the interviewer's search_resume; the
-        # evaluation is done, so drop them (PII). Best-effort: the purge job
-        # sweeps anything missed here.
-        try:
-            await rag.delete_resume_points(self._qdrant, settings, [interview_id])
-        except Exception:
-            logger.exception("failed to delete resume points for %s", interview_id)

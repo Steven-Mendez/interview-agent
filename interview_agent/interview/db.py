@@ -462,8 +462,7 @@ async def upsert_app_settings(session: AsyncSession, values: dict[str, Any]) -> 
 
 async def delete_conversations_older_than(session: AsyncSession, days: int) -> list[uuid.UUID]:
     """Purge conversations (and, via CASCADE, their milestones, messages and
-    evaluations) older than `days`. Returns the deleted ids so the caller can
-    clean up the matching Qdrant points."""
+    evaluations) older than `days`. Returns the deleted ids for logging."""
     cutoff = func.now() - timedelta(days=days)
     ids = list(
         await session.scalars(select(Conversation.id).where(Conversation.created_at < cutoff))

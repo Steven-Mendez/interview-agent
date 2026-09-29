@@ -1,8 +1,8 @@
-"""API route tests against a real (test) Postgres, with the LLM/RAG calls
+"""API route tests against a real (test) Postgres, with LLM calls and PDF conversion
 mocked out.
 
 The app is assembled by hand (router + app.state) instead of importing the
-real `app`, whose lifespan needs Qdrant and validated API keys. The test
+real `app`, whose lifespan needs validated API keys. The test
 database is created on the fly; locally it lands on the docker-compose
 Postgres, in CI on the service container (TEST_DATABASE_URL overrides).
 """
@@ -25,7 +25,8 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from interview_agent import agent
 from interview_agent.config import settings
-from interview_agent.interview import db, rag
+from interview_agent.interview import db
+from interview_agent.interview import resume as resume_ingestion
 from interview_agent.interview.models import (
     EvaluationResult,
     InterviewLength,
@@ -33,7 +34,7 @@ from interview_agent.interview.models import (
     MilestoneSpec,
     Seniority,
 )
-from interview_agent.prompts import length_for
+from interview_agent.prompts import build_interviewer_prompt, length_for
 from interview_agent.server import evaluations, routes
 from interview_agent.voices import VOICES
 
@@ -99,25 +100,15 @@ async def client_and_sessionmaker(monkeypatch):
         await conn.run_sync(db.Base.metadata.drop_all)
         await conn.run_sync(db.Base.metadata.create_all)
 
-    # The routes only touch qdrant through rag helpers — stub those instead
-    # of faking a client.
-    async def _no_index(*args, **kwargs) -> int:
-        return 3
-
-    async def _no_delete(*args, **kwargs) -> None:
-        return None
-
-    monkeypatch.setattr(rag, "index_resume", _no_index)
-    monkeypatch.setattr(rag, "delete_resume_points", _no_delete)
-    monkeypatch.setattr(rag, "pdf_to_markdown", lambda data, filename: "# Resume\nPython dev.")
+    monkeypatch.setattr(
+        resume_ingestion, "pdf_to_markdown", lambda data, filename: "# Resume\nPython dev."
+    )
     monkeypatch.setattr(routes, "run_planner", _fake_planner)
 
     app = FastAPI()
     app.include_router(routes.router, prefix="/api")
     app.state.sessionmaker = sessionmaker
-    app.state.qdrant = object()  # only ever handed to the stubbed rag helpers
-    app.state.embeddings = object()
-    app.state.evaluations = evaluations.EvaluationRunner(sessionmaker, app.state.qdrant)
+    app.state.evaluations = evaluations.EvaluationRunner(sessionmaker)
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -246,7 +237,7 @@ async def test_put_settings_rejects_voice_language_mismatch(client_and_sessionma
 
 
 async def test_create_interview_happy_path(client_and_sessionmaker):
-    client, _ = client_and_sessionmaker
+    client, sessionmaker = client_and_sessionmaker
     res = await client.post("/api/interviews", **_upload())
     assert res.status_code == 200
     body = res.json()
@@ -255,6 +246,14 @@ async def test_create_interview_happy_path(client_and_sessionmaker):
     assert body["plan"]["language"] == "en"  # injected from the settings
     assert "milestones" not in body["plan"]  # stored separately
     assert "planner" in body["token_usage"]
+
+    async with sessionmaker() as session:
+        row = await db.get_conversation(session, uuid.UUID(body["id"]))
+        milestones = await db.get_milestones(session, uuid.UUID(body["id"]))
+        assert row is not None
+        prompt = build_interviewer_prompt(row, milestones, row.max_minutes)
+        assert "# Resume\nPython dev." in prompt
+        assert body["job_offer"] in prompt
 
 
 async def test_create_interview_snapshots_settings(client_and_sessionmaker):
@@ -494,7 +493,7 @@ async def test_shutdown_marks_a_cancelled_run_failed_so_the_ui_offers_a_retry(
 
     monkeypatch.setattr(evaluations, "run_evaluator", _hanging_evaluator)
     conversation_id = await _seed_finished_interview(sessionmaker)
-    runner = evaluations.EvaluationRunner(sessionmaker, object())
+    runner = evaluations.EvaluationRunner(sessionmaker)
     async with sessionmaker() as session:
         assert await db.claim_evaluation(session, conversation_id, evaluations.STALE_AFTER)
     runner.start(conversation_id)
@@ -526,9 +525,8 @@ async def test_evaluate_without_transcript_409(client_and_sessionmaker, monkeypa
 
 
 async def test_evaluate_refuses_a_live_interview(client_and_sessionmaker, monkeypatch):
-    # Evaluating mid-interview would score half a transcript and, worse, purge
-    # the resume chunks from Qdrant — blinding search_resume for the rest of
-    # the live interview. The worker only POSTs here after marking "completed".
+    # Evaluating mid-interview would score half a transcript. The worker only
+    # POSTs here after marking "completed".
     client, sessionmaker = client_and_sessionmaker
     monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
     conversation_id = uuid.uuid4()
@@ -1144,10 +1142,14 @@ async def test_repeat_replans_the_same_role_into_a_new_interview(client_and_sess
     assert (await client.get(f"/api/interviews/{source['id']}")).json()["status"] == "planned"
     assert (await client.get("/api/interviews")).json()["total"] == 2
 
-    # The stored resume markdown is what gets re-indexed and re-planned.
+    # The stored resume is reused by both the planner and the voice agent.
     async with sessionmaker() as session:
         row = await db.get_conversation(session, uuid.UUID(repeat["id"]))
         assert row is not None and row.resume_markdown == "# Resume\nPython dev."
+        milestones = await db.get_milestones(session, row.id)
+        prompt = build_interviewer_prompt(row, milestones, row.max_minutes)
+        assert row.resume_markdown in prompt
+        assert source["job_offer"] in prompt
 
 
 async def test_repeat_of_a_repeat_points_back_at_the_original(client_and_sessionmaker):

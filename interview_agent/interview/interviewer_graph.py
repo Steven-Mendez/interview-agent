@@ -1,6 +1,6 @@
 """Per-session interviewer brain: the same ReAct shape as `graph.py`, but
 built by a factory that closes over the session's context (conversation id,
-DB, Qdrant, end signal) so the LangChain tools can reach it — LiveKit's
+DB, end signal) so the LangChain tools can reach it — LiveKit's
 LLMAdapter gives tools no per-session context of its own.
 
 `end_interview` must NOT touch the LiveKit session (we're mid-generation
@@ -18,14 +18,12 @@ from collections.abc import Callable
 from langchain_core.messages import SystemMessage, ToolMessage
 from langchain_core.messages.ai import UsageMetadata
 from langchain_core.tools import tool
-from langchain_openai import OpenAIEmbeddings
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
-from qdrant_client import AsyncQdrantClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from interview_agent.config import Settings
-from interview_agent.interview import db, rag
+from interview_agent.interview import db
 from interview_agent.llm import build_chat_model, make_streaming_chat_node
 from interview_agent.prompts import build_milestone_status
 
@@ -55,32 +53,11 @@ def build_interviewer_graph(
     settings: Settings,
     conversation_id: uuid.UUID,
     sessionmaker: async_sessionmaker[AsyncSession],
-    qdrant: AsyncQdrantClient,
-    embeddings: OpenAIEmbeddings,
     end_event: asyncio.Event,
     system_prompt: str,
     usage_sink: Callable[[UsageMetadata], None] | None = None,
 ):
     """Compile a per-session interviewer workflow for LiveKit's LLMAdapter."""
-
-    @tool
-    async def search_resume(query: str) -> str:
-        """Semantically search the candidate's resume. Use before probing a
-        specific claim (projects, dates, technologies) to ground your question.
-
-        Args:
-            query: What to look for, e.g. "Kubernetes migration project".
-        """
-        try:
-            chunks = await rag.search_resume_chunks(
-                qdrant, embeddings, settings, conversation_id, query
-            )
-        except Exception as exc:
-            logger.exception("search_resume failed for %s", conversation_id)
-            return _TOOL_FAILED.format(exc=exc)
-        if not chunks:
-            return "No matching section found in the resume."
-        return "\n---\n".join(chunks)
 
     @tool
     async def complete_milestone(milestone_number: int, notes: str) -> str:
@@ -124,7 +101,7 @@ def build_interviewer_graph(
         # this — kept truthful for standalone runs and logs.
         return "The interview is ending. The farewell is handled outside this graph."
 
-    tools = [search_resume, complete_milestone, end_interview]
+    tools = [complete_milestone, end_interview]
 
     llm = build_chat_model(
         settings,

@@ -52,7 +52,7 @@ def test_route_after_tools_scans_parallel_tool_batch():
 
 
 def test_route_after_tools_continues_otherwise():
-    state = {"messages": [AIMessage(content=""), _tool_message("search_resume")]}
+    state = {"messages": [AIMessage(content=""), _tool_message("complete_milestone")]}
     assert _route_after_tools(state) == "chat"
     # Not a tool result at the tail (e.g. mid-graph inspection): keep chatting.
     assert _route_after_tools({"messages": [AIMessage(content="hi")]}) == "chat"

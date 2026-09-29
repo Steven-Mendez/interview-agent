@@ -9,15 +9,14 @@ An AI voice job-interview simulator. Upload your resume (PDF) and paste a job of
 Three agents, one flow:
 
 1. **Planner** — reads the resume and the job offer, designs the interview (interviewer persona, milestones to cover) in the language you configured.
-2. **Interviewer** — a real-time voice agent that runs the interview in the browser over LiveKit, checks off milestones as it goes, and can search your resume mid-conversation (RAG).
+2. **Interviewer** — a real-time voice agent that runs the interview in the browser over LiveKit, checks off milestones as it goes, and uses the full resume and job offer in its context to ground its questions.
 3. **Evaluator** — when the interview ends (plan complete, time cap, or you close the tab), it scores the transcript automatically: hired or not, score, strengths and weaknesses.
 
 ## Tech stack
 
 - **LiveKit Agents** — real-time audio pipeline (STT, TTS, turn detection)
 - **LangGraph** — the interviewer's brain (ReAct graph + tools)
-- **OpenAI** — LLMs and embeddings
-- **Qdrant** — vector search over the resume
+- **OpenAI** — LLMs for planning, interviewing and evaluation
 - **PostgreSQL** — conversations, milestones, transcripts, evaluations
 - **FastAPI** — the API, under `/api` (also serves the built frontend)
 - **TanStack Start + shadcn/ui** — React frontend in `web/`, built as a SPA
@@ -35,7 +34,7 @@ cp .env.example .env         # fill in your keys
 docker compose up -d --build
 ```
 
-That starts the whole stack: Postgres, Qdrant, the API + frontend, and the LiveKit worker (migrations run automatically).
+That starts the whole stack: Postgres, the API + frontend, and the LiveKit worker (migrations run automatically). The resume is stored as text in Postgres; all three agents receive it directly, without embeddings or a vector database.
 
 Open <http://localhost:8000>: upload a resume PDF, paste the job offer, wait for the plan (~30–60 s), then start the voice interview. When it ends, the evaluation appears on the same page.
 
@@ -45,11 +44,11 @@ The **Settings** screen configures the agent globally: its name, the interview l
 
 ## Development (local)
 
-To iterate with hot reload, run only the databases in Docker and the app with [uv](https://docs.astral.sh/uv/) (Python 3.12+) and [pnpm](https://pnpm.io/) (Node 22+):
+To iterate with hot reload, run only Postgres in Docker and the app with [uv](https://docs.astral.sh/uv/) (Python 3.12+) and [pnpm](https://pnpm.io/) (Node 22+):
 
 ```bash
 uv sync
-docker compose up -d postgres qdrant    # Postgres (:5432) + Qdrant (:6333)
+docker compose up -d postgres           # Postgres (:5432)
 uv run alembic upgrade head             # create the schema
 
 # Terminal 1: the LiveKit worker (the interviewer)

@@ -9,15 +9,14 @@ Un simulador de entrevistas de trabajo por voz con IA. Sube tu currículum (PDF)
 Tres agentes, un solo flujo:
 
 1. **Planner** — lee el currículum y la oferta, y diseña la entrevista (persona del entrevistador, hitos a cubrir) en el idioma que configuraste.
-2. **Interviewer** — un agente de voz en tiempo real que conduce la entrevista en el navegador sobre LiveKit, va marcando los hitos y puede buscar en tu currículum durante la conversación (RAG).
+2. **Interviewer** — un agente de voz en tiempo real que conduce la entrevista en el navegador sobre LiveKit, va marcando los hitos y usa el currículum completo y la oferta en su contexto para fundamentar las preguntas.
 3. **Evaluator** — cuando la entrevista termina (plan completado, límite de tiempo, o cierras la pestaña), evalúa el transcript automáticamente: contratado o no, puntuación, fortalezas y debilidades.
 
 ## Stack
 
 - **LiveKit Agents** — pipeline de audio en tiempo real (STT, TTS, detección de turnos)
 - **LangGraph** — el cerebro del entrevistador (grafo ReAct + tools)
-- **OpenAI** — LLMs y embeddings
-- **Qdrant** — búsqueda vectorial sobre el currículum
+- **OpenAI** — LLMs para planificación, entrevista y evaluación
 - **PostgreSQL** — conversaciones, hitos, transcripts, evaluaciones
 - **FastAPI** — el API, bajo `/api` (también sirve el frontend compilado)
 - **TanStack Start + shadcn/ui** — frontend React en `web/`, compilado como SPA
@@ -35,7 +34,7 @@ cp .env.example .env         # completa tus claves
 docker compose up -d --build
 ```
 
-Eso levanta todo el stack: Postgres, Qdrant, la API + frontend y el worker de LiveKit (las migraciones corren automáticamente).
+Eso levanta todo el stack: Postgres, la API + frontend y el worker de LiveKit (las migraciones corren automáticamente). El currículum se guarda como texto en Postgres; los tres agentes lo reciben directamente, sin embeddings ni base de datos vectorial.
 
 Abre <http://localhost:8000>: sube un currículum en PDF, pega la oferta de trabajo, espera el plan (~30–60 s) y empieza la entrevista por voz. Al terminar, la evaluación aparece en la misma página.
 
@@ -45,11 +44,11 @@ La pantalla **Settings** configura el agente de forma global: su nombre, el idio
 
 ## Desarrollo (local)
 
-Para iterar con hot reload, corre solo las bases de datos en Docker y la app con [uv](https://docs.astral.sh/uv/) (Python 3.12+) y [pnpm](https://pnpm.io/) (Node 22+):
+Para iterar con hot reload, corre solo Postgres en Docker y la app con [uv](https://docs.astral.sh/uv/) (Python 3.12+) y [pnpm](https://pnpm.io/) (Node 22+):
 
 ```bash
 uv sync
-docker compose up -d postgres qdrant    # Postgres (:5432) + Qdrant (:6333)
+docker compose up -d postgres           # Postgres (:5432)
 uv run alembic upgrade head             # crea el esquema
 
 # Terminal 1: el worker de LiveKit (el entrevistador)

@@ -42,6 +42,8 @@ class _Conv:
         self.interview_length = interview_length
         self.plan = plan if plan is not None else {"language": "es", "persona": "Laura"}
         self.custom_instructions = None
+        self.resume_markdown = "# Resume\nPython developer."
+        self.job_offer = "Backend developer at ACME."
 
 
 class _MS:
@@ -177,6 +179,26 @@ def test_planner_prompt_always_demands_a_per_milestone_bar():
 
 
 # ---- Interviewer prompt -----------------------------------------------------
+
+
+@pytest.mark.parametrize("projects", [1, 40])
+def test_interviewer_receives_full_source_documents_without_retrieval(projects):
+    conversation = _Conv()
+    conversation.resume_markdown = "# Experience\n" + "\n".join(
+        f"Project {i}: Migrated a PostgreSQL database and wrote Python services."
+        for i in range(projects)
+    )
+    conversation.job_offer = "# Backend Engineer\nACME needs Python, SQL and mentoring."
+    conversation.plan["summary"] = "A short summary that omits project details."
+
+    prompt = build_interviewer_prompt(conversation, [], 15)
+
+    # Details omitted by the planner must still be available to the voice
+    # agent, including the end of a resume larger than a former RAG chunk.
+    assert conversation.resume_markdown in prompt
+    assert conversation.job_offer in prompt
+    assert prompt.count(conversation.resume_markdown) == 1
+    assert "search_resume" not in prompt
 
 
 def test_interviewer_prompt_injects_the_level_ceiling():

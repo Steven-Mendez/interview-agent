@@ -28,7 +28,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from interview_agent.config import settings
-from interview_agent.interview import db, rag
+from interview_agent.interview import db
+from interview_agent.interview import resume as resume_ingestion
 from interview_agent.interview.models import InterviewLength, Seniority
 from interview_agent.interview.planner import run_planner
 from interview_agent.llm import summarize_usage
@@ -448,7 +449,7 @@ async def create_interview(
         # In a worker thread: the conversion is CPU-bound pure Python and
         # would otherwise stall every other request on this event loop.
         resume_markdown = await anyio.to_thread.run_sync(
-            rag.pdf_to_markdown, data, resume.filename or "resume.pdf"
+            resume_ingestion.pdf_to_markdown, data, resume.filename or "resume.pdf"
         )
     except Exception as exc:  # markitdown raises converter-specific errors
         raise HTTPException(status_code=400, detail=f"Could not read PDF: {exc}") from exc
@@ -479,7 +480,7 @@ async def _plan_and_persist(
     pinned_evidence: str | None = None,
     interviewer_overrides: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
-    """Index the resume, run the planner and store the planned interview.
+    """Run the planner and store the resume and planned interview in Postgres.
 
     Shared by POST /interviews (fresh upload) and POST /interviews/{id}/repeat
     (same resume text and offer, replanned) — the only difference between the
@@ -533,17 +534,6 @@ async def _plan_and_persist(
 
         planner_usage = UsageMetadataCallbackHandler()
         try:
-            n_chunks = await rag.index_resume(
-                request.app.state.qdrant,
-                request.app.state.embeddings,
-                settings,
-                conversation_id,
-                resume_markdown,
-            )
-            logger.info(
-                "resume indexed",
-                extra={"conversation": str(conversation_id), "chunks": n_chunks},
-            )
             plan = await run_planner(
                 settings,
                 resume_markdown,
@@ -696,9 +686,8 @@ async def repeat_interview(
 ):
     """Run the same role again: a NEW interview off the stored resume and offer.
 
-    The resume PDF is long gone (only its markdown is kept) and so are the
-    Qdrant chunks, which are purged after the evaluation — so this re-indexes
-    the stored markdown and re-plans. Re-planning rather than cloning the old
+    The resume PDF is long gone; its markdown is kept in Postgres and reused
+    to plan the new interview. Re-planning rather than cloning the old
     milestones is the point of a practice re-run: the same role and the same
     bar, different questions. The original is never touched.
     """
@@ -836,10 +825,8 @@ async def evaluate_interview(request: Request, interview_id: uuid.UUID):
         conversation = await _load_or_404(session, interview_id)
         if conversation.status == "interviewing":
             # A live interview must never be evaluated: it would score half a
-            # transcript AND purge the resume chunks from Qdrant (see the
-            # runner), blinding search_resume for the rest of it. But a row
-            # past its reconnect window is not live — a crash never marks it
-            # completed — and the transcript it left is still worth scoring.
+            # transcript. A row past its reconnect window is not live — a crash
+            # never marks it completed — and its transcript is still worth scoring.
             if _can_reconnect(conversation):
                 raise HTTPException(status_code=409, detail="Interview is still in progress")
             logger.info(

@@ -41,10 +41,9 @@ from livekit.agents import (
 )
 from livekit.agents.llm import ChatContext, ChatMessage
 from livekit.plugins import langchain, silero
-from qdrant_client import AsyncQdrantClient
 
 from interview_agent.config import settings
-from interview_agent.interview import db, rag
+from interview_agent.interview import db
 from interview_agent.interview.db import Message
 from interview_agent.interview.interviewer_graph import build_interviewer_graph
 from interview_agent.prompts import build_interviewer_prompt
@@ -331,8 +330,6 @@ async def _trigger_evaluation(
 
 async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
     engine, sessionmaker = db.create_engine_and_sessionmaker(settings.database_url)
-    qdrant = AsyncQdrantClient(url=settings.qdrant_url)
-    embeddings = rag.build_embeddings(settings)
 
     async with sessionmaker() as s:
         conversation = await db.get_conversation(s, conversation_id)
@@ -376,8 +373,6 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
         settings,
         conversation_id,
         sessionmaker,
-        qdrant,
-        embeddings,
         end_event,
         prompt,
         usage_sink=_track_usage,
@@ -529,7 +524,6 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
             f"{settings.app_base_url}/api/interviews/{conversation_id}/evaluate",
             conversation_id,
         )
-        await qdrant.close()
         await engine.dispose()
 
     ctx.add_shutdown_callback(_on_shutdown)

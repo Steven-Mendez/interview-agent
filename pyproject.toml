@@ -18,7 +18,6 @@ dependencies = [
     "uvicorn[standard]>=0.50.1",
     "python-multipart>=0.0.32",
     "markitdown[pdf]>=0.1.6",
-    "qdrant-client>=1.18.0",
     "sqlalchemy[asyncio]>=2.0.51",
     "asyncpg>=0.31.0",
     "alembic>=1.18.5",

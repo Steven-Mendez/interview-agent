@@ -16,6 +16,7 @@ import asyncio
 import itertools
 import json
 import logging
+import math
 import re
 import time
 import unicodedata
@@ -61,6 +62,8 @@ _DEDUPE_MIN_WORDS = 8  # shortest real duplicate seen was 18 words
 _DEDUPE_MAX_LAG_SECONDS = 5.0  # an aggregate lands 0-0.5s after the final it repeats
 _DEDUPE_HISTORY_SECONDS = 60.0  # longest stretch one aggregate spanned was 11s
 _DEDUPE_MAX_FINALS = 64  # memory guard; bounds the 60s window, not the interview
+_DEDUPE_MODEL = "assemblyai/universal-streaming-multilingual"
+_DEDUPE_AUDIO_TOLERANCE = 0.001
 
 _NON_WORD = re.compile(r"[^\w\s]", re.UNICODE)
 
@@ -110,49 +113,76 @@ def _normalize_final(text: str) -> list[str]:
 
 
 def _make_duplicate_final_filter(
-    *, now: Callable[[], float] = time.monotonic
-) -> Callable[[str], bool]:
-    """Return `keep(final_text) -> bool`, dropping redundant STT finals.
+    *, model: str, now: Callable[[], float] = time.monotonic
+) -> Callable[[stt.SpeechEvent], bool]:
+    """Drop AssemblyAI aggregates only when text AND audio boundaries match.
 
-    `assemblyai/universal-streaming-multilingual` emits, for one long answer,
-    several FORMATTED per-phrase finals and then one UNFORMATTED final that
-    re-states everything since its own turn started. That aggregate is
-    cumulative rather than incremental (livekit/agents#3312), and it wrecks the
-    transcript two different ways depending on whether it beats the turn flush:
-    arriving before, it is concatenated into the same message; arriving after,
-    it opens a whole second turn. Both come from the same event, so dropping it
-    here — upstream of the browser stream, the end-of-turn detector and
-    `conversation_item_added` — fixes both.
-
-    The aggregate always covers up to and including the most recent phrase
-    final, so it is structurally a *suffix* of what was already emitted. Match
-    on suffix rather than containment: containment would also swallow a
-    legitimate prefix of earlier speech.
-
-    Stateful. Only kept finals are recorded, so the buffer stays a faithful
-    record of what actually went downstream. It is a rolling time window and is
-    deliberately NOT reset on turn commit: the aggregate lands ~0.06s AFTER the
-    commit, so a commit-scoped buffer would be empty exactly when it is needed.
+    The incident recorded in tests/test_stt_dedupe.py contained cumulative
+    finals before and after LiveKit committed a turn. Text alone cannot tell
+    these apart from a candidate repeating an answer. Missing or ambiguous
+    timing evidence therefore keeps the speech. request_id scopes history;
+    it is not a unique transcript identifier and never proves duplication.
+    Create a new filter for every stt_node invocation, not every user turn.
     """
-    history: deque[tuple[float, list[str]]] = deque(maxlen=_DEDUPE_MAX_FINALS)
+    history: deque[tuple[float, float, float, list[str]]] = deque(maxlen=_DEDUPE_MAX_FINALS)
+    request_id: str | None = None
+    last_end: float | None = None
 
-    def keep(text: str) -> bool:
-        tokens = _normalize_final(text)
-        if not tokens:
+    def keep(event: stt.SpeechEvent) -> bool:
+        nonlocal request_id, last_end
+        if model != _DEDUPE_MODEL or event.type is not stt.SpeechEventType.FINAL_TRANSCRIPT:
             return True
+        if not event.alternatives:
+            history.clear()
+            last_end = None
+            return True
+        if event.request_id and event.request_id != request_id:
+            history.clear()
+            last_end = None
+            request_id = event.request_id
+
+        data = event.alternatives[0]
+        tokens = _normalize_final(data.text)
+        start, end = data.start_time, data.end_time
+        valid_times = (
+            isinstance(start, (int, float))
+            and isinstance(end, (int, float))
+            and math.isfinite(start)
+            and math.isfinite(end)
+            and 0 <= start < end
+        )
+        if not tokens or not valid_times:
+            history.clear()
+            last_end = None
+            logger.debug("kept stt final: insufficient audio timing evidence")
+            return True
+        # Aggregate start times go backwards by design; only a regressing END
+        # is evidence of a restarted audio clock.
+        if last_end is not None and end < last_end - _DEDUPE_AUDIO_TOLERANCE:
+            history.clear()
+            logger.debug("reset stt dedupe history: audio clock regressed")
+        last_end = end
         stamp = now()
         cutoff = stamp - _DEDUPE_HISTORY_SECONDS
         while history and history[0][0] < cutoff:
             history.popleft()
-        # A duplicate treads on the heels of what it repeats; anything slower is
-        # the candidate genuinely saying the same thing again (e.g. after being
-        # asked to repeat), which must be kept.
         recent = bool(history) and stamp - history[-1][0] <= _DEDUPE_MAX_LAG_SECONDS
         if len(tokens) >= _DEDUPE_MIN_WORDS and recent:
-            seen = [tok for _, toks in history for tok in toks]
-            if len(tokens) <= len(seen) and seen[-len(tokens) :] == tokens:
-                return False
-        history.append((stamp, tokens))
+            seen: list[str] = []
+            for _, prior_start, _, prior_tokens in reversed(history):
+                seen = prior_tokens + seen
+                if len(seen) > len(tokens):
+                    break
+                if (
+                    seen == tokens
+                    and math.isclose(start, prior_start, abs_tol=_DEDUPE_AUDIO_TOLERANCE, rel_tol=0)
+                    and math.isclose(
+                        end, history[-1][2], abs_tol=_DEDUPE_AUDIO_TOLERANCE, rel_tol=0
+                    )
+                ):
+                    logger.info("dropped duplicate stt final: matching text and audio boundaries")
+                    return False
+        history.append((stamp, start, end, tokens))
         return True
 
     return keep
@@ -216,11 +246,11 @@ def _build_session(ctx: JobContext, graph, agent_settings: dict | None) -> Agent
         # cloud→local fallback.
         turn_handling=TurnHandlingOptions(
             turn_detection=inference.TurnDetector(),
-            # Pinned to livekit's streaming defaults. Do NOT raise min_delay to
-            # chase the "late stt final" warning: AssemblyAI's aggregate final
-            # would then land *before* the flush and get concatenated into the
-            # same transcript instead of opening a second turn — the same
-            # duplicate, but invisible. InterviewAgent.stt_node handles it.
+            # LangGraph's internal tools commit milestones and signal closure
+            # while the graph runs. They cannot be rolled back when LiveKit
+            # discards an unconfirmed response. Accept the latency tradeoff.
+            preemptive_generation={"enabled": False},
+            # Keep the audio turn detector's documented endpointing defaults.
             endpointing={"mode": "fixed", "min_delay": 0.3, "max_delay": 2.5},
         ),
     )
@@ -236,33 +266,28 @@ class InterviewAgent(Agent):
     filter here covers all of them. See `_make_duplicate_final_filter`.
     """
 
-    def __init__(self, *, instructions: str, chat_ctx: ChatContext | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        instructions: str,
+        chat_ctx: ChatContext | None = None,
+        stt_model: str = settings.stt_model,
+    ) -> None:
         # chat_ctx carries the earlier half of a resumed interview; livekit
         # copies it into the agent and never re-emits it as conversation items,
         # so seeding it does not re-persist the transcript.
         super().__init__(instructions=instructions, chat_ctx=chat_ctx)
-        # On the agent rather than inside stt_node, so the buffer survives a
-        # reconnect of the STT stream.
-        self._keep_final = _make_duplicate_final_filter()
-        self._dropped_finals = 0
+        self._stt_model = stt_model
 
     async def stt_node(
         self, audio: AsyncIterable[rtc.AudioFrame], model_settings: ModelSettings
     ) -> AsyncIterable[stt.SpeechEvent]:
+        keep_final = _make_duplicate_final_filter(model=self._stt_model)
         async for event in Agent.default.stt_node(self, audio, model_settings):
             # Only finals are judged: interim/preflight transcripts drive the
             # live bubble, and RECOGNITION_USAGE carries STT billing metrics.
-            if event.type is stt.SpeechEventType.FINAL_TRANSCRIPT and event.alternatives:
-                text = event.alternatives[0].text
-                if text.strip() and not self._keep_final(text):
-                    self._dropped_finals += 1
-                    logger.info(
-                        "dropped duplicate stt final #%d (%d words): %.120s",
-                        self._dropped_finals,
-                        len(text.split()),
-                        text,
-                    )
-                    continue
+            if not keep_final(event):
+                continue
             yield event
 
 
@@ -533,7 +558,11 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
 
     await session.start(
         room=ctx.room,
-        agent=InterviewAgent(instructions=prompt, chat_ctx=_chat_ctx_from_messages(prior_messages)),
+        agent=InterviewAgent(
+            instructions=prompt,
+            chat_ctx=_chat_ctx_from_messages(prior_messages),
+            stt_model=settings.stt_model,
+        ),
     )
     watcher_task = asyncio.create_task(watch_end_event())
     timer_task = asyncio.create_task(time_cap())

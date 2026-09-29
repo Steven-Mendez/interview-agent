@@ -49,6 +49,7 @@ import { useDevicePreview } from "@/hooks/use-device-preview"
 import type { DevicePreview } from "@/hooks/use-device-preview"
 import { PageContainer, PageShell } from "@/components/ui/page"
 import { Button } from "@/components/ui/button"
+import { InterviewAudioRecovery } from "@/components/interview-audio-recovery"
 import {
   Card,
   CardContent,
@@ -163,6 +164,11 @@ function InterviewSessionPage({ interviewId }: { interviewId: string }) {
   return session.room ? (
     <RoomContext.Provider value={session.room}>
       <RoomAudioRenderer />
+      {session.phase === "live" && (
+        <div className="mx-auto w-full max-w-6xl px-4 pt-2">
+          <InterviewAudioRecovery />
+        </div>
+      )}
       {content}
     </RoomContext.Provider>
   ) : (
@@ -312,6 +318,11 @@ function InterviewPanel({
                             className={m.interim ? "opacity-70" : undefined}
                           >
                             <BubbleContent>{m.text}</BubbleContent>
+                            {m.incomplete && (
+                              <span className="block px-3 pb-2 text-xs opacity-70">
+                                Incomplete transcription
+                              </span>
+                            )}
                           </Bubble>
                         </MessageContent>
                       </Message>

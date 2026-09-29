@@ -4,10 +4,8 @@ import { Room, RoomEvent } from "livekit-client"
 import { getInterviewToken, ApiError } from "@/lib/api"
 import { log } from "@/lib/log"
 
-// Live interview session over LiveKit — a faithful port of the transcription
-// and connection logic in `frontend/app.js` (lines 226-366), folded into one
-// hook. The dedupe rules are load-bearing and tuned against livekit-client
-// 2.20.0; keep them literal.
+// Live interview session over LiveKit. Transcript identity comes from the
+// SDK segment id; text similarity alone never proves duplicated speech.
 
 export type SessionPhase = "idle" | "connecting" | "live" | "ended"
 export type Who = "user" | "agent"
@@ -18,6 +16,7 @@ export interface ChatMessage {
   who: Who
   text: string
   interim: boolean
+  incomplete: boolean
 }
 
 /** Options for `start`. The device id comes from the pre-join check, so the
@@ -55,6 +54,9 @@ interface Segment {
   who: Who
   text: string
   interim: boolean
+  incomplete: boolean
+  confirmed: boolean
+  version: number
   rendered: boolean
   timer: ReturnType<typeof setTimeout> | null
 }
@@ -75,7 +77,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
   // Refs for the transcription bookkeeping — mutated imperatively inside the
   // stream handlers, exactly like the module-level state in app.js.
   const segmentsRef = React.useRef<Map<string, Segment>>(new Map())
-  const lastSegmentRef = React.useRef<Partial<Record<Who, Segment>>>({})
+  const readersRef = React.useRef(new Map<AbortController, Segment>())
   const orderRef = React.useRef<string[]>([]) // render order of segment ids
   const phaseRef = React.useRef<SessionPhase>("idle")
   const roomRef = React.useRef<Room | null>(null)
@@ -87,6 +89,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
 
   // Rebuild the render list from the ordered, rendered segments and publish it.
   const commit = React.useCallback(() => {
+    if (disposedRef.current) return
     const next: ChatMessage[] = []
     for (const id of orderRef.current) {
       const seg = segmentsRef.current.get(id)
@@ -96,6 +99,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
         who: seg.who,
         text: seg.text,
         interim: seg.interim,
+        incomplete: seg.incomplete,
       })
     }
     setMessages(next)
@@ -110,6 +114,9 @@ export function useInterviewSession(interviewId: string): InterviewSession {
           who,
           text: "",
           interim: true,
+          incomplete: false,
+          confirmed: false,
+          version: 0,
           rendered: false,
           timer: null,
         }
@@ -128,48 +135,53 @@ export function useInterviewSession(interviewId: string): InterviewSession {
       if (!seg.rendered) {
         seg.rendered = true
         orderRef.current.push(seg.segmentId)
-        lastSegmentRef.current[seg.who] = seg
       }
       seg.text = text
+      seg.interim = true
+      seg.incomplete = false
       commit()
     },
     [commit]
   )
 
   const finalizeBubble = React.useCallback(
-    (seg: Segment) => {
-      if (seg.timer) {
-        clearTimeout(seg.timer)
-        seg.timer = null
-      }
-      if (!seg.rendered) return
-      // Supersede dedupe: if the previous bubble from the same speaker never
-      // finalized and one text is a prefix of the other, it was a discarded
-      // partial of this same utterance — drop it.
-      const prev = lastSegmentRef.current[seg.who]
-      if (prev && prev !== seg && prev.rendered && prev.interim) {
-        if (seg.text.startsWith(prev.text) || prev.text.startsWith(seg.text)) {
-          orderRef.current = orderRef.current.filter(
-            (id) => id !== prev.segmentId
-          )
-          segmentsRef.current.delete(prev.segmentId)
-        }
+    (seg: Segment, incomplete = false) => {
+      if (seg.timer) clearTimeout(seg.timer)
+      seg.timer = null
+      if (!seg.rendered) {
+        segmentsRef.current.delete(seg.segmentId)
+        return
       }
       seg.interim = false
-      lastSegmentRef.current[seg.who] = seg
+      seg.incomplete = incomplete
+      seg.confirmed = !incomplete
       commit()
     },
     [commit]
   )
 
+  const cancelTranscriptions = React.useCallback(() => {
+    for (const [controller, seg] of readersRef.current) {
+      // Finalize before aborting, since the callback deliberately ignores
+      // cancelled reads. A newer/confirmed version must not be downgraded.
+      controller.abort()
+      if (!seg.confirmed) finalizeBubble(seg, true)
+    }
+    readersRef.current.clear()
+    for (const seg of segmentsRef.current.values()) {
+      if (seg.timer || seg.interim) finalizeBubble(seg, true)
+    }
+  }, [finalizeBubble])
+
   const registerTranscriptionHandler = React.useCallback(
     (r: Room) => {
-      // One handler per topic per Room (a second registration throws) — this
-      // is why we register imperatively inside start(), never in a useEffect
-      // (StrictMode would double-mount and throw).
+      r.on(RoomEvent.Reconnecting, cancelTranscriptions)
+      r.on(RoomEvent.Disconnected, cancelTranscriptions)
+      // One handler per topic per Room, registered before connect.
       r.registerTextStreamHandler(
         "lk.transcription",
         async (reader, participantInfo) => {
+          if (disposedRef.current || roomRef.current !== r) return
           const attrs = reader.info.attributes ?? {}
           const segmentId = attrs["lk.segment_id"] ?? reader.info.id
           if (!attrs["lk.segment_id"]) {
@@ -177,35 +189,53 @@ export function useInterviewSession(interviewId: string): InterviewSession {
           }
           const isUser = participantInfo.identity === "candidate"
           const seg = bubbleFor(segmentId, isUser ? "user" : "agent")
-
-          if (isUser) {
-            // User STT: each interim is a separate stream carrying the FULL text
-            // so far under the same segment id — replace the bubble text in place.
-            const text = await reader.readAll()
-            setBubbleText(seg, text)
-            if (attrs["lk.transcription_final"] === "true") {
+          const controller = new AbortController()
+          readersRef.current.set(controller, seg)
+          // A confirmed final is immutable. Still drain a late stream so its
+          // reader can finish normally without creating another bubble.
+          const version = seg.confirmed ? seg.version : ++seg.version
+          if (seg.timer) clearTimeout(seg.timer)
+          seg.timer = null
+          const current = () =>
+            !disposedRef.current &&
+            !controller.signal.aborted &&
+            roomRef.current === r &&
+            seg.version === version &&
+            !seg.confirmed &&
+            segmentsRef.current.get(segmentId) === seg
+          try {
+            // User streams each carry the FULL text, agent streams deltas.
+            // Accumulate within this reader, replacing this segment's text:
+            // unlike readAll(), this preserves received user text on failure.
+            let text = ""
+            for await (const chunk of reader.withAbortSignal(
+              controller.signal
+            )) {
+              text += chunk
+              if (current()) setBubbleText(seg, text)
+            }
+            if (!current()) return
+            if (!isUser || attrs["lk.transcription_final"] === "true") {
               finalizeBubble(seg)
+            } else if (seg.rendered) {
+              seg.timer = setTimeout(() => {
+                if (current()) finalizeBubble(seg, true)
+              }, 3000)
             } else {
-              // Safety net: if the final version never arrives (it occasionally
-              // doesn't), solidify the interim after 3s without updates.
-              if (seg.timer) clearTimeout(seg.timer)
-              seg.timer = setTimeout(() => finalizeBubble(seg), 3000)
+              segmentsRef.current.delete(segmentId)
             }
-          } else {
-            // Agent speech: one delta stream per segment, word-synced with the
-            // audio playback — accumulate chunks; stream close = segment done
-            // (works for interruptions too; the trailer "final" attribute isn't
-            // reliably surfaced by the JS SDK).
-            for await (const chunk of reader) {
-              setBubbleText(seg, seg.text + chunk)
+          } catch {
+            if (current()) {
+              finalizeBubble(seg, true)
+              console.warn("[app] transcription stream ended before completion")
             }
-            if (seg.rendered) finalizeBubble(seg)
-            else segmentsRef.current.delete(segmentId) // empty stream: never render it
+          } finally {
+            readersRef.current.delete(controller)
           }
         }
       )
     },
-    [bubbleFor, setBubbleText, finalizeBubble]
+    [bubbleFor, setBubbleText, finalizeBubble, cancelTranscriptions]
   )
 
   const registerAgentStateHandler = React.useCallback((r: Room) => {
@@ -225,10 +255,8 @@ export function useInterviewSession(interviewId: string): InterviewSession {
 
   const start = React.useCallback(
     (options?: StartOptions) => {
-      // Runs inside the click handler: mic permission + audio autoplay need the
-      // user gesture. No state update between here and setMicrophoneEnabled that
-      // could re-render before the permission prompt (phase→connecting is the
-      // only one, and it just swaps the button for a status line).
+      // Start from a user action. Microphone acquisition also lets LiveKit
+      // attempt audio playback; the UI offers recovery if it stays blocked.
       if (phaseRef.current !== "idle") return
 
       void (async () => {
@@ -269,6 +297,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
           // would show "Evaluating…" for an interview that never began.
           const link = { live: false, lost: false }
           r.on(RoomEvent.Disconnected, (reason) => {
+            if (disposedRef.current) return
             if (!link.live) {
               link.lost = true
               return
@@ -326,9 +355,10 @@ export function useInterviewSession(interviewId: string): InterviewSession {
     disposedRef.current = false
     return () => {
       disposedRef.current = true
+      cancelTranscriptions()
       void roomRef.current?.disconnect()
     }
-  }, [])
+  }, [cancelTranscriptions])
 
   return { phase, start, error, messages, agentState, room, endedAt }
 }

@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from langchain_core.messages import AIMessageChunk
+from livekit import rtc
 from livekit.agents import Agent, AgentSession, stt
 from livekit.agents.llm import ChatContext
 from livekit.agents.voice.audio_recognition import AudioRecognition
@@ -124,6 +125,44 @@ async def test_invalid_worker_context_marks_failure_closes_room_and_releases_eng
     assert delete.await_args.args[0].room == "dispatched-room"
     engine.dispose.assert_awaited_once()
     ctx.shutdown.assert_called_once_with(reason="invalid_source_context")
+
+
+async def test_worker_reaches_session_start_with_a_real_unconnected_room(monkeypatch):
+    conversation_id = uuid.uuid4()
+    conversation = SimpleNamespace(
+        status="planned",
+        plan={"language": "es"},
+        max_minutes=8,
+        agent_settings={},
+        ended_reason=None,
+    )
+    engine = SimpleNamespace(dispose=AsyncMock())
+    monkeypatch.setattr(
+        agent.db, "create_engine_and_sessionmaker", lambda *args: (engine, LocalSessionMaker())
+    )
+    monkeypatch.setattr(agent.db, "get_conversation", AsyncMock(return_value=conversation))
+    monkeypatch.setattr(agent.db, "get_milestones", AsyncMock(return_value=[]))
+    monkeypatch.setattr(agent.db, "get_messages", AsyncMock(return_value=[]))
+    monkeypatch.setattr(agent.db, "set_status", AsyncMock())
+    monkeypatch.setattr(agent, "build_interviewer_prompt", lambda *args: "Interview")
+    monkeypatch.setattr(agent, "build_interviewer_graph", lambda *args, **kwargs: None)
+    monkeypatch.setattr(agent, "_trigger_evaluation", AsyncMock())
+    session = AgentSession(vad=None)
+    # Only actual provider/audio startup is doubled. The worker wiring,
+    # subscriptions and pre-connect Room.local_participant guard are real.
+    start = AsyncMock()
+    monkeypatch.setattr(session, "start", start)
+    monkeypatch.setattr(session, "generate_reply", AsyncMock())
+    monkeypatch.setattr(agent, "_build_session", lambda *args: session)
+    callbacks = []
+    room = rtc.Room()
+    ctx = SimpleNamespace(room=room, add_shutdown_callback=callbacks.append)
+    await agent._run_interview(ctx, conversation_id)
+    start.assert_awaited_once()
+    assert start.call_args.kwargs["room"] is room
+    assert len(callbacks) == 1
+    await callbacks[0]()
+    engine.dispose.assert_awaited_once()
 
 
 class LocalEndOfTurnDetector:

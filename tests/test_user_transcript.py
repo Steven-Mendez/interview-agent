@@ -4,6 +4,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+from livekit import rtc
 from livekit.agents import AgentSession, ConversationItemAddedEvent, UserInputTranscribedEvent
 from livekit.agents.llm import ChatMessage
 
@@ -29,10 +30,23 @@ async def flush():
         await asyncio.sleep(0)
 
 
+def room_for(send):
+    return SimpleNamespace(local_participant=SimpleNamespace(send_text=send))
+
+
+async def test_forwarder_can_be_registered_before_job_room_connects():
+    # Real Room.local_participant raises until connected. Worker startup
+    # registers this helper before AgentSession.start connects the room.
+    room = rtc.Room()
+    session = AgentSession(vad=None)
+    forwarder = UserTranscriptForwarder(session, room)
+    await forwarder.aclose()
+
+
 async def test_one_turn_id_across_sentences_and_authoritative_final_correction():
     session = AgentSession(vad=None)
     send = AsyncMock()
-    forwarder = UserTranscriptForwarder(session, SimpleNamespace(send_text=send))
+    forwarder = UserTranscriptForwarder(session, room_for(send))
     try:
         transcribe(session, "First sentence.")
         await flush()
@@ -71,7 +85,7 @@ async def test_one_turn_id_across_sentences_and_authoritative_final_correction()
 async def test_repeated_sentences_inside_one_turn_are_preserved():
     session = AgentSession(vad=None)
     send = AsyncMock()
-    forwarder = UserTranscriptForwarder(session, SimpleNamespace(send_text=send))
+    forwarder = UserTranscriptForwarder(session, room_for(send))
     transcribe(session, "I used Git.")
     transcribe(session, "I used Git.")
     await flush()
@@ -83,7 +97,7 @@ async def test_repeated_sentences_inside_one_turn_are_preserved():
 async def test_failed_publish_does_not_stop_later_final_or_log_candidate_text(caplog):
     session = AgentSession(vad=None)
     send = AsyncMock(side_effect=[RuntimeError("private candidate text"), None])
-    forwarder = UserTranscriptForwarder(session, SimpleNamespace(send_text=send))
+    forwarder = UserTranscriptForwarder(session, room_for(send))
     transcribe(session, "Candidate's private answer")
     await flush()
     commit(session, "Candidate's private answer")
@@ -104,7 +118,7 @@ async def test_slow_publisher_coalesces_updates_but_keeps_distinct_confirmed_tur
         started.set()
         await blocked.wait()
 
-    forwarder = UserTranscriptForwarder(session, SimpleNamespace(send_text=send))
+    forwarder = UserTranscriptForwarder(session, room_for(send))
     transcribe(session, "First")
     await started.wait()
     for i in range(100):
@@ -122,14 +136,14 @@ async def test_slow_publisher_coalesces_updates_but_keeps_distinct_confirmed_tur
 async def test_close_unsubscribes_and_another_session_has_fresh_turn_identity():
     session = AgentSession(vad=None)
     send = AsyncMock()
-    old = UserTranscriptForwarder(session, SimpleNamespace(send_text=send))
+    old = UserTranscriptForwarder(session, room_for(send))
     commit(session, "Answer")
     await old.aclose()
     old_id = send.call_args.kwargs["attributes"]["lk.segment_id"]
     commit(session, "Ignored after close")
     await flush()
     assert send.await_count == 1
-    new = UserTranscriptForwarder(session, SimpleNamespace(send_text=send))
+    new = UserTranscriptForwarder(session, room_for(send))
     commit(session, "Answer")
     await new.aclose()
     assert send.call_args.kwargs["attributes"]["lk.segment_id"] != old_id
@@ -148,10 +162,52 @@ async def test_shutdown_cancels_stalled_publish_and_can_close_twice(monkeypatch)
         finally:
             cancelled.set()
 
-    forwarder = UserTranscriptForwarder(session, SimpleNamespace(send_text=send))
+    forwarder = UserTranscriptForwarder(session, room_for(send))
     commit(session, "Answer")
     await started.wait()
     await forwarder.aclose()
     await forwarder.aclose()
     assert cancelled.is_set()
     assert forwarder._task.done()
+
+
+async def test_assistant_boundary_preserves_orphan_and_starts_a_new_user_turn():
+    session = AgentSession(vad=None)
+    send = AsyncMock()
+    forwarder = UserTranscriptForwarder(session, room_for(send))
+    transcribe(session, "Orphaned answer")
+    await flush()
+    session.emit(
+        "conversation_item_added",
+        ConversationItemAddedEvent(item=ChatMessage(role="assistant", content=["Next question"])),
+    )
+    await flush()
+    orphan = send.call_args
+    assert orphan.args == ("Orphaned answer",)
+    assert orphan.kwargs["attributes"]["interview.incomplete"] == "true"
+    transcribe(session, "New answer")
+    await flush()
+    assert send.call_args.args == ("New answer",)
+    commit(session, "New answer")
+    await forwarder.aclose()
+    assert (
+        send.call_args.kwargs["attributes"]["lk.segment_id"]
+        != (orphan.kwargs["attributes"]["lk.segment_id"])
+    )
+
+
+async def test_failed_final_is_retried_with_same_id_and_later_turn_is_not_lost():
+    session = AgentSession(vad=None)
+    send = AsyncMock(side_effect=[RuntimeError("lost final"), None, None])
+    forwarder = UserTranscriptForwarder(session, room_for(send))
+    commit(session, "First answer")
+    commit(session, "Second answer")
+    await forwarder.aclose()
+    assert [c.args[0] for c in send.call_args_list] == [
+        "First answer",
+        "First answer",
+        "Second answer",
+    ]
+    ids = [c.kwargs["attributes"]["lk.segment_id"] for c in send.call_args_list]
+    assert ids[0] == ids[1]
+    assert ids[1] != ids[2]

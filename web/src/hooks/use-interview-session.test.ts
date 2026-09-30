@@ -136,6 +136,42 @@ async function connected() {
 }
 
 describe("interview transcription lifecycle", () => {
+  it("keeps an orphan incomplete before the next agent and user messages", async () => {
+    const { room, result } = await connected()
+    const orphan = new ControlledReader("orphan")
+    orphan.info.attributes["interview.incomplete"] = "true"
+    orphan.push("Unconfirmed answer")
+    orphan.push(null)
+    await act(async () => {
+      await room.receive(orphan)
+    })
+    const agent = new ControlledReader("question", true)
+    agent.push("Next question")
+    agent.push(null)
+    await act(async () => {
+      await room.receive(agent, "agent")
+    })
+    const answer = new ControlledReader("next-turn", true)
+    answer.push("Next answer")
+    answer.push(null)
+    await act(async () => {
+      await room.receive(answer)
+    })
+    expect(result.current.messages.map(({ text }) => text)).toEqual([
+      "Unconfirmed answer",
+      "Next question",
+      "Next answer",
+    ])
+    expect(result.current.messages[0]).toMatchObject({
+      interim: false,
+      incomplete: true,
+    })
+    expect(result.current.messages[2]).toMatchObject({
+      interim: false,
+      incomplete: false,
+    })
+  })
+
   it("renders consecutive STT sentences as one turn, keeping repeated sentences", async () => {
     const { room, result } = await connected()
     for (const [text, final] of [

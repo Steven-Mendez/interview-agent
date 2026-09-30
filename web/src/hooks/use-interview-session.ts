@@ -240,7 +240,9 @@ export function useInterviewSession(interviewId: string): InterviewSession {
               if (current()) setBubbleText(seg, text)
             }
             if (!current()) return
-            if (!isUser || attrs["lk.transcription_final"] === "true") {
+            if (isUser && attrs["interview.incomplete"] === "true") {
+              finalizeBubble(seg, true)
+            } else if (!isUser || attrs["lk.transcription_final"] === "true") {
               finalizeBubble(seg)
             } else if (seg.rendered) {
               seg.timer = setTimeout(() => {

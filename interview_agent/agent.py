@@ -470,7 +470,7 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
             logger.exception("failed to persist transcript item")
 
     session.on("conversation_item_added", _on_item)
-    user_transcript = UserTranscriptForwarder(session, ctx.room.local_participant)
+    user_transcript = UserTranscriptForwarder(session, ctx.room)
 
     # --- End-of-interview machinery ----------------------------------------
     closing = False

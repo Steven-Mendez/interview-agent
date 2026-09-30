@@ -48,6 +48,7 @@ from interview_agent.interview import db
 from interview_agent.interview.db import Message
 from interview_agent.interview.interviewer_graph import build_interviewer_graph
 from interview_agent.prompts import build_interviewer_prompt
+from interview_agent.user_transcript import UserTranscriptForwarder
 from interview_agent.voices import DEFAULT_LANGUAGE, DEFAULT_VOICE, VOICES
 
 logger = logging.getLogger("interview_agent")
@@ -262,8 +263,10 @@ def _build_session(ctx: JobContext, graph, agent_settings: dict | None) -> Agent
             # discards an unconfirmed response. Accept the latency tradeoff.
             # Later interruptions of confirmed turns do not roll tools back.
             preemptive_generation={"enabled": False},
-            # Keep the audio turn detector's documented endpointing defaults.
-            endpointing={"mode": "fixed", "min_delay": 0.3, "max_delay": 2.5},
+            # The 2026-09-30 voice test delivered a final 1.17s after audio
+            # ended, after a 0.3s turn had already committed. Allow that tail
+            # plus a margin; keep the detector and its longer hesitation wait.
+            endpointing={"mode": "fixed", "min_delay": 1.5, "max_delay": 2.5},
         ),
     )
 
@@ -467,6 +470,7 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
             logger.exception("failed to persist transcript item")
 
     session.on("conversation_item_added", _on_item)
+    user_transcript = UserTranscriptForwarder(session, ctx.room.local_participant)
 
     # --- End-of-interview machinery ----------------------------------------
     closing = False
@@ -495,6 +499,7 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
         except Exception:
             logger.exception("failed to mark interview completed")
         await session.aclose()
+        await user_transcript.aclose()
         await ctx.api.room.delete_room(api.DeleteRoomRequest(room=ctx.room.name))
 
     wrap_up_issued = False
@@ -556,6 +561,7 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
     async def _on_shutdown() -> None:
         for task in (watcher_task, timer_task, idle_task):
             task.cancel()
+        await user_transcript.aclose()
         # Drain in-flight transcript writes so the evaluation sees them all.
         if background_tasks:
             await asyncio.gather(*background_tasks, return_exceptions=True)

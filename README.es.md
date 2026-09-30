@@ -50,6 +50,10 @@ La generación especulativa está desactivada porque las herramientas de LangGra
 
 Los streams de transcripción fallidos o abandonados conservan el texto recibido con la marca **Incomplete transcription**. Una reconexión breve puede continuar el stream existente; un lector sin datos durante 30 segundos se cancela y queda marcado como incompleto sin terminar la entrevista. El control **Enable audio** aparece cuando el navegador bloquea la reproducción.
 
+Las burbujas del usuario siguen los turnos de conversación, en vez de las frases individuales de STT. El worker publica texto acumulado por `interview.user_transcription` con un mismo identificador hasta que `conversation_item_added` confirma la respuesta exacta. Se conservan las frases repetidas; los turnos confirmados distintos mantienen identificadores diferentes. La voz del agente sigue usando el stream sincronizado `lk.transcription` de LiveKit. Actualiza worker y frontend juntos para este protocolo.
+
+La espera mínima de cierre de turno es de 1,5 segundos; la espera para dudas o pausas más largas sigue en 2,5 segundos. Esto cubre, con margen, el final de STT que llegó 1,17 segundos tarde en la prueba de voz del 30 de septiembre, a cambio de hasta 1,2 segundos más de espera que el mínimo anterior. Las regresiones locales con el SDK reproducen la división anterior y verifican que ese fragmento queda en un solo turno. Los retrasos mayores del proveedor pueden requerir más mediciones; quedan pendientes las pruebas con micrófono en Chrome y Safari posteriores al cambio.
+
 ## Actualización desde la versión con Qdrant
 
 Retirar Qdrant de Compose no elimina sus contenedores ni el volumen `qdrant_data` existente. La tarea actual de retención solo gestiona Postgres; los datos vectoriales antiguos requieren una limpieza única por parte del administrador del despliegue.

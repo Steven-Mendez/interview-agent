@@ -10,7 +10,7 @@ import { useInterviewSession } from "./use-interview-session"
 const mocks = vi.hoisted(() => {
   const rooms: MockRoom[] = []
   class MockRoom {
-    handler!: TextStreamHandler
+    handlers = new Map<string, TextStreamHandler>()
     listeners = new Map<string, Array<() => void>>()
     localParticipant = {
       setMicrophoneEnabled: vi.fn().mockResolvedValue(undefined),
@@ -20,8 +20,8 @@ const mocks = vi.hoisted(() => {
     constructor() {
       rooms.push(this)
     }
-    registerTextStreamHandler(_topic: string, handler: TextStreamHandler) {
-      this.handler = handler
+    registerTextStreamHandler(topic: string, handler: TextStreamHandler) {
+      this.handlers.set(topic, handler)
     }
     on(event: string, handler: () => void) {
       this.listeners.set(event, [...(this.listeners.get(event) ?? []), handler])
@@ -30,9 +30,17 @@ const mocks = vi.hoisted(() => {
     emit(event: string) {
       this.listeners.get(event)?.forEach((handler) => handler())
     }
-    receive(reader: ControlledReader, identity = "candidate") {
+    receive(
+      reader: ControlledReader,
+      identity = "candidate",
+      topic = identity === "candidate"
+        ? "interview.user_transcription"
+        : "lk.transcription"
+    ) {
       return Promise.resolve(
-        this.handler(reader as unknown as TextStreamReader, { identity })
+        this.handlers.get(topic)!(reader as unknown as TextStreamReader, {
+          identity,
+        })
       )
     }
   }
@@ -128,6 +136,59 @@ async function connected() {
 }
 
 describe("interview transcription lifecycle", () => {
+  it("renders consecutive STT sentences as one turn, keeping repeated sentences", async () => {
+    const { room, result } = await connected()
+    for (const [text, final] of [
+      ["First sentence.", false],
+      ["First sentence. First sentence.", false],
+      ["First sentence. First sentence. Last sentence.", true],
+    ] as const) {
+      const reader = new ControlledReader("turn-one", final)
+      reader.push(text)
+      reader.push(null)
+      await act(async () => {
+        // Custom user text is published by the agent, not the candidate.
+        await room.receive(reader, "agent", "interview.user_transcription")
+      })
+      expect(result.current.messages).toHaveLength(1)
+    }
+    expect(result.current.messages[0]).toMatchObject({
+      who: "user",
+      text: "First sentence. First sentence. Last sentence.",
+      interim: false,
+      incomplete: false,
+    })
+    const next = new ControlledReader("turn-two", true)
+    next.push("First sentence.")
+    next.push(null)
+    await act(async () => {
+      await room.receive(next)
+    })
+    // A new confirmed turn stays separate, even without intervening agent text.
+    expect(result.current.messages).toHaveLength(2)
+  })
+
+  it("ignores native user STT segments when receiving grouped turns", async () => {
+    const { room, result } = await connected()
+    const sentence = new ControlledReader("sentence", true)
+    sentence.push("One sentence")
+    sentence.push(null)
+    await act(async () => {
+      await room.receive(sentence, "candidate", "lk.transcription")
+    })
+    expect(result.current.messages).toEqual([])
+    const turn = new ControlledReader("turn", true)
+    turn.push("One sentence. Another sentence.")
+    turn.push(null)
+    await act(async () => {
+      await room.receive(turn, "agent", "interview.user_transcription")
+    })
+    expect(result.current.messages).toHaveLength(1)
+    expect(result.current.messages[0].text).toBe(
+      "One sentence. Another sentence."
+    )
+  })
+
   it("keeps a failed partial when a new segment repeats it (legacy lastSegmentRef case)", async () => {
     const { room, result } = await connected()
     const old = new ControlledReader("old")

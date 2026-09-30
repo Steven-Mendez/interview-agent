@@ -50,6 +50,10 @@ Speculative generation is disabled because the LangGraph tools persist milestone
 
 Failed or abandoned transcription streams keep any received text marked **Incomplete transcription**. Brief reconnects can continue the existing stream; a reader that receives no data for 30 seconds is cancelled and marked incomplete without ending the interview. The **Enable audio** control appears when the browser blocks playback.
 
+User bubbles follow conversation turns rather than individual STT sentences. The worker forwards cumulative text on `interview.user_transcription` under one id until `conversation_item_added` confirms the exact reply. Repeated sentences are preserved; separate confirmed turns keep separate ids. Agent speech continues using LiveKit's synchronized `lk.transcription` stream. Upgrade worker and frontend together for this protocol.
+
+The minimum endpointing delay is 1.5 seconds; the longer hesitation delay remains 2.5 seconds. This covers the 1.17-second late STT final observed in the September 30 voice test, with a margin, and costs up to 1.2 seconds more waiting than the previous minimum. Local SDK regression tests reproduce the old split and verify that this tail stays in one turn. Longer provider stalls can still require further measurement; post-change microphone tests in Chrome and Safari remain pending.
+
 ## Upgrading from the Qdrant version
 
 Removing Qdrant from Compose does not delete existing containers or the `qdrant_data` volume. The current retention job only manages Postgres; legacy vector data needs a one-time cleanup by the deployment operator.

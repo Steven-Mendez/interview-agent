@@ -1,5 +1,6 @@
 import * as React from "react"
 import { Room, RoomEvent } from "livekit-client"
+import type { TextStreamHandler } from "livekit-client"
 
 import { getInterviewToken, ApiError } from "@/lib/api"
 import { log } from "@/lib/log"
@@ -184,17 +185,19 @@ export function useInterviewSession(interviewId: string): InterviewSession {
       // invalidates both user and agent transcription streams it produced.
       r.on(RoomEvent.ParticipantDisconnected, cancelTranscriptions)
       r.on(RoomEvent.Disconnected, cancelTranscriptions)
-      // One handler per topic per Room, registered before connect.
-      r.registerTextStreamHandler(
-        "lk.transcription",
+      // The worker groups user STT sentences until LiveKit confirms a turn.
+      // Keep the official topic for the agent's audio-synchronized text.
+      const handler =
+        (isUserTurn: boolean): TextStreamHandler =>
         async (reader, participantInfo) => {
           if (disposedRef.current || roomRef.current !== r) return
+          if (!isUserTurn && participantInfo.identity === "candidate") return
           const attrs = reader.info.attributes ?? {}
           const segmentId = attrs["lk.segment_id"] ?? reader.info.id
           if (!attrs["lk.segment_id"]) {
             console.warn("[app] transcription stream without lk.segment_id")
           }
-          const isUser = participantInfo.identity === "candidate"
+          const isUser = isUserTurn
           const seg = bubbleFor(segmentId, isUser ? "user" : "agent")
           const controller = new AbortController()
           readersRef.current.set(controller, seg)
@@ -256,7 +259,8 @@ export function useInterviewSession(interviewId: string): InterviewSession {
             readersRef.current.delete(controller)
           }
         }
-      )
+      r.registerTextStreamHandler("lk.transcription", handler(false))
+      r.registerTextStreamHandler("interview.user_transcription", handler(true))
     },
     [bubbleFor, setBubbleText, finalizeBubble, cancelTranscriptions]
   )

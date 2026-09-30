@@ -5,7 +5,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from livekit import rtc
-from livekit.agents import AgentSession, ConversationItemAddedEvent, UserInputTranscribedEvent
+from livekit.agents import (
+    AgentSession,
+    AgentStateChangedEvent,
+    ConversationItemAddedEvent,
+    UserInputTranscribedEvent,
+    UserStateChangedEvent,
+)
 from livekit.agents.llm import ChatMessage
 
 from interview_agent import user_transcript
@@ -32,6 +38,22 @@ async def flush():
 
 def room_for(send):
     return SimpleNamespace(local_participant=SimpleNamespace(send_text=send))
+
+
+def agent_speaks(session):
+    session.emit(
+        "agent_state_changed",
+        AgentStateChangedEvent(old_state="thinking", new_state="speaking"),
+    )
+
+
+def assistant_item(session, *, interrupted=False):
+    session.emit(
+        "conversation_item_added",
+        ConversationItemAddedEvent(
+            item=ChatMessage(role="assistant", content=["Next question"], interrupted=interrupted)
+        ),
+    )
 
 
 async def test_forwarder_can_be_registered_before_job_room_connects():
@@ -177,10 +199,8 @@ async def test_assistant_boundary_preserves_orphan_and_starts_a_new_user_turn():
     forwarder = UserTranscriptForwarder(session, room_for(send))
     transcribe(session, "Orphaned answer")
     await flush()
-    session.emit(
-        "conversation_item_added",
-        ConversationItemAddedEvent(item=ChatMessage(role="assistant", content=["Next question"])),
-    )
+    agent_speaks(session)
+    assistant_item(session)
     await flush()
     orphan = send.call_args
     assert orphan.args == ("Orphaned answer",)
@@ -194,6 +214,78 @@ async def test_assistant_boundary_preserves_orphan_and_starts_a_new_user_turn():
         send.call_args.kwargs["attributes"]["lk.segment_id"]
         != (orphan.kwargs["attributes"]["lk.segment_id"])
     )
+
+
+async def test_interrupted_assistant_item_keeps_the_user_turn_until_commit():
+    session = AgentSession(vad=None)
+    send = AsyncMock()
+    forwarder = UserTranscriptForwarder(session, room_for(send))
+    transcribe(session, "A")
+    transcribe(session, "B")
+    agent_speaks(session)
+    await flush()
+    assistant_item(session, interrupted=True)
+    await flush()
+    transcribe(session, "C")
+    await flush()
+    commit(session, "A B C")
+    await forwarder.aclose()
+    assert len({c.kwargs["attributes"]["lk.segment_id"] for c in send.call_args_list}) == 1
+    assert all(
+        c.kwargs["attributes"]["interview.incomplete"] == "false" for c in send.call_args_list
+    )
+    assert send.call_args.args == ("A B C",)
+    assert send.call_args.kwargs["attributes"]["lk.transcription_final"] == "true"
+
+
+async def test_late_stt_during_agent_speech_does_not_create_an_orphan():
+    session = AgentSession(vad=None)
+    send = AsyncMock()
+    forwarder = UserTranscriptForwarder(session, room_for(send))
+    transcribe(session, "A")
+    agent_speaks(session)
+    transcribe(session, "B")
+    await flush()
+    assistant_item(session)
+    commit(session, "A B")
+    await forwarder.aclose()
+    assert len({c.kwargs["attributes"]["lk.segment_id"] for c in send.call_args_list}) == 1
+    assert send.call_args.args == ("A B",)
+
+
+async def test_audio_barge_in_before_stt_invalidates_orphan_boundary():
+    session = AgentSession(vad=None)
+    send = AsyncMock()
+    forwarder = UserTranscriptForwarder(session, room_for(send))
+    transcribe(session, "A")
+    await flush()
+    agent_speaks(session)
+    session.emit(
+        "user_state_changed", UserStateChangedEvent(old_state="listening", new_state="speaking")
+    )
+    assistant_item(session)
+    session.emit(
+        "user_state_changed", UserStateChangedEvent(old_state="speaking", new_state="listening")
+    )
+    transcribe(session, "B")
+    commit(session, "A B")
+    await forwarder.aclose()
+    assert len({c.kwargs["attributes"]["lk.segment_id"] for c in send.call_args_list}) == 1
+    assert send.call_args.args == ("A B",)
+
+
+async def test_assistant_item_without_speech_boundary_keeps_ambiguous_user_text():
+    session = AgentSession(vad=None)
+    send = AsyncMock()
+    forwarder = UserTranscriptForwarder(session, room_for(send))
+    transcribe(session, "A")
+    await flush()
+    assistant_item(session)
+    transcribe(session, "B")
+    commit(session, "A B")
+    await forwarder.aclose()
+    assert len({c.kwargs["attributes"]["lk.segment_id"] for c in send.call_args_list}) == 1
+    assert send.call_args.args == ("A B",)
 
 
 async def test_failed_final_is_retried_with_same_id_and_later_turn_is_not_lost():

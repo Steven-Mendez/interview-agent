@@ -177,3 +177,27 @@ async def test_fence_uses_database_time_after_waiting_for_the_row_lock(postgres_
             await write
     async with postgres_sessionmaker() as session:
         assert await db.get_messages(session, interview_id) == []
+
+
+async def test_worker_fenced_session_registers_and_exports_its_trace(postgres_sessionmaker):
+    from types import SimpleNamespace
+
+    from interview_agent.privacy import guarded_export, register_trace
+
+    interview_id = await seed(postgres_sessionmaker)
+    trace_id = uuid.uuid4()
+    settings = SimpleNamespace(
+        langsmith_endpoint="https://api.smith.langchain.com",
+        langsmith_project="interview-agent",
+        metrics_detail_days=30,
+    )
+    # The API registers the trace first; the worker joins it from its fenced
+    # session, whose ownership check has already begun a transaction.
+    created = await register_trace(postgres_sessionmaker, trace_id, interview_id, settings)
+    worker = workers.WorkerCoordinator(interview_id, postgres_sessionmaker)
+    await worker.claim()
+    joined = await register_trace(worker.sessionmaker, trace_id, interview_id, settings)
+    assert joined == ("existing", created[1])
+    sent = []
+    assert await guarded_export(worker.sessionmaker, trace_id, lambda: sent.append(True))
+    assert sent == [True]

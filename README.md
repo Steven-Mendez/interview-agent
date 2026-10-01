@@ -56,7 +56,14 @@ In the normal closing flow, the browser plays the localized farewell and sends a
 
 The results distinguish coverage from ability and show criterion evidence and suggested practice. **Request new assessment** creates a separate request while retaining the earlier feedback; an uncertain HTTP reply keeps the same request identity on retry. **Evaluation history** includes earlier results and failed attempts. **Review saved answers** supports explicit incident decisions and new transcript versions; it preserves old versions and assessments, and a confirmed omission keeps the affected old global score hidden. These controls are optional and do not require a manual review to conduct an interview.
 
-The current endpointing delays are 1.5 seconds minimum and 2.5 seconds for longer hesitation. SDK and synthetic-audio integration tests cover the implemented contracts; they do not establish physical microphone behavior, audible latency or improved interview quality. The **Metrics** page shows latency, spend and closing outcomes recorded from metadata only; setting `LANGSMITH_API_KEY` additionally exports content-free traces.
+The current endpointing delays are 1.5 seconds minimum and 2.5 seconds for longer hesitation. SDK and synthetic-audio integration tests cover the implemented contracts; they do not establish physical microphone behavior, audible latency or improved interview quality. The **Metrics** page shows latency, spend and closing outcomes recorded from metadata only, and local logs never contain interview content.
+
+LangSmith is optional, and setting `LANGSMITH_API_KEY` is the consent to send it the interviews' **content**. Without the key nothing is sent. With it, each interview produces two kinds of traces, grouped in one LangSmith thread (shared by repeats of the same interview) and linked from the interview page:
+
+- **The interview trace** (`interview`): `planner` (CV, job offer, settings and the resulting plan), `worker` (the plan and the final transcript) and `evaluator` (transcript in; score, evidence and comments out).
+- **The voice session trace**, one per worker run, in the shape of LangSmith's official LiveKit integration: its root carries the **stereo audio recording** (candidate and interviewer) and the conversation, so LangSmith shows it as a voice conversation; below it every turn with what the candidate said according to the transcription, the interviewer's reply, STT/LLM/TTS latencies, and inside each reply the decision graph and the model call with its prompt, answer, tokens and cost (counted once).
+
+Both are deleted from LangSmith `METRICS_DETAIL_DAYS` days after the interview (default 30), or when the interview is deleted. With a LiveKit Cloud project that has agent observability enabled, LiveKit Cloud also receives the recording, under LiveKit's own retention. `uv run python scripts/verify_langsmith.py` checks export of both traces (audio included) and their deletion live with synthetic content; `--inspect <interview-id>` summarizes a real interview's traces.
 
 ## Development (local)
 
@@ -78,5 +85,7 @@ cd web && pnpm install && pnpm dev
 ```
 
 Open <http://localhost:3000> for the dev frontend. (The uvicorn on :8000 serves the last `pnpm build` output, if any — production behavior.)
+
+Tests need only Docker running: `uv run pytest` starts a throwaway Postgres 16 container for the session and removes it afterwards (no `.env`, no running database). To use an existing database instead, set `TEST_DATABASE_URL` to one whose name ends in `_test` (CI does this with its service container).
 
 > **Note on language and voice:** the interview language, the agent's name and its voice are set in the in-app Settings screen (not in `.env`). Speech recognition and synthesis are pinned to the configured language; the voice catalog lives in `interview_agent/voices.py`.

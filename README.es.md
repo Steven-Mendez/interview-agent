@@ -56,7 +56,14 @@ En el cierre normal, el navegador reproduce la despedida localizada y envía una
 
 Los resultados separan cobertura de capacidad y muestran evidencia por criterio y práctica sugerida. **Request new assessment** crea una solicitud distinta conservando el feedback anterior; si se pierde la respuesta HTTP, el reintento mantiene la misma identidad. **Evaluation history** incluye resultados anteriores e intentos fallidos. **Review saved answers** permite decidir incidentes expresamente y crear nuevas versiones del transcript; conserva versiones y evaluaciones previas, y una omisión confirmada mantiene oculta la puntuación global antigua afectada. Estos controles son opcionales y no exigen revisión manual para realizar una entrevista.
 
-Las esperas actuales de cierre de turno son 1,5 segundos como mínimo y 2,5 segundos para dudas más largas. Las pruebas SDK y de audio sintético cubren los contratos implementados; no acreditan comportamiento del micrófono físico, latencia audible ni mejora de calidad de entrevista. La página **Metrics** muestra latencia, gasto y resultados de cierre registrados solo como metadatos; con `LANGSMITH_API_KEY` se exportan además trazas sin contenido.
+Las esperas actuales de cierre de turno son 1,5 segundos como mínimo y 2,5 segundos para dudas más largas. Las pruebas SDK y de audio sintético cubren los contratos implementados; no acreditan comportamiento del micrófono físico, latencia audible ni mejora de calidad de entrevista. La página **Metrics** muestra latencia, gasto y resultados de cierre registrados solo como metadatos, y los logs locales nunca contienen el contenido de las entrevistas.
+
+LangSmith es opcional, y configurar `LANGSMITH_API_KEY` es el consentimiento para enviarle el **contenido** de las entrevistas. Sin la key no se envía nada. Con ella, cada entrevista genera dos tipos de trazas, agrupadas en un mismo hilo (thread) de LangSmith (compartido por las repeticiones de la misma entrevista) y enlazadas desde la página de la entrevista:
+
+- **La traza de la entrevista** (`interview`): `planner` (CV, oferta, ajustes y el plan resultante), `worker` (el plan y la transcripción final) y `evaluator` (entra la transcripción; salen nota, evidencia y comentarios).
+- **La traza de la sesión de voz**, una por cada ejecución del worker, con la forma de la integración oficial de LangSmith con LiveKit: su raíz lleva la **grabación de audio estéreo** (candidato y entrevistador) y la conversación, así que LangSmith la muestra como conversación de voz; debajo, cada turno con lo que dijo el candidato según la transcripción, la respuesta del entrevistador, latencias de STT/LLM/TTS y, dentro de cada respuesta, el grafo de decisión y la llamada al modelo con su prompt, respuesta, tokens y coste (contado una sola vez).
+
+Ambas se borran de LangSmith `METRICS_DETAIL_DAYS` días después de la entrevista (30 por defecto), o al borrar la entrevista. Con un proyecto de LiveKit Cloud que tenga activada la observabilidad de agentes, LiveKit Cloud también recibe la grabación, con la retención propia de LiveKit. `uv run python scripts/verify_langsmith.py` comprueba en vivo la exportación de ambas trazas (audio incluido) y su borrado con contenido sintético; `--inspect <id-entrevista>` resume las trazas de una entrevista real.
 
 ## Desarrollo (local)
 
@@ -78,5 +85,7 @@ cd web && pnpm install && pnpm dev
 ```
 
 Abre <http://localhost:3000> para el frontend de desarrollo. (El uvicorn en :8000 sirve el último `pnpm build`, si existe — el comportamiento de producción.)
+
+Los tests solo necesitan Docker en marcha: `uv run pytest` levanta un Postgres 16 desechable para la sesión y lo elimina al terminar (sin `.env` ni base de datos levantada). Para usar una base existente, define `TEST_DATABASE_URL` con una cuyo nombre termine en `_test` (CI lo hace con su contenedor de servicio).
 
 > **Nota sobre el idioma y la voz:** el idioma de la entrevista, el nombre del agente y su voz se configuran en la pantalla Settings de la app (no en el `.env`). El reconocimiento y la síntesis de voz quedan fijados al idioma configurado; el catálogo de voces vive en `interview_agent/voices.py`.

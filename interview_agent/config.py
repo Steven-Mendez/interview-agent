@@ -76,7 +76,7 @@ class Settings(BaseSettings):
 
     # Content stays in Postgres. External traces contain metadata only.
     langsmith_api_key: str = Field(default="", alias="LANGSMITH_API_KEY", repr=False)
-    langsmith_project: str = Field(default="interview-agent-v2", alias="LANGSMITH_PROJECT")
+    langsmith_project: str = Field(default="interview-agent", alias="LANGSMITH_PROJECT")
     langsmith_endpoint: str = Field(
         default="https://api.smith.langchain.com", alias="LANGSMITH_ENDPOINT"
     )

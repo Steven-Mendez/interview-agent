@@ -6,6 +6,7 @@ import { AssessmentRequest } from "@/components/assessment-request"
 import { useEvaluationRequest } from "@/hooks/use-evaluation-request"
 import { TranscriptReview } from "@/components/transcript-review"
 import { EvaluationHistory } from "@/components/evaluation-history"
+import { TraceLink } from "@/components/trace-link"
 import { QuestionRecovery } from "@/components/question-recovery"
 import * as React from "react"
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router"
@@ -930,6 +931,10 @@ function ResultsPanel({
             )}
           />
           <TranscriptReview interviewId={interview.id} />
+          <TraceLink
+            url={interview.langsmith_url}
+            voiceUrls={interview.langsmith_voice_urls}
+          />
         </div>
       </PageContainer>
     </PageShell>
@@ -1225,6 +1230,10 @@ function Evaluation({ interview }: { interview: Interview }) {
             )}
           />
           <TranscriptCard interviewId={interview.id} />
+          <TraceLink
+            url={interview.langsmith_url}
+            voiceUrls={interview.langsmith_voice_urls}
+          />
 
           {repeat.isError && (
             <Alert variant="destructive">

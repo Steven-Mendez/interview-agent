@@ -9,7 +9,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import timedelta
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 
 import httpx
 from sqlalchemy import delete, func, or_, select
@@ -24,10 +25,30 @@ VERIFICATION_DAYS = 14
 LEASE_SECONDS = 45
 
 
-async def register_trace(sessionmaker, trace_id, conversation_id, settings) -> bool:
+@asynccontextmanager
+async def _transaction(sessionmaker):
+    """One transaction for the API's plain sessions and the worker's fenced ones.
+    A FencedSession checks ownership on entry, which already begins a
+    transaction, so begin() would raise; its commit rechecks the fence."""
+    async with sessionmaker() as session:
+        if not session.in_transaction():
+            async with session.begin():
+                yield session
+            return
+        yield session
+        await session.commit()
+
+
+async def register_trace(
+    sessionmaker, trace_id, conversation_id, settings
+) -> tuple[str, datetime] | None:
+    """Returns ("created", root start) for the first process of an interview,
+    ("existing", root start) for later ones, or None when the interview no
+    longer exists. Every process places its runs under the same root start,
+    which LangSmith's dotted_order requires to be identical."""
     if sessionmaker is None:
         raise RuntimeError("External export requires durable privacy storage")
-    async with sessionmaker() as session, session.begin():
+    async with _transaction(sessionmaker) as session:
         # Registration races content deletion under the same conversation lock;
         # network exports never hold this lock or delay the voice turn.
         conversation = await session.scalar(
@@ -36,24 +57,31 @@ async def register_trace(sessionmaker, trace_id, conversation_id, settings) -> b
             .with_for_update()
         )
         if conversation is None:
-            return False
+            return None
         now = await session.scalar(select(func.clock_timestamp()))
-        await session.execute(
+        inserted = await session.scalar(
             insert(db.ExternalTrace)
             .values(
                 id=trace_id,
                 conversation_id=conversation_id,
                 endpoint=settings.langsmith_endpoint.rstrip("/"),
                 project_name=settings.langsmith_project,
+                created_at=now,
                 expires_at=now + timedelta(days=settings.metrics_detail_days),
             )
             .on_conflict_do_nothing(index_elements=[db.ExternalTrace.id])
+            .returning(db.ExternalTrace.created_at)
         )
-        return True
+        if inserted is not None:
+            return "created", inserted
+        started = await session.scalar(
+            select(db.ExternalTrace.created_at).where(db.ExternalTrace.id == trace_id)
+        )
+        return "existing", started
 
 
 async def guarded_export(sessionmaker, trace_id, operation) -> bool:
-    async with sessionmaker() as session, session.begin():
+    async with _transaction(sessionmaker) as session:
         row = await session.scalar(
             select(db.ExternalTrace).where(db.ExternalTrace.id == trace_id).with_for_update()
         )
@@ -118,10 +146,16 @@ async def delete_conversation(session, conversation_id) -> bool:
     return True
 
 
+def api_root(endpoint: str) -> str:
+    """Host root for versioned routes; accepts endpoints given with /api/v1."""
+    root = endpoint.rstrip("/")
+    return root.removesuffix("/api/v1") + "/"
+
+
 class LangSmithDeletionAPI:
     def __init__(self, settings, *, transport=None):
         self.client = httpx.AsyncClient(
-            base_url=settings.langsmith_endpoint.rstrip("/") + "/",
+            base_url=api_root(settings.langsmith_endpoint),
             headers={"x-api-key": settings.langsmith_api_key},
             timeout=5,
             transport=transport,
@@ -130,25 +164,22 @@ class LangSmithDeletionAPI:
     async def close(self):
         await self.client.aclose()
 
-    async def project_id(self, name):
+    async def project(self, name) -> dict:
         response = await self.client.get(
-            "sessions", params={"name": name, "limit": 1, "include_stats": "false"}
+            "api/v1/sessions", params={"name": name, "limit": 1, "include_stats": "false"}
         )
         response.raise_for_status()
         rows = response.json()
         if not rows or rows[0].get("name") != name:
             raise LookupError("project_not_found")
-        return uuid.UUID(rows[0]["id"])
+        return rows[0]
+
+    async def project_id(self, name):
+        return uuid.UUID((await self.project(name))["id"])
 
     async def submit(self, trace_id, project_id):
-        # The SDK endpoint normally omits /api/v1 for public routes; use the
-        # documented deletion URL explicitly, preserving regional base hosts.
         response = await self.client.post(
-            (
-                "runs/delete"
-                if self.client.base_url.path.rstrip("/").endswith("/api/v1")
-                else "api/v1/runs/delete"
-            ),
+            "api/v1/runs/delete",
             json={
                 "trace_ids": [str(trace_id)],
                 "session_id": str(project_id),
@@ -156,21 +187,27 @@ class LangSmithDeletionAPI:
         )
         response.raise_for_status()
 
-    async def absent(self, trace_id, project_id):
+    async def absent(self, trace_id, project_id, since):
+        # v1 /runs/query is deprecated (Cloud removal 2027-01-31). v2 searches
+        # only the last 24 hours unless told otherwise, which would report an
+        # older, still existing trace as deleted: the window starts before the
+        # trace was registered.
         response = await self.client.post(
-            "runs/query",
+            "api/v2/runs/query",
             json={
-                "trace": str(trace_id),
-                "session": [str(project_id)],
-                "limit": 1,
-                "select": ["id"],
+                "project_ids": [str(project_id)],
+                "trace_id": str(trace_id),
+                "min_start_time": (since - timedelta(days=1)).isoformat(),
+                "selects": ["ID"],
+                "page_size": 1,
             },
         )
         response.raise_for_status()
         body = response.json()
-        if not isinstance(body, dict) or not isinstance(body.get("runs"), list):
+        runs = body.get("items", body.get("runs")) if isinstance(body, dict) else None
+        if not isinstance(runs, list):
             raise ValueError("invalid_verification_response")
-        return not body["runs"]
+        return not runs
 
 
 class ExternalDeletionWorker:
@@ -220,11 +257,12 @@ class ExternalDeletionWorker:
                 row.attempts += 1  # reserved before any external request
             row.lease_owner = owner
             row.lease_until = now + timedelta(seconds=LEASE_SECONDS)
-            identifier, project_name, project_id, phase = (
+            identifier, project_name, project_id, phase, registered = (
                 row.id,
                 row.project_name,
                 row.project_id,
                 row.state,
+                row.created_at,
             )
 
         error, absent, submitted = None, False, False
@@ -235,7 +273,7 @@ class ExternalDeletionWorker:
                     await self.api.submit(identifier, project_id)
                     submitted = True
                 else:
-                    absent = await self.api.absent(identifier, project_id)
+                    absent = await self.api.absent(identifier, project_id, registered)
         except Exception as exc:
             # Never persist response bodies or exception messages containing keys.
             error = type(exc).__name__

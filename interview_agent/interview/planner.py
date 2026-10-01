@@ -87,7 +87,8 @@ async def run_planner(
         ]
         for attempt in range(2):
             try:
-                # Automatic LangSmith capture is disabled: our observer exports metadata only.
+                # Automatic LangSmith capture is disabled: our observer exports this call
+                # inside the interview trace instead of a separate one.
                 with tracing_context(enabled=False):
                     result = await llm.ainvoke(messages, config=config)
                 if not isinstance(result, InterviewPlan):

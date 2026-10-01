@@ -3,15 +3,14 @@ mocked out.
 
 The app is assembled by hand (router + app.state) instead of importing the
 real `app`, whose lifespan needs validated API keys. The test
-database is created on the fly; locally it lands on the docker-compose
-Postgres, in CI on the service container (TEST_DATABASE_URL overrides).
+database is created on the fly in the session's Postgres (conftest: a throwaway
+container locally, CI's service container via TEST_DATABASE_URL).
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import os
 import uuid
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -21,7 +20,6 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, func, select, text, update
-from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from interview_agent.config import settings
@@ -44,11 +42,6 @@ from interview_agent.interview.seals import ensure_seal
 from interview_agent.prompts import length_for
 from interview_agent.server import evaluations, routes
 from interview_agent.voices import VOICES
-
-TEST_DATABASE_URL = os.environ.get(
-    "TEST_DATABASE_URL",
-    "postgresql+asyncpg://interview:interview@localhost:5432/interview_test",
-)
 
 
 def _plan(detected: Seniority | None = Seniority.MID) -> InterviewPlan:
@@ -80,9 +73,8 @@ def _evaluation() -> EvaluationResult:
     )
 
 
-async def _ensure_test_database() -> None:
+async def _ensure_test_database(url) -> None:
     """CREATE DATABASE if missing — Postgres has no CREATE ... IF NOT EXISTS."""
-    url = make_url(TEST_DATABASE_URL)
     if not url.database or not url.database.endswith("_test"):
         raise ValueError("Route tests require a dedicated *_test database")
     admin = create_async_engine(
@@ -100,9 +92,11 @@ async def _ensure_test_database() -> None:
 
 
 @pytest.fixture
-async def client_and_sessionmaker(monkeypatch):
-    await _ensure_test_database()
-    engine, sessionmaker = db.create_engine_and_sessionmaker(TEST_DATABASE_URL)
+async def client_and_sessionmaker(monkeypatch, integration_database_url):
+    await _ensure_test_database(integration_database_url)
+    engine, sessionmaker = db.create_engine_and_sessionmaker(
+        integration_database_url.render_as_string(hide_password=False)
+    )
     async with engine.begin() as conn:
         # The test database persists across runs and create_all never ALTERs
         # an existing table — rebuild from scratch so schema changes (new
@@ -2170,3 +2164,55 @@ async def test_question_limit_above_eight_is_reachable_and_effective_limit_is_ho
     # One primary question per planned topic: never display an unreachable 12.
     assert fewer["question_limit"] == 9
     assert fewer["run_config"]["requested_question_limit"] == 12
+
+
+async def test_interview_links_to_its_langsmith_trace_only_while_exported(
+    client_and_sessionmaker, monkeypatch
+):
+    import httpx
+
+    from interview_agent import observability
+    from interview_agent.config import Settings
+    from interview_agent.privacy import LangSmithDeletionAPI, register_trace, retire_traces
+
+    client, sessionmaker = client_and_sessionmaker
+    tenant, project = uuid.uuid4(), uuid.uuid4()
+
+    def respond(request):
+        assert request.url.path == "/api/v1/sessions"
+        return httpx.Response(
+            200,
+            json=[{"id": str(project), "tenant_id": str(tenant), "name": "interview-agent"}],
+        )
+
+    configured = Settings(_env_file=None, LANGSMITH_API_KEY="synthetic-test-key")
+    monkeypatch.setattr(
+        observability,
+        "LangSmithDeletionAPI",
+        lambda s: LangSmithDeletionAPI(s, transport=httpx.MockTransport(respond)),
+    )
+    links = observability.TraceLinks(configured)
+    assert await links.resolve()
+    client._transport.app.state.trace_links = links
+    interview_id = await _seed_finished_interview(sessionmaker)
+    detail = (await client.get(f"/api/interviews/{interview_id}")).json()
+    assert detail["langsmith_url"] is None  # never exported: no dead link
+    trace_id = observability.interview_trace_id(interview_id)
+    await register_trace(sessionmaker, trace_id, interview_id, configured)
+    detail = (await client.get(f"/api/interviews/{interview_id}")).json()
+    assert detail["langsmith_url"] == (
+        f"https://smith.langchain.com/o/{tenant}/projects/p/{project}/r/{trace_id}?poll=true"
+    )
+    assert detail["langsmith_voice_urls"] == []
+    # Each worker run of the interview registers its voice session's trace.
+    voice = uuid.uuid4()
+    await register_trace(sessionmaker, voice, interview_id, configured)
+    detail = (await client.get(f"/api/interviews/{interview_id}")).json()
+    assert detail["langsmith_voice_urls"] == [
+        f"https://smith.langchain.com/o/{tenant}/projects/p/{project}/r/{voice}?poll=true"
+    ]
+    async with sessionmaker() as session:
+        await retire_traces(session, conversation_id=interview_id)
+        await session.commit()
+    detail = (await client.get(f"/api/interviews/{interview_id}")).json()
+    assert detail["langsmith_url"] is None and detail["langsmith_voice_urls"] == []

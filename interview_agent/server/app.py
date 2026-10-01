@@ -21,6 +21,7 @@ from interview_agent.interview import db
 from interview_agent.interview.db import create_engine_and_sessionmaker
 from interview_agent.logging_config import setup_file_logging
 from interview_agent.metrics import purge_metrics
+from interview_agent.observability import TraceLinks
 from interview_agent.privacy import ExternalDeletionWorker
 from interview_agent.runtime import process_manifest, record_manifest, validate_database_revision
 from interview_agent.server.evaluations import EvaluationRunner
@@ -115,6 +116,8 @@ async def lifespan(app: FastAPI):
 
     purge_task = asyncio.create_task(_purge_loop(sessionmaker))
     deletion_task = asyncio.create_task(ExternalDeletionWorker(sessionmaker, settings).run())
+    app.state.trace_links = TraceLinks(settings) if settings.langsmith_api_key else None
+    links_task = asyncio.create_task(app.state.trace_links.run()) if app.state.trace_links else None
     sweep_task = asyncio.create_task(
         LifecycleSweeper(sessionmaker, settings, app.state.evaluations).run()
     )
@@ -127,6 +130,10 @@ async def lifespan(app: FastAPI):
         deletion_task.cancel()
         with suppress(asyncio.CancelledError):
             await deletion_task
+        if links_task is not None:
+            links_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await links_task
         sweep_task.cancel()
         with suppress(asyncio.CancelledError):
             await sweep_task

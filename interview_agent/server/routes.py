@@ -41,7 +41,14 @@ from interview_agent.interview.seals import result_invalid, seal_invalid
 from interview_agent.interview.workers import reconnect_deadline
 from interview_agent.llm import summarize_usage
 from interview_agent.metrics import apply_filters, metrics_report, record_metric
-from interview_agent.observability import LLMObserver, Telemetry, content_hash, execution_config
+from interview_agent.observability import (
+    LLMObserver,
+    Telemetry,
+    content_hash,
+    execution_config,
+    interview_trace_id,
+    send_trace_feedback,
+)
 from interview_agent.playback import PlaybackAck, acknowledge_playback, closing_state
 from interview_agent.prompts import DEFAULT_SENIORITY, fit_length, followup_budget, length_for
 from interview_agent.server import evaluations
@@ -171,6 +178,10 @@ async def record_response_onset(request: Request, interview_id: uuid.UUID, body:
             )
         except IntegrityError:
             return {"accepted": True, "duplicate": True}
+    # Also on the interview's LangSmith trace, without delaying the browser.
+    send_trace_feedback(
+        _sessionmaker(request), settings, interview_id, "response_onset_seconds", body.seconds
+    )
     return {"accepted": True}
 
 
@@ -868,6 +879,19 @@ async def _plan_and_persist(
             settings,
             run_config,
             defer_dimensions=requested_seniority is None,
+            process="planner",
+            thread_of=repeat_of_id,
+            # The interview's inputs; also the root's, the planner registers it.
+            inputs={
+                "resume_markdown": resume_markdown,
+                "resume_filename": resume_filename,
+                "job_offer": job_offer,
+                "interviewer": interviewer,
+                "requested_seniority": requested_seniority.value if requested_seniority else None,
+                "interview_length": length.value,
+                "max_minutes": max_minutes,
+                "question_limit": question_limit,
+            },
         )
         observer = LLMObserver(
             telemetry, "planner", settings.planner_model, settings.planner_reasoning_effort
@@ -897,15 +921,25 @@ async def _plan_and_persist(
                     "seniority": (requested_seniority or plan.detected_seniority).value,
                 }
             )
+            telemetry.set_outputs(plan)
+            telemetry.annotate(
+                outcome="planned",
+                milestones=len(plan.milestones),
+                question_limit=min(question_limit, len(plan.milestones)),
+                seniority_source="explicit" if requested_seniority else "detected",
+            )
         except Exception as exc:
             logger.exception("planning failed for %s", conversation_id)
+            telemetry.annotate(outcome="error")
+            telemetry.set_outputs({"error": type(exc).__name__, "detail": str(exc)})
             await db.set_status(session, conversation_id, "error")
             # The attempts inside with_retry were real spend even though no
             # plan came out of them.
             await evaluations.record_spent_usage(session, conversation_id, "planner", planner_usage)
             raise HTTPException(status_code=500, detail=f"Planning failed: {exc}") from exc
         finally:
-            await telemetry.drain()
+            # Planning runs inside the HTTP request: keep the previous bound.
+            await telemetry.drain(timeout_seconds=5)
 
         await db.add_token_usage(
             session, conversation_id, "planner", summarize_usage(planner_usage.usage_metadata)
@@ -1136,7 +1170,7 @@ async def get_interview(request: Request, interview_id: uuid.UUID):
         if conversation.status in ("interviewing", "closing"):
             await reconcile_interview(session, interview_id, settings)
             await session.refresh(conversation)
-        return _serialize(
+        body = _serialize(
             conversation,
             await session.scalar(select(func.clock_timestamp())),
             evaluation_invalid=await result_invalid(
@@ -1145,6 +1179,35 @@ async def get_interview(request: Request, interview_id: uuid.UUID):
                 conversation.evaluation.result if conversation.evaluation else None,
             ),
         )
+        body["langsmith_url"], body["langsmith_voice_urls"] = await _trace_urls(
+            request, session, interview_id
+        )
+        return body
+
+
+async def _trace_urls(
+    request: Request, session, interview_id: uuid.UUID
+) -> tuple[str | None, list[str]]:
+    """Links to the interview's LangSmith trace and its voice sessions (one per
+    worker run: a resumed interview has several) while exported, not retired."""
+    links = getattr(request.app.state, "trace_links", None)
+    if links is None or links.base is None:
+        return None, []
+    traces = list(
+        await session.scalars(
+            select(db.ExternalTrace)
+            .where(
+                db.ExternalTrace.conversation_id == interview_id,
+                db.ExternalTrace.state == "active",
+            )
+            .order_by(db.ExternalTrace.created_at)
+        )
+    )
+    interview = interview_trace_id(interview_id)
+    return (
+        links.url(interview) if any(t.id == interview for t in traces) else None,
+        [links.url(t.id) for t in traces if t.id != interview],
+    )
 
 
 @router.get("/interviews/{interview_id}/evaluations")

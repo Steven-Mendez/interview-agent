@@ -7,23 +7,44 @@ import os
 # calibration suite keeps the real key from .env.
 if os.environ.get("RUN_LIVE_LLM_TESTS") != "1":
     os.environ["OPENAI_API_KEY"] = "synthetic-offline-test-key"
+# No suite exports to the developer's LangSmith (a real key would send synthetic
+# interviews there); export tests pass their own key. The project is pinned to
+# the default the tests' fake LangSmith responses name.
+# scripts/verify_langsmith.py is the live check.
+os.environ["LANGSMITH_API_KEY"] = ""
+os.environ["LANGSMITH_PROJECT"] = "interview-agent"
+os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
+from testcontainers.community.postgres import PostgresContainer
 
 from interview_agent.interview import db
 
 
+@pytest.fixture(scope="session")
+def integration_database_url():
+    """TEST_DATABASE_URL when set (e.g. CI's Postgres service), else a throwaway
+    Postgres container for this session, so Docker is the only local setup. It
+    starts only when a test needs the database and is removed at the end."""
+    if explicit := os.environ.get("TEST_DATABASE_URL"):
+        yield make_url(explicit)
+        return
+    with PostgresContainer(
+        "postgres:16-alpine",
+        username="interview",
+        password="interview",
+        dbname="interview_test",
+        driver="asyncpg",
+    ) as postgres:
+        yield make_url(postgres.get_connection_url())
+
+
 @pytest.fixture
-async def postgres_sessionmaker():
-    url = make_url(
-        os.environ.get(
-            "TEST_DATABASE_URL",
-            "postgresql+asyncpg://interview:interview@localhost:5432/interview_test",
-        )
-    )
+async def postgres_sessionmaker(integration_database_url):
+    url = integration_database_url
     if not url.database or not url.database.endswith("_test"):
         raise ValueError("Integration tests require a dedicated *_test database")
     admin = create_async_engine(

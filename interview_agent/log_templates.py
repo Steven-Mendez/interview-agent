@@ -30,6 +30,7 @@ SAFE_LOG_TEMPLATES = frozenset(
         "Question recovery failed; delivery remains uncertain",
         "Shutdown cleanup failed: %s",
         "Technical notice attribute could not be published",
+        "Trace outcome could not be read",
         "Telemetry drain deadline expired for %d tasks",
         "Turn waiter cleanup failed: %s",
         "Worker engine disposal did not complete",

@@ -280,9 +280,14 @@ class GraphTelemetry:
         self.emit = Mock()
         self.parent_span = ContextVar("test_parent_span", default=None)
         self.export_span = AsyncMock()
+        self.annotate_span = Mock()
+        self.span_outputs = Mock()
+
+    def current_parent(self):
+        return self.parent_span.get()
 
     @asynccontextmanager
-    async def span(self, name):
+    async def span(self, name, inputs=None):
         yield
 
 

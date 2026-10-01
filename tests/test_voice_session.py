@@ -176,9 +176,12 @@ async def test_worker_reaches_session_start_with_a_real_unconnected_room(
         shutdown=Mock(),
         api=SimpleNamespace(room=SimpleNamespace(delete_room=AsyncMock())),
         job=SimpleNamespace(room=SimpleNamespace(name="dispatched-room")),
+        # No LangSmith key: prewarm configured no voice tracing.
+        proc=SimpleNamespace(userdata={"voice_tracing": None}),
     )
     await agent._run_interview(ctx, conversation_id)
     start.assert_awaited_once()
+    # Without LangSmith nothing is recorded.
     assert start.call_args.kwargs["record"] is False
     assert start.call_args.kwargs["room"] is room
     assert start.call_args.kwargs["agent"]._worker.lease.epoch == (

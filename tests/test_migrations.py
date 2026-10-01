@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import select, text
-from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -17,13 +16,10 @@ from interview_agent.interview import db
 ROOT = Path(__file__).resolve().parents[1]
 
 
-async def test_v2_upgrade_preserves_legacy_data_and_blocks_destructive_downgrade():
-    source = make_url(
-        os.environ.get(
-            "TEST_DATABASE_URL",
-            "postgresql+asyncpg://interview:interview@localhost:5432/interview_test",
-        )
-    )
+async def test_v2_upgrade_preserves_legacy_data_and_blocks_destructive_downgrade(
+    integration_database_url,
+):
+    source = integration_database_url
     assert source.database.endswith("_test"), "Migration tests require an explicit test database"
     target = source.set(database="interview_migration_test")
     admin = create_async_engine(source.set(database="postgres"), isolation_level="AUTOCOMMIT")

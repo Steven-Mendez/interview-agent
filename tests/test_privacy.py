@@ -45,6 +45,15 @@ async def setup_trace(sessionmaker):
     return conversation_id, trace_id
 
 
+async def test_every_process_places_runs_under_the_same_root_start(postgres_sessionmaker):
+    conversation_id, _ = await setup_trace(postgres_sessionmaker)
+    trace_id = uuid.uuid4()
+    first = await register_trace(postgres_sessionmaker, trace_id, conversation_id, settings())
+    second = await register_trace(postgres_sessionmaker, trace_id, conversation_id, settings())
+    assert (first[0], second[0]) == ("created", "existing")
+    assert first[1] == second[1] and first[1].tzinfo is not None
+
+
 async def make_due(sessionmaker, identifier):
     async with sessionmaker() as session:
         await session.execute(
@@ -55,7 +64,7 @@ async def make_due(sessionmaker, identifier):
         await session.commit()
 
 
-async def test_canaries_and_tombstone_discard_pending_exports_and_preserve_rollups(
+async def test_content_is_exported_until_the_tombstone_then_nothing_and_rollups_survive(
     postgres_sessionmaker, monkeypatch
 ):
     cid, _ = await setup_trace(postgres_sessionmaker)
@@ -65,7 +74,7 @@ async def test_canaries_and_tombstone_discard_pending_exports_and_preserve_rollu
         postgres_sessionmaker,
         cid,
         settings(),
-        config={"resume": "CANARY_CV", "job_offer": "CANARY_OFFER"},
+        inputs={"resume_markdown": "CANARY_CV", "job_offer": "CANARY_OFFER"},
     )
     async with telemetry.span("planner"):
         await telemetry.export_span(
@@ -73,12 +82,20 @@ async def test_canaries_and_tombstone_discard_pending_exports_and_preserve_rollu
             "interviewer",
             datetime.now(UTC),
             datetime.now(UTC),
-            {"transcript": "CANARY_ANSWER", "quote": "CANARY_QUOTE"},
+            {"transcript": "CANARY_METADATA"},
+            inputs={"messages": [{"role": "user", "content": "CANARY_ANSWER"}]},
         )
     await telemetry.record("planner", "duration_seconds", 1)
     await telemetry.drain()
-    assert client.create_run.call_count == 3
-    assert "CANARY_" not in str(client.mock_calls)
+    # Interview root, this process, the planner node and the finished leaf.
+    assert client.create_run.call_count == 4
+    runs = {c.kwargs["name"]: c.kwargs for c in client.create_run.call_args_list}
+    # The key is the consent: the interview's content travels in run inputs...
+    assert runs["interview"]["inputs"]["resume_markdown"] == "CANARY_CV"
+    assert runs["process"]["inputs"]["job_offer"] == "CANARY_OFFER"
+    assert "CANARY_ANSWER" in str(runs["interviewer"]["inputs"])
+    # ...while metadata (filters) keeps only our own categories.
+    assert "CANARY_METADATA" not in str(client.mock_calls)
     async with postgres_sessionmaker() as session:
         assert await delete_conversation(session, cid)
         assert list(await session.scalars(select(db.MetricEvent))) == []
@@ -142,7 +159,8 @@ class FakeAPI:
         if self.error:
             raise ConnectionError("CANARY_SECRET")
 
-    async def absent(self, tid, pid):
+    async def absent(self, tid, pid, since):
+        self.since = since
         return self.missing
 
 
@@ -256,31 +274,97 @@ async def test_missing_credentials_stays_visible_without_spending_retry_budget(
         assert row.last_error == "missing_credentials"
 
 
-async def test_real_http_contract_targets_exact_trace_and_checks_all_children():
+@pytest.mark.parametrize(
+    "endpoint", ["https://api.smith.langchain.com", "https://ls.example.com/api/v1/"]
+)
+async def test_real_http_contract_targets_exact_trace_and_checks_all_children(endpoint):
     pid, tid = uuid.uuid4(), uuid.uuid4()
+    registered = datetime(2026, 9, 1, tzinfo=UTC)
     requests = []
 
     def respond(request):
         requests.append(request)
-        if request.url.path == "/sessions":
-            return httpx.Response(200, json=[{"id": str(pid), "name": "interview-agent-v2"}])
+        if request.url.path == "/api/v1/sessions":
+            return httpx.Response(200, json=[{"id": str(pid), "name": "interview-agent"}])
         if request.url.path == "/api/v1/runs/delete":
             assert json.loads(request.content) == {"trace_ids": [str(tid)], "session_id": str(pid)}
             return httpx.Response(200, json={})
-        assert request.url.path == "/runs/query"
+        # v1 /runs/query is deprecated; v2 needs an explicit window, or it only
+        # searches the last 24 hours and an old trace would look deleted.
+        assert request.url.path == "/api/v2/runs/query"
         body = json.loads(request.content)
-        assert body["trace"] == str(tid) and body["session"] == [str(pid)]
-        assert body["select"] == ["id"]  # no content downloaded
-        return httpx.Response(200, json={"runs": []})
+        assert body["trace_id"] == str(tid) and body["project_ids"] == [str(pid)]
+        assert datetime.fromisoformat(body["min_start_time"]) < registered
+        assert body["selects"] == ["ID"]  # no content downloaded
+        return httpx.Response(200, json={"items": [] if len(requests) > 3 else [{"id": "x"}]})
+
+    api = LangSmithDeletionAPI(
+        settings(LANGSMITH_ENDPOINT=endpoint), transport=httpx.MockTransport(respond)
+    )
+    try:
+        assert await api.project_id("interview-agent") == pid
+        await api.submit(tid, pid)
+        assert not await api.absent(tid, pid, registered)  # a child still exists
+        assert await api.absent(tid, pid, registered)
+    finally:
+        await api.close()
+    assert len(requests) == 4
+
+
+async def test_verification_rejects_an_unknown_response_shape():
+    def respond(request):
+        return httpx.Response(200, json={"unexpected": []})
 
     api = LangSmithDeletionAPI(settings(), transport=httpx.MockTransport(respond))
     try:
-        assert await api.project_id("interview-agent-v2") == pid
-        await api.submit(tid, pid)
-        assert await api.absent(tid, pid)
+        with pytest.raises(ValueError, match="invalid_verification_response"):
+            await api.absent(uuid.uuid4(), uuid.uuid4(), datetime.now(UTC))
     finally:
         await api.close()
-    assert len(requests) == 3
+
+
+async def test_verification_window_starts_from_the_trace_registration(postgres_sessionmaker):
+    cid, tid = await setup_trace(postgres_sessionmaker)
+    async with postgres_sessionmaker() as session:
+        await retire_traces(session, conversation_id=cid)
+        await session.commit()
+    api = FakeAPI()
+    worker = ExternalDeletionWorker(postgres_sessionmaker, settings(), api=api)
+    await worker.once()
+    await make_due(postgres_sessionmaker, tid)
+    await worker.once()
+    async with postgres_sessionmaker() as session:
+        assert api.since == (await session.get(db.ExternalTrace, tid)).created_at
+
+
+async def test_every_process_of_an_interview_shares_one_trace(postgres_sessionmaker, monkeypatch):
+    cid, _ = await setup_trace(postgres_sessionmaker)
+    clients = []
+
+    def make_client(**kwargs):
+        clients.append(Mock())
+        return clients[-1]
+
+    monkeypatch.setattr("interview_agent.observability.Client", make_client)
+    planner = Telemetry(postgres_sessionmaker, cid, settings(), process="planner")
+    await planner.drain()
+    worker = Telemetry(postgres_sessionmaker, cid, settings(), process="worker")
+    await worker.drain()
+    assert planner.trace_id == worker.trace_id
+    first, second = (
+        [call.kwargs for call in client.create_run.call_args_list] for client in clients
+    )
+    # Only the first process creates the interview root; both hang under it.
+    assert [c["name"] for c in first] == ["interview", "planner"]
+    assert [c["name"] for c in second] == ["worker"]
+    assert first[1]["parent_run_id"] == second[0]["parent_run_id"] == planner.trace_id
+    async with postgres_sessionmaker() as session:
+        rows = list(
+            await session.scalars(
+                select(db.ExternalTrace).where(db.ExternalTrace.conversation_id == cid)
+            )
+        )
+        assert planner.trace_id in {row.id for row in rows}
 
 
 async def test_crashed_deletion_claim_keeps_original_attempt_and_can_be_recovered(

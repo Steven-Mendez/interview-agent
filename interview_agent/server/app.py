@@ -20,7 +20,11 @@ from interview_agent.config import settings
 from interview_agent.interview import db
 from interview_agent.interview.db import create_engine_and_sessionmaker
 from interview_agent.logging_config import setup_file_logging
+from interview_agent.metrics import purge_metrics
+from interview_agent.privacy import ExternalDeletionWorker
+from interview_agent.runtime import process_manifest, record_manifest, validate_database_revision
 from interview_agent.server.evaluations import EvaluationRunner
+from interview_agent.server.reconciliation import LifecycleSweeper
 from interview_agent.server.routes import router
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -58,7 +62,14 @@ async def _purge_loop(sessionmaker) -> None:
     while True:
         try:
             async with sessionmaker() as session:
-                deleted = await db.delete_conversations_older_than(session, settings.retention_days)
+                await purge_metrics(
+                    session, settings.metrics_detail_days, settings.metrics_retention_days
+                )
+                deleted = (
+                    await db.delete_conversations_older_than(session, settings.retention_days)
+                    if settings.retention_days > 0
+                    else []
+                )
             logger.info(
                 "retention purge done",
                 extra={"deleted": len(deleted), "days": settings.retention_days},
@@ -79,6 +90,11 @@ async def lifespan(app: FastAPI):
 
     settings.require_keys()
     engine, sessionmaker = create_engine_and_sessionmaker(settings.database_url)
+    try:
+        database_revision = await validate_database_revision(sessionmaker)
+    except BaseException:
+        await engine.dispose()
+        raise
     logger.info(
         "server ready",
         extra={
@@ -88,19 +104,32 @@ async def lifespan(app: FastAPI):
     )
 
     app.state.sessionmaker = sessionmaker
+    app.state.runtime_manifest = await process_manifest(
+        settings, "api", functions=(lifespan.__wrapped__, _purge_loop)
+    )
+    app.state.runtime_manifest["database_revision"] = database_revision
+    await record_manifest(sessionmaker, app.state.runtime_manifest)
     # POST /evaluate claims a row and hands it here; the run itself happens
     # in this process, off the request.
     app.state.evaluations = EvaluationRunner(sessionmaker)
 
-    purge_task: asyncio.Task | None = None
-    if settings.retention_days > 0:
-        purge_task = asyncio.create_task(_purge_loop(sessionmaker))
-    else:
+    purge_task = asyncio.create_task(_purge_loop(sessionmaker))
+    deletion_task = asyncio.create_task(ExternalDeletionWorker(sessionmaker, settings).run())
+    sweep_task = asyncio.create_task(
+        LifecycleSweeper(sessionmaker, settings, app.state.evaluations).run()
+    )
+    if settings.retention_days <= 0:
         logger.info("retention purge disabled (RETENTION_DAYS=0)")
 
     try:
         yield
     finally:
+        deletion_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await deletion_task
+        sweep_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await sweep_task
         if purge_task is not None:
             purge_task.cancel()
             with suppress(asyncio.CancelledError):

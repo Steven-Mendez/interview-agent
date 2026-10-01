@@ -8,11 +8,7 @@ that job continue the interview instead of starting a new one on top of it.
 
 from dataclasses import dataclass
 
-from interview_agent.agent import (
-    _RESUME_MAX_MESSAGES,
-    _chat_ctx_from_messages,
-    _next_seq,
-)
+from interview_agent.agent import _RESUME_MAX_MESSAGES, _chat_ctx_from_messages
 
 
 @dataclass
@@ -22,6 +18,10 @@ class Row:
     role: str
     content: str
     seq: int | None
+    id: int = 1
+    source_id: str | None = None
+    metrics: dict | None = None
+    interrupted: bool = False
 
 
 def transcript(n: int, *, start: int = 0) -> list[Row]:
@@ -33,40 +33,6 @@ def transcript(n: int, *, start: int = 0) -> list[Row]:
         )
         for i in range(start, start + n)
     ]
-
-
-# --- _next_seq ---------------------------------------------------------------
-
-
-def test_first_job_starts_at_zero():
-    assert _next_seq([]) == 0
-
-
-def test_resumed_job_continues_past_the_highest_seq():
-    assert _next_seq(transcript(6)) == 6
-
-
-def test_continues_from_the_max_not_the_count():
-    # A gap (a persist that failed) must not push the next job onto a used seq.
-    rows = [Row("assistant", "a", 0), Row("user", "b", 1), Row("assistant", "c", 7)]
-    assert _next_seq(rows) == 8
-
-
-def test_legacy_rows_without_seq_are_skipped():
-    rows = [Row("assistant", "a", None), Row("user", "b", None), Row("assistant", "c", 2)]
-    assert _next_seq(rows) == 3
-
-
-def test_all_rows_without_seq_falls_back_to_zero():
-    # max() over an empty generator would raise; default=-1 keeps it total.
-    assert _next_seq([Row("assistant", "a", None)]) == 0
-
-
-def test_second_job_transcript_does_not_interleave():
-    # The bug: two runs of 0,1,2… sort as 0,0,1,1,2,2 under order_by(seq, id).
-    first = transcript(3)
-    second = transcript(3, start=_next_seq(first))
-    assert [r.seq for r in first + second] == [0, 1, 2, 3, 4, 5]
 
 
 # --- _chat_ctx_from_messages -------------------------------------------------
@@ -103,3 +69,12 @@ def test_blank_and_unknown_roles_are_dropped():
         Row("user", "Sí.", 3),
     ]
     assert texts(_chat_ctx_from_messages(rows)) == [("user", "Sí.")]
+
+
+def test_resume_preserves_capture_identity_version_and_confirmation():
+    proof = {"stt_confirmed": True, "stt_turn_id": "turn", "stt_turn_version": 2}
+    row = Row("user", "Corrected", 7, id=42, source_id="capture-turn-v1", metrics=proof)
+    item = _chat_ctx_from_messages([row]).messages()[0]
+    assert item.id == row.source_id and item.metrics == proof
+    item.metrics["stt_turn_version"] = 3
+    assert row.metrics["stt_turn_version"] == 2

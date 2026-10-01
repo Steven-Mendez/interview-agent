@@ -6,12 +6,14 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     # LiveKit realtime voice agent framework + plugins
-    "livekit-agents>=1.0",                 # includes the `inference` gateway (STT/TTS AssemblyAI + Cartesia)
-    "livekit-plugins-silero>=1.0",         # local VAD
-    "livekit-plugins-langchain>=1.0",      # LLMAdapter: wraps the LangGraph workflow as an LLM
+    "livekit-agents==1.8.3",
+    "livekit-plugins-silero>=1.6.6",
+    "livekit-plugins-langchain>=1.6.6",
     # LangGraph orchestration + OpenAI chat model
-    "langgraph>=0.6",
-    "langchain-openai>=0.3",
+    "langgraph>=1.2.7",
+    "langchain-openai>=1.3.3",
+    "openai>=2.44.0",
+    "langsmith>=0.4",
     # Config
     "pydantic-settings>=2.0",
     "fastapi>=0.139.0",
@@ -22,6 +24,7 @@ dependencies = [
     "asyncpg>=0.31.0",
     "alembic>=1.18.5",
     "httpx>=0.28.1",
+    "pdfminer-six>=20260107",
 ]
 
 [project.scripts]

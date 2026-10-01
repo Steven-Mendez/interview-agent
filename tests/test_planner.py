@@ -18,6 +18,8 @@ def _plan() -> InterviewPlan:
         persona="Laura, engineering manager, warm but rigorous",
         summary="Solid backend candidate.",
         focus_areas=["Kubernetes", "SQL"],
+        detected_seniority=Seniority.MID,
+        seniority_evidence="Backend engineer",
         milestones=[
             MilestoneSpec(
                 title=f"M{i}", description="Probe it.", expected_evidence="Names one index."

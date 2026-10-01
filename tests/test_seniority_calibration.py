@@ -18,7 +18,6 @@ from interview_agent.prompts import (
     SENIORITY_CALIBRATION,
     build_calibration_block,
     build_evaluator_prompt,
-    build_interviewer_prompt,
     build_planner_prompt,
     fit_length,
     followup_budget,
@@ -31,28 +30,6 @@ def _flat(text: str) -> str:
     """Collapse whitespace: assertions should track the wording of a prompt,
     not how it happens to be wrapped in the source."""
     return " ".join(text.split())
-
-
-class _Conv:
-    """Minimal stand-in for db.Conversation: the prompt builder only reads
-    attributes, so a real row (and a database) is unnecessary here."""
-
-    def __init__(self, seniority="mid", interview_length="standard", plan=None):
-        self.seniority = seniority
-        self.interview_length = interview_length
-        self.plan = plan if plan is not None else {"language": "es", "persona": "Laura"}
-        self.custom_instructions = None
-        self.resume_markdown = "# Resume\nPython developer."
-        self.job_offer = "Backend developer at ACME."
-
-
-class _MS:
-    def __init__(self, position, title, description, expected_evidence=None):
-        self.position = position
-        self.title = title
-        self.description = description
-        self.expected_evidence = expected_evidence
-        self.completed = False
 
 
 # ---- The profile table ------------------------------------------------------
@@ -179,73 +156,6 @@ def test_planner_prompt_always_demands_a_per_milestone_bar():
 
 
 # ---- Interviewer prompt -----------------------------------------------------
-
-
-@pytest.mark.parametrize("projects", [1, 40])
-def test_interviewer_receives_full_source_documents_without_retrieval(projects):
-    conversation = _Conv()
-    conversation.resume_markdown = "# Experience\n" + "\n".join(
-        f"Project {i}: Migrated a PostgreSQL database and wrote Python services."
-        for i in range(projects)
-    )
-    conversation.job_offer = "# Backend Engineer\nACME needs Python, SQL and mentoring."
-    conversation.plan["summary"] = "A short summary that omits project details."
-
-    prompt = build_interviewer_prompt(conversation, [], 15)
-
-    # Details omitted by the planner must still be available to the voice
-    # agent, including the end of a resume larger than a former RAG chunk.
-    assert conversation.resume_markdown in prompt
-    assert conversation.job_offer in prompt
-    assert prompt.count(conversation.resume_markdown) == 1
-    assert "search_resume" not in prompt
-
-
-def test_interviewer_prompt_injects_the_level_ceiling():
-    junior = _flat(build_interviewer_prompt(_Conv(seniority="junior"), [], 15))
-    assert _flat(SENIORITY_CALIBRATION[Seniority.JUNIOR].out_of_scope) in junior
-    assert "NEVER ask about" in junior
-    # The rewritten probing rule: brevity must stop reading as vagueness.
-    assert "Brevity is not vagueness" in junior
-    # And the anti-ratchet rule.
-    assert "do NOT raise the difficulty of later questions" in junior
-
-    senior = _flat(build_interviewer_prompt(_Conv(seniority="senior"), [], 15))
-    assert _flat(SENIORITY_CALIBRATION[Seniority.JUNIOR].out_of_scope) not in senior
-
-
-def test_interviewer_prompt_states_the_follow_up_budget():
-    trainee = _flat(
-        build_interviewer_prompt(_Conv(seniority="trainee", interview_length="deep"), [], 15)
-    )
-    assert "NO follow-up budget" in trainee
-
-    senior = _flat(
-        build_interviewer_prompt(_Conv(seniority="senior", interview_length="deep"), [], 25)
-    )
-    assert "budget of 2 follow-up(s)" in senior
-    # A "deep" interview clamped to 15 minutes was planned as standard, so it
-    # runs with standard's budget too.
-    clamped = _flat(
-        build_interviewer_prompt(_Conv(seniority="senior", interview_length="deep"), [], 15)
-    )
-    assert "budget of 1 follow-up(s)" in clamped
-
-
-def test_interviewer_prompt_carries_each_milestone_bar():
-    milestones = [
-        _MS(0, "Indexes", "Probe it.", "Names the missing index on the filter column"),
-        _MS(1, "Legacy", "Probe it.", None),
-    ]
-    prompt = build_interviewer_prompt(_Conv(seniority="junior"), milestones, 15)
-    assert "1. Indexes: Probe it. (passes when: Names the missing index" in prompt
-    # A legacy milestone with no bar renders cleanly, with no dangling suffix.
-    assert "2. Legacy: Probe it.\n" in prompt
-
-
-def test_interviewer_prompt_tolerates_a_legacy_row_without_a_level():
-    prompt = _flat(build_interviewer_prompt(_Conv(seniority=None, interview_length=None), [], 15))
-    assert SENIORITY_CALIBRATION[DEFAULT_SENIORITY].label in prompt
 
 
 # ---- Evaluator prompt -------------------------------------------------------

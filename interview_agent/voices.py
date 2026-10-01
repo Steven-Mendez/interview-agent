@@ -23,21 +23,21 @@ VOICES: dict[str, dict[str, str]] = {
         "label": "Jacqueline",
         "gender": "female",
         "language": "en",
-        "tts_model": "cartesia/sonic-3",
+        "tts_model": "cartesia/sonic-3.6-2026-08-27",
         "tts_voice": "9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
     },
     "en_male": {
         "label": "Blake",
         "gender": "male",
         "language": "en",
-        "tts_model": "cartesia/sonic-3",
+        "tts_model": "cartesia/sonic-3.6-2026-08-27",
         "tts_voice": "a167e0f3-df7e-4d52-a9c3-f949145efdab",
     },
     "es_female": {
         "label": "Daniela",
         "gender": "female",
         "language": "es",
-        "tts_model": "cartesia/sonic-3",
+        "tts_model": "cartesia/sonic-3.6-2026-08-27",
         "tts_voice": "5c5ad5e7-1020-476b-8b91-fdcbe9cc313c",
     },
     "es_male": {
@@ -48,6 +48,10 @@ VOICES: dict[str, dict[str, str]] = {
         "tts_voice": "Diego",
     },
 }
+
+
+def resolve_voice(key: str) -> dict[str, str]:
+    return dict(VOICES[key])
 
 
 def voices_by_language() -> dict[str, list[dict[str, str]]]:

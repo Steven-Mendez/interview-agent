@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+VERIFIED_STT_MODELS = frozenset({"assemblyai/universal-3-6-pro"})
 
 
 class Settings(BaseSettings):
@@ -18,25 +20,23 @@ class Settings(BaseSettings):
 
     # LLM (OpenAI via LangGraph)
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
-    # The realtime voice model: it drives the interviewer, where
-    # time-to-first-token matters most. Planner and evaluator have their own
-    # quality-first models below.
+    # The interviewer's model decides every voice turn: quality first, with its
+    # audible latency measured. Planner and evaluator have their own below.
     interviewer_model: str = Field(
-        default="gpt-5.4-mini",
+        default="gpt-6-astra",
         alias="INTERVIEWER_MODEL",
-        description="Low-latency chat model for the realtime voice loop.",
+        description="Decision model for the realtime voice loop.",
     )
-    # GPT-5-family models take reasoning effort ("none" = no reasoning, lowest
-    # time-to-first-token — what a voice agent wants) and reject temperature;
-    # pre-GPT-5 models take temperature and ignore reasoning effort.
-    interviewer_reasoning_effort: str = Field(default="none", alias="INTERVIEWER_REASONING_EFFORT")
+    # GPT-6 models take reasoning effort "low" and above (not none/minimal) and
+    # reject temperature; pre-GPT-5 models take temperature instead.
+    interviewer_reasoning_effort: str = Field(default="low", alias="INTERVIEWER_REASONING_EFFORT")
     interviewer_temperature: float = Field(default=0.7, alias="INTERVIEWER_TEMPERATURE")
 
     # Interview planner/evaluator: run once per interview with no latency
     # pressure, so quality-first models with high reasoning effort.
-    planner_model: str = Field(default="gpt-5.5", alias="PLANNER_MODEL")
+    planner_model: str = Field(default="gpt-6-astra", alias="PLANNER_MODEL")
     planner_reasoning_effort: str = Field(default="high", alias="PLANNER_REASONING_EFFORT")
-    evaluator_model: str = Field(default="gpt-5.5", alias="EVALUATOR_MODEL")
+    evaluator_model: str = Field(default="gpt-6-astra", alias="EVALUATOR_MODEL")
     evaluator_reasoning_effort: str = Field(default="high", alias="EVALUATOR_REASONING_EFFORT")
 
     # Postgres (from docker-compose.yml).
@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     # End the interview after this long with no conversation items at all
     # (e.g. the candidate walked away leaving the tab open).
     interview_idle_minutes: int = Field(default=3, alias="INTERVIEW_IDLE_MINUTES")
+    interview_reconnect_seconds: int = Field(
+        default=10, alias="INTERVIEW_RECONNECT_SECONDS", ge=1, le=300
+    )
+    worker_drain_minutes: int = Field(default=30, alias="WORKER_DRAIN_MINUTES", ge=1, le=60)
     livekit_agent_name: str = Field(default="interviewer", alias="LIVEKIT_AGENT_NAME")
     # Where the worker reaches the FastAPI app to auto-trigger evaluation.
     app_base_url: str = Field(default="http://localhost:8000", alias="APP_BASE_URL")
@@ -68,7 +72,17 @@ class Settings(BaseSettings):
     # STT via LiveKit Inference. The transcription language is pinned to the
     # interview language chosen in the in-app Settings screen; the TTS model
     # and voice come from the same screen (see interview_agent/voices.py).
-    stt_model: str = Field(default="assemblyai/universal-streaming-multilingual", alias="STT_MODEL")
+    stt_model: str = Field(default="assemblyai/universal-3-6-pro", alias="STT_MODEL")
+
+    # Content stays in Postgres. External traces contain metadata only.
+    langsmith_api_key: str = Field(default="", alias="LANGSMITH_API_KEY", repr=False)
+    langsmith_project: str = Field(default="interview-agent-v2", alias="LANGSMITH_PROJECT")
+    langsmith_endpoint: str = Field(
+        default="https://api.smith.langchain.com", alias="LANGSMITH_ENDPOINT"
+    )
+    metrics_retention_days: int = Field(default=365, alias="METRICS_RETENTION_DAYS", ge=1)
+    metrics_detail_days: int = Field(default=30, alias="METRICS_DETAIL_DAYS", ge=1)
+    closing_timeout_seconds: int = Field(default=20, alias="CLOSING_TIMEOUT_SECONDS", ge=5, le=60)
 
     # LiveKit: key/secret auth the Inference gateway (STT/TTS); the server URL
     # is where the worker and the browser join interview rooms.
@@ -93,8 +107,24 @@ class Settings(BaseSettings):
             raise RuntimeError(f"Missing variables in .env: {', '.join(missing)}.")
         return self
 
+    @field_validator("stt_model")
+    @classmethod
+    def _verified_stt_model(cls, value):
+        # New interviews only start on models whose drain contract (final
+        # results plus provider finalized/closed signals) was observed.
+        # Deepgram Flux returned finals without session.finalized/closed
+        # within five seconds, so it stays a benchmark-only arm.
+        if value not in VERIFIED_STT_MODELS:
+            raise ValueError(
+                f"STT_MODEL must be one of {sorted(VERIFIED_STT_MODELS)}; "
+                "other models have no verified transcript drain contract"
+            )
+        return value
+
     @model_validator(mode="after")
-    def _clamp_temperature(self) -> Settings:
+    def _check_bounds(self) -> Settings:
+        if self.interview_reconnect_seconds > self.worker_drain_minutes * 60:
+            raise ValueError("Reconnect time cannot exceed the worker drain period.")
         if not 0.0 <= self.interviewer_temperature <= 2.0:
             raise ValueError("INTERVIEWER_TEMPERATURE must be between 0.0 and 2.0.")
         return self

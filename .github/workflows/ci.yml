@@ -40,7 +40,7 @@ jobs:
       - run: uv sync
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      # The live-LLM calibration test skips itself without OPENAI_API_KEY.
+      # The live-LLM calibration test runs only with RUN_LIVE_LLM_TESTS=1.
       - run: uv run pytest
 
   frontend:

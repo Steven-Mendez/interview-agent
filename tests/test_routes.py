@@ -10,32 +10,38 @@ Postgres, in CI on the service container (TEST_DATABASE_URL overrides).
 from __future__ import annotations
 
 import asyncio
-import itertools
 import json
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 
+import jwt
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from interview_agent import agent
 from interview_agent.config import settings
 from interview_agent.interview import db
 from interview_agent.interview import resume as resume_ingestion
 from interview_agent.interview.context import MAX_JOB_OFFER_CHARS, MAX_RESUME_CHARS
+from interview_agent.interview.dialogue import system_prompt
+from interview_agent.interview.evaluation_contract import insufficient_evaluation
 from interview_agent.interview.models import (
+    Assessment,
+    CriterionEvaluation,
     EvaluationResult,
+    EvidenceRef,
     InterviewLength,
     InterviewPlan,
     MilestoneSpec,
     Seniority,
 )
-from interview_agent.prompts import build_interviewer_prompt, length_for
+from interview_agent.interview.seals import ensure_seal
+from interview_agent.prompts import length_for
 from interview_agent.server import evaluations, routes
 from interview_agent.voices import VOICES
 
@@ -45,7 +51,7 @@ TEST_DATABASE_URL = os.environ.get(
 )
 
 
-def _plan(detected: Seniority | None = None) -> InterviewPlan:
+def _plan(detected: Seniority | None = Seniority.MID) -> InterviewPlan:
     return InterviewPlan(
         persona="Laura, engineering manager",
         summary="Solid candidate.",
@@ -68,6 +74,7 @@ def _evaluation() -> EvaluationResult:
         strengths=["clear communication"],
         weaknesses=["little SQL depth"],
         rationale="Convincing on most milestones.",
+        score_gap="Little SQL depth kept it from the top of the band.",
         seniority_evaluated=Seniority.MID,
         calibration_notes=["Skipped trade-off depth: above this level."],
     )
@@ -76,6 +83,8 @@ def _evaluation() -> EvaluationResult:
 async def _ensure_test_database() -> None:
     """CREATE DATABASE if missing — Postgres has no CREATE ... IF NOT EXISTS."""
     url = make_url(TEST_DATABASE_URL)
+    if not url.database or not url.database.endswith("_test"):
+        raise ValueError("Route tests require a dedicated *_test database")
     admin = create_async_engine(
         url.set(database="postgres").render_as_string(hide_password=False),
         isolation_level="AUTOCOMMIT",
@@ -98,7 +107,8 @@ async def client_and_sessionmaker(monkeypatch):
         # The test database persists across runs and create_all never ALTERs
         # an existing table — rebuild from scratch so schema changes (new
         # columns/tables) land, and every test starts from a clean slate.
-        await conn.run_sync(db.Base.metadata.drop_all)
+        await conn.execute(text("DROP SCHEMA public CASCADE"))
+        await conn.execute(text("CREATE SCHEMA public"))
         await conn.run_sync(db.Base.metadata.create_all)
 
     monkeypatch.setattr(
@@ -122,20 +132,302 @@ async def _fake_planner(settings, resume_markdown, job_offer, **kwargs) -> Inter
 
 
 async def _fake_evaluator(settings, **kwargs) -> EvaluationResult:
-    return _evaluation()
+    records = [m for m in kwargs["transcript"] if m["role"] == "user"]
+    milestones = kwargs["milestones"]
+    level = Seniority(kwargs["seniority"])
+    if not records or not milestones:
+        return insufficient_evaluation(level, milestones, kwargs.get("language", "en"))
+    reference = EvidenceRef(
+        message_id=records[0]["id"],
+        message_version=records[0].get("version"),
+        quote=records[0]["content"],
+    )
+    complete = kwargs.get("transcript_complete", True)
+    return _evaluation().model_copy(
+        update={
+            "criteria": [
+                CriterionEvaluation(
+                    milestone_id=m["id"],
+                    assessment=Assessment.MEETS,
+                    evidence=[reference],
+                    rationale="Demonstrated the fixture criterion.",
+                    practice="",
+                )
+                for m in milestones
+            ],
+            "strengths": [],
+            "weaknesses": [],
+            "seniority_evaluated": level,
+            "evaluation_status": "complete" if complete else "partial",
+            "score": 82 if complete else None,
+            "hired": True if complete else None,
+        }
+    )
+
+
+def _pdf_bytes():
+    """A valid one-page synthetic PDF; extraction remains independently mocked."""
+    stream = b"BT /F1 12 Tf 20 50 Td (Python developer) Tj ET"
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+    ]
+    data = b"%PDF-1.4\n"
+    offsets = []
+    for index, obj in enumerate(objects, 1):
+        offsets.append(len(data))
+        data += str(index).encode() + b" 0 obj\n" + obj + b"\nendobj\n"
+    xref = len(data)
+    data += b"xref\n0 6\n0000000000 65535 f \n"
+    for offset in offsets:
+        data += f"{offset:010d} 00000 n \n".encode()
+    return data + f"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
 
 
 def _upload(job_offer: str = "Backend engineer at ACME.", **extra: str):
     return {
-        "files": {"resume": ("cv.pdf", b"%PDF-fake", "application/pdf")},
+        "files": {"resume": ("cv.pdf", _pdf_bytes(), "application/pdf")},
         "data": {"job_offer": job_offer, **extra},
     }
 
 
-def _interviewer(**fields: str) -> str:
+def _interviewer(**fields) -> str:
     """The `interviewer` form field. Only the keys passed are sent, so the
     test controls exactly what inherits and what overrides."""
     return json.dumps(fields)
+
+
+async def test_preview_extracts_without_planning_or_persisting(
+    client_and_sessionmaker, monkeypatch
+):
+    client, sessionmaker = client_and_sessionmaker
+
+    async def unexpected_planner(*args, **kwargs):
+        pytest.fail("Preview must not spend a planner request")
+
+    monkeypatch.setattr(routes, "run_planner", unexpected_planner)
+    response = await client.post("/api/resumes/preview", files=_upload()["files"])
+    assert response.status_code == 200
+    assert response.json() == {
+        "filename": "cv.pdf",
+        "text": "# Resume\nPython dev.",
+        "characters": len("# Resume\nPython dev."),
+        "pdf_sha256": sha256(_pdf_bytes()).hexdigest(),
+    }
+    async with sessionmaker() as session:
+        assert (await db.list_conversations(session, limit=20, offset=0))[1] == 0
+
+
+@pytest.mark.parametrize(
+    "failure", ["extension", "bytes", "empty_file", "empty_text", "text_limit"]
+)
+async def test_preview_rejects_invalid_sources(client_and_sessionmaker, monkeypatch, failure):
+    client, _ = client_and_sessionmaker
+    name, data = "cv.pdf", _pdf_bytes()
+    status = 400
+    if failure == "extension":
+        name = "cv.txt"
+    elif failure == "bytes":
+        monkeypatch.setattr(routes, "_MAX_RESUME_BYTES", len(data) - 1)
+        status = 413
+    elif failure == "empty_file":
+        data = b""
+    elif failure == "empty_text":
+        monkeypatch.setattr(resume_ingestion, "pdf_to_markdown", lambda *args: " \n")
+    else:
+        monkeypatch.setattr(
+            resume_ingestion, "pdf_to_markdown", lambda *args: "r" * (MAX_RESUME_CHARS + 1)
+        )
+        status = 413
+    response = await client.post(
+        "/api/resumes/preview", files={"resume": (name, data, "application/pdf")}
+    )
+    assert response.status_code == status
+
+
+async def test_reviewed_resume_is_exact_planner_input_and_repeat_source(
+    client_and_sessionmaker, monkeypatch
+):
+    client, sessionmaker = client_and_sessionmaker
+    preview = (await client.post("/api/resumes/preview", files=_upload()["files"])).json()
+    reviewed = "# Curriculum revisado\nPython y SQL; corregí la extracción.\n"
+    seen = []
+
+    async def planner(settings, resume_markdown, job_offer, **kwargs):
+        seen.append(resume_markdown)
+        return _plan()
+
+    def unexpected_conversion(*args):
+        pytest.fail("The reviewed input must not be replaced by another extraction")
+
+    monkeypatch.setattr(routes, "run_planner", planner)
+    monkeypatch.setattr(resume_ingestion, "pdf_to_markdown", unexpected_conversion)
+    response = await client.post(
+        "/api/interviews",
+        **_upload(
+            resume_review=json.dumps({"pdf_sha256": preview["pdf_sha256"], "text": reviewed})
+        ),
+    )
+    assert response.status_code == 200
+    source = response.json()
+    assert source["run_config"]["resume_input"] == {
+        "kind": "reviewed_pdf_text",
+        "pdf_sha256": preview["pdf_sha256"],
+        "text_sha256": sha256(reviewed.encode()).hexdigest(),
+    }
+    repeat = await client.post(f"/api/interviews/{source['id']}/repeat")
+    assert repeat.status_code == 200
+    assert seen == [reviewed, reviewed]
+    assert repeat.json()["run_config"]["resume_input"] == source["run_config"]["resume_input"]
+    async with sessionmaker() as session:
+        stored = await db.get_conversation(session, uuid.UUID(source["id"]))
+        assert stored.resume_markdown == reviewed
+
+
+@pytest.mark.parametrize("failure", ["changed_pdf", "blank_text", "oversized_text", "invalid_json"])
+async def test_invalid_review_never_reaches_planner_or_creates_row(
+    client_and_sessionmaker, monkeypatch, failure
+):
+    client, sessionmaker = client_and_sessionmaker
+
+    async def unexpected_planner(*args, **kwargs):
+        pytest.fail("Invalid reviewed input must be rejected before planning")
+
+    monkeypatch.setattr(routes, "run_planner", unexpected_planner)
+    review = {"pdf_sha256": sha256(_pdf_bytes()).hexdigest(), "text": "Reviewed CV"}
+    status = 400
+    if failure == "changed_pdf":
+        review["pdf_sha256"] = sha256(b"different PDF").hexdigest()
+        status = 409
+    elif failure == "blank_text":
+        review["text"] = " \n"
+    elif failure == "oversized_text":
+        review["text"] = "x" * (MAX_RESUME_CHARS + 1)
+        status = 413
+    raw = "not JSON" if failure == "invalid_json" else json.dumps(review)
+    response = await client.post("/api/interviews", **_upload(resume_review=raw))
+    assert response.status_code == status
+    async with sessionmaker() as session:
+        assert (await db.list_conversations(session, limit=20, offset=0))[1] == 0
+
+
+@pytest.mark.parametrize("reviewed", [False, True])
+async def test_corrupt_pdf_rejected_even_with_matching_reviewed_text(
+    client_and_sessionmaker, monkeypatch, reviewed
+):
+    client, sessionmaker = client_and_sessionmaker
+
+    async def forbidden(*args, **kwargs):
+        pytest.fail("A corrupt PDF must not reach the planner")
+
+    monkeypatch.setattr(routes, "run_planner", forbidden)
+    data = b"%PDF-1.4\ncorrupt document with no catalog"
+    payload = _upload()
+    payload["files"] = {"resume": ("cv.pdf", data, "application/pdf")}
+    if reviewed:
+        payload["data"]["resume_review"] = json.dumps(
+            {"pdf_sha256": sha256(data).hexdigest(), "text": "Edited valid-looking text"}
+        )
+    response = await client.post("/api/interviews", **payload)
+    assert response.status_code == 400 and "readable PDF" in response.json()["detail"]
+    async with sessionmaker() as session:
+        assert (await db.list_conversations(session, limit=20, offset=0))[1] == 0
+
+
+async def test_repeat_inherits_limits_and_recalculates_changed_profile(
+    client_and_sessionmaker, monkeypatch
+):
+    client, _ = client_and_sessionmaker
+    seen = []
+
+    async def planner(settings, resume_markdown, job_offer, **kwargs):
+        seen.append(kwargs)
+        spec = _plan().milestones[0]
+        return _plan().model_copy(
+            update={
+                "milestones": [
+                    spec.model_copy(update={"title": f"M{i}"})
+                    for i in range(kwargs["question_limit"])
+                ]
+            }
+        )
+
+    monkeypatch.setattr(routes, "run_planner", planner)
+    source = (
+        await client.post(
+            "/api/interviews",
+            **_upload(
+                seniority="senior",
+                interviewer=_interviewer(question_limit=2, followup_limit=0, max_minutes=7),
+            ),
+        )
+    ).json()
+    inherited = (await client.post(f"/api/interviews/{source['id']}/repeat")).json()
+    assert (inherited["question_limit"], inherited["followup_limit"], inherited["max_minutes"]) == (
+        2,
+        0,
+        7,
+    )
+    assert seen[-1]["question_limit"] == 2
+    assert seen[-1]["max_minutes"] == 7
+    changed = (
+        await client.post(
+            f"/api/interviews/{source['id']}/repeat", json={"interview_length": "deep"}
+        )
+    ).json()
+    assert seen[-1]["question_limit"] == 8
+    assert changed["question_limit"] == 8
+    assert changed["followup_limit"] == 2
+    assert changed["max_minutes"] == min(25, settings.interview_max_minutes)
+    overridden = (
+        await client.post(
+            f"/api/interviews/{source['id']}/repeat",
+            json={
+                "interview_length": "deep",
+                "question_limit": 1,
+                "followup_limit": 0,
+                "max_minutes": 4,
+            },
+        )
+    ).json()
+    assert (
+        overridden["question_limit"],
+        overridden["followup_limit"],
+        overridden["max_minutes"],
+    ) == (1, 0, 4)
+    assert len(overridden["milestones"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("question_limit", 0),
+        ("question_limit", 13),
+        ("question_limit", True),
+        ("question_limit", "3"),
+        ("question_limit", 2.5),
+        ("followup_limit", -1),
+        ("followup_limit", 3),
+        ("max_minutes", 0),
+        ("max_minutes", 26),
+        ("max_minutes", False),
+    ],
+)
+async def test_budget_contract_rejects_invalid_values_on_create_and_repeat(
+    client_and_sessionmaker, field, value
+):
+    client, _ = client_and_sessionmaker
+    created = await client.post(
+        "/api/interviews", **_upload(interviewer=_interviewer(**{field: value}))
+    )
+    assert created.status_code == 400
+    source = (await client.post("/api/interviews", **_upload())).json()
+    repeated = await client.post(f"/api/interviews/{source['id']}/repeat", json={field: value})
+    assert repeated.status_code == 422
 
 
 @pytest.mark.parametrize("field", ["resume", "job_offer"])
@@ -166,7 +458,7 @@ async def test_rejects_oversized_source_before_planning(
         assert (await db.list_conversations(session, limit=20, offset=0))[1] == 0
 
 
-async def test_rejects_oversized_legacy_source_on_token_and_repeat(client_and_sessionmaker):
+async def test_rejects_oversized_source_on_token_and_repeat(client_and_sessionmaker):
     client, sessionmaker = client_and_sessionmaker
     conversation_id = uuid.uuid4()
     async with sessionmaker() as session:
@@ -176,6 +468,9 @@ async def test_rejects_oversized_legacy_source_on_token_and_repeat(client_and_se
                 status="planned",
                 job_offer="offer",
                 resume_markdown="r" * (MAX_RESUME_CHARS + 1),
+                run_config={
+                    "models": {"interviewer": {"model": "gpt-6-astra", "reasoning_effort": "low"}}
+                },
             )
         )
         await session.commit()
@@ -186,7 +481,7 @@ async def test_rejects_oversized_legacy_source_on_token_and_repeat(client_and_se
         assert (await db.list_conversations(session, limit=20, offset=0))[1] == 1
 
 
-async def _seed_finished_interview(sessionmaker) -> uuid.UUID:
+async def _seed_finished_interview(sessionmaker, *, integrity="complete") -> uuid.UUID:
     """A completed interview with a transcript, ready to evaluate."""
     conversation_id = uuid.uuid4()
     async with sessionmaker() as session:
@@ -214,7 +509,20 @@ async def _seed_finished_interview(sessionmaker) -> uuid.UUID:
         for seq, (role, content) in enumerate(
             [("assistant", "Tell me about X."), ("user", "I built X.")]
         ):
-            await db.insert_message(session, conversation_id, role, content, seq=seq)
+            await db.insert_message(
+                session,
+                conversation_id,
+                role,
+                content,
+                seq=seq,
+                metrics={"stt_confirmed": True} if role == "user" else None,
+            )
+        # Every finished interview is sealed after its confirmed transcript.
+        row = await db.get_conversation(session, conversation_id)
+        row.transcript_sealed_at = datetime.now(UTC)
+        row.transcript_integrity = integrity
+        await ensure_seal(session, row)
+        await session.commit()
     return conversation_id
 
 
@@ -298,9 +606,8 @@ async def test_create_interview_happy_path(client_and_sessionmaker):
 
     async with sessionmaker() as session:
         row = await db.get_conversation(session, uuid.UUID(body["id"]))
-        milestones = await db.get_milestones(session, uuid.UUID(body["id"]))
         assert row is not None
-        prompt = build_interviewer_prompt(row, milestones, row.max_minutes)
+        prompt = system_prompt(row)
         assert "# Resume\nPython dev." in prompt
         assert body["job_offer"] in prompt
 
@@ -334,7 +641,7 @@ async def test_create_interview_snapshots_settings(client_and_sessionmaker):
     assert snapshot["agent_name"] == "Sam"
     assert snapshot["language"] == "es"
     assert snapshot["voice"] == "es_female"
-    assert snapshot["tts_model"] == "cartesia/sonic-3"
+    assert snapshot["tts_model"] == "cartesia/sonic-3.6-2026-08-27"
     assert snapshot["tts_voice"]  # resolved, not just the catalog key
 
 
@@ -439,7 +746,7 @@ async def test_a_second_evaluate_while_one_runs_starts_nothing(
         nonlocal calls
         calls += 1
         await release.wait()
-        return _evaluation()
+        return await _fake_evaluator(settings, **kwargs)
 
     monkeypatch.setattr(evaluations, "run_evaluator", _slow_evaluator)
     conversation_id = await _seed_finished_interview(sessionmaker)
@@ -471,7 +778,7 @@ async def test_a_run_whose_process_died_is_claimed_again(client_and_sessionmaker
     async def _counting_evaluator(settings, **kwargs):
         nonlocal calls
         calls += 1
-        return _evaluation()
+        return await _fake_evaluator(settings, **kwargs)
 
     monkeypatch.setattr(evaluations, "run_evaluator", _counting_evaluator)
     conversation_id = await _seed_finished_interview(sessionmaker)
@@ -513,14 +820,18 @@ async def test_a_live_run_keeps_its_heartbeat_moving(client_and_sessionmaker, mo
 
     async def _slow_evaluator(settings, **kwargs):
         await release.wait()
-        return _evaluation()
+        return await _fake_evaluator(settings, **kwargs)
 
     monkeypatch.setattr(evaluations, "run_evaluator", _slow_evaluator)
     conversation_id = await _seed_finished_interview(sessionmaker)
 
     claimed_at = (await client.post(f"/api/interviews/{conversation_id}/evaluate")).json()
-    await asyncio.sleep(0.1)
-    later = (await client.get(f"/api/interviews/{conversation_id}")).json()
+    # Bounded poll: the run's setup holds the row briefly before heartbeats.
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        later = (await client.get(f"/api/interviews/{conversation_id}")).json()
+        if later["updated_at"] != claimed_at["updated_at"]:
+            break
     assert later["status"] == "evaluating"
     assert datetime.fromisoformat(later["updated_at"]) > datetime.fromisoformat(
         claimed_at["updated_at"]
@@ -530,7 +841,7 @@ async def test_a_live_run_keeps_its_heartbeat_moving(client_and_sessionmaker, mo
     assert (await _settled(client, conversation_id))["status"] == "evaluated"
 
 
-async def test_shutdown_marks_a_cancelled_run_failed_so_the_ui_offers_a_retry(
+async def test_shutdown_leaves_the_request_recoverable_after_its_lease(
     client_and_sessionmaker, monkeypatch
 ):
     _, sessionmaker = client_and_sessionmaker
@@ -553,24 +864,77 @@ async def test_shutdown_marks_a_cancelled_run_failed_so_the_ui_offers_a_retry(
     assert runner.running == 0
     async with sessionmaker() as session:
         conversation = await db.get_conversation(session, conversation_id)
-    assert conversation is not None
-    assert conversation.status == "evaluation_failed"
+        # The UI keeps polling instead of showing a failure that is not final.
+        assert conversation.status == "evaluating"
+        request_id = conversation.evaluation_request_id
+        run = await session.get(db.EvaluationRun, conversation.evaluation_claim_id)
+        run.lease_until = await session.scalar(select(func.clock_timestamp())) - timedelta(
+            seconds=1
+        )
+        await session.commit()
+    async with sessionmaker() as session:
+        attempt = await db.claim_evaluation(
+            session, conversation_id, evaluations.STALE_AFTER, recover=True
+        )
+        assert (await session.get(db.EvaluationRun, attempt)).request_id == request_id
 
 
-async def test_evaluate_without_transcript_409(client_and_sessionmaker, monkeypatch):
+async def test_evaluate_without_transcript_is_insufficient(client_and_sessionmaker, monkeypatch):
     client, sessionmaker = client_and_sessionmaker
     monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
     conversation_id = uuid.uuid4()
     async with sessionmaker() as session:
         session.add(
             db.Conversation(
-                id=conversation_id, status="completed", job_offer="o", resume_markdown="r"
+                id=conversation_id,
+                status="completed",
+                job_offer="o",
+                resume_markdown="r",
+                transcript_sealed_at=datetime.now(UTC),
             )
         )
         await session.commit()
 
     res = await client.post(f"/api/interviews/{conversation_id}/evaluate")
-    assert res.status_code == 409
+    assert res.status_code == 202
+    result = (await _settled(client, conversation_id))["evaluation"]
+    assert result["evaluation_status"] == "insufficient"
+    assert result["score"] is None
+    assert result["hired"] is None
+
+
+async def test_interview_without_stt_confirmation_is_insufficient_without_model(
+    client_and_sessionmaker, monkeypatch
+):
+    from interview_agent.interview import evaluator
+
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(evaluator, "build_chat_model", pytest.fail)
+    conversation_id = uuid.uuid4()
+    async with sessionmaker() as session:
+        session.add(
+            db.Conversation(
+                id=conversation_id,
+                status="completed",
+                job_offer="offer",
+                resume_markdown="# Resume",
+                plan={"language": "en"},
+            )
+        )
+        await session.commit()
+        await db.insert_message(session, conversation_id, "assistant", "Tell me about X.", seq=0)
+        # An unconfirmed STT interim is never candidate evidence.
+        await db.insert_message(
+            session, conversation_id, "user", "I built X.", seq=1, metrics={"stt_confirmed": False}
+        )
+        row = await db.get_conversation(session, conversation_id)
+        row.transcript_sealed_at = datetime.now(UTC)
+        await session.commit()
+
+    assert (await client.post(f"/api/interviews/{conversation_id}/evaluate")).status_code == 202
+    result = (await _settled(client, conversation_id))["evaluation"]
+    assert result["evaluation_status"] == "insufficient"
+    assert result["score"] is None and result["hired"] is None
 
 
 async def test_evaluate_refuses_a_live_interview(client_and_sessionmaker, monkeypatch):
@@ -586,6 +950,8 @@ async def test_evaluate_refuses_a_live_interview(client_and_sessionmaker, monkey
                 status="interviewing",
                 job_offer="o",
                 resume_markdown="r",
+                max_minutes=8,
+                started_at=datetime.now(UTC),
             )
         )
         await session.commit()
@@ -613,11 +979,14 @@ async def test_an_interrupted_interview_is_evaluable_once_its_window_closes(
                 job_offer="o",
                 resume_markdown="r",
                 max_minutes=8,
+                started_at=datetime.now(UTC),
             )
         )
         await session.commit()
         await db.insert_message(session, conversation_id, "assistant", "Tell me about X.", seq=0)
-        await db.insert_message(session, conversation_id, "user", "I built X.", seq=1)
+        await db.insert_message(
+            session, conversation_id, "user", "I built X.", seq=1, metrics={"stt_confirmed": True}
+        )
 
     # Inside the window it is a live interview: rejoinable, not evaluable.
     body = (await client.get(f"/api/interviews/{conversation_id}")).json()
@@ -629,21 +998,26 @@ async def test_an_interrupted_interview_is_evaluable_once_its_window_closes(
         await session.execute(
             update(db.Conversation)
             .where(db.Conversation.id == conversation_id)
-            .values(updated_at=datetime.now(UTC) - timedelta(minutes=8 + 5 + 1))
+            .values(
+                started_at=datetime.now(UTC) - timedelta(minutes=9),
+                worker_owner_id=uuid.uuid4(),
+                worker_epoch=1,
+                worker_lease_until=datetime.now(UTC) - timedelta(seconds=31),
+            )
         )
         await session.commit()
 
     body = (await client.get(f"/api/interviews/{conversation_id}")).json()
     assert body["can_start"] is False
-    assert datetime.fromisoformat(body["reconnect_until"]) < datetime.now(UTC)
+    assert body["reconnect_until"] is None and body["status"] == "completed"
 
     res = await client.post(f"/api/interviews/{conversation_id}/evaluate")
     assert res.status_code == 202
     assert res.json()["status"] == "evaluating"
-    assert res.json()["ended_reason"] == "connection_lost"
+    assert res.json()["ended_reason"] == "worker_lost"
     body = await _settled(client, conversation_id)
     assert body["status"] == "evaluated"
-    assert body["evaluation"]["ended_by"] == "connection_lost"
+    assert body["evaluation"]["ended_by"] == "worker_lost"
     assert body["can_start"] is False
     assert body["reconnect_until"] is None
 
@@ -717,7 +1091,7 @@ async def test_a_failed_evaluation_still_books_its_tokens(client_and_sessionmake
         usage_callback.usage_metadata = {
             "gpt": {"input_tokens": 10, "output_tokens": 4, "total_tokens": 14}
         }
-        return _evaluation()
+        return await _fake_evaluator(settings, **kwargs)
 
     monkeypatch.setattr(evaluations, "run_evaluator", _spent_and_succeeded)
     assert (await client.post(f"/api/interviews/{conversation_id}/evaluate")).status_code == 202
@@ -782,6 +1156,17 @@ async def test_token_allows_a_fresh_reconnect(client_and_sessionmaker, monkeypat
                 status="interviewing",
                 job_offer="o",
                 resume_markdown="r",
+                max_minutes=8,
+                started_at=datetime.now(UTC),
+                run_config={
+                    "models": {"interviewer": {"model": "gpt-6-astra", "reasoning_effort": "low"}},
+                    "stt_model": "assemblyai/universal-3-6-pro",
+                },
+                agent_settings={
+                    "language": "es",
+                    "tts_model": "cartesia/sonic-3.6",
+                    "tts_voice": "voice",
+                },
             )
         )
         await session.commit()
@@ -789,6 +1174,21 @@ async def test_token_allows_a_fresh_reconnect(client_and_sessionmaker, monkeypat
     res = await client.get(f"/api/interviews/{conversation_id}/token")
     assert res.status_code == 200
     assert res.json()["room"] == f"interview-{conversation_id}"
+    verified = routes.api.TokenVerifier(
+        settings.livekit_api_key,
+        settings.livekit_api_secret,
+        leeway=timedelta(0),
+    ).verify(res.json()["token"])
+    assert verified.identity == "candidate"
+    claims = jwt.decode(
+        res.json()["token"],
+        settings.livekit_api_secret,
+        algorithms=["HS256"],
+        issuer=settings.livekit_api_key,
+        options={"require": ["exp", "nbf"]},
+    )
+    assert 6 * 60 * 60 <= claims["exp"] - claims["nbf"] <= 6 * 60 * 60 + 1
+    assert claims["exp"] - claims["nbf"] > settings.interview_max_minutes * 60 + 45
 
 
 async def test_token_refuses_a_stale_reconnect(client_and_sessionmaker):
@@ -855,17 +1255,16 @@ async def test_resumed_job_appends_instead_of_interleaving(client_and_sessionmak
             )
         )
         await session.commit()
-        for seq, (role, content) in enumerate(
-            [("assistant", "greeting"), ("user", "answer 1"), ("assistant", "question 2")]
-        ):
-            await db.insert_message(session, conversation_id, role, content, seq=seq)
-
-        prior = await db.get_messages(session, conversation_id)
-        assert agent._next_seq(prior) == 3
-        resumed_seq = itertools.count(agent._next_seq(prior))
-
-        for role, content in [("assistant", "welcome back"), ("user", "answer 2")]:
-            await db.insert_message(session, conversation_id, role, content, seq=next(resumed_seq))
+        # Order is allocated under the conversation lock, so a second job
+        # continues after the first one's messages instead of renumbering.
+        for role, content in [
+            ("assistant", "greeting"),
+            ("user", "answer 1"),
+            ("assistant", "question 2"),
+            ("assistant", "welcome back"),
+            ("user", "answer 2"),
+        ]:
+            await db.insert_message(session, conversation_id, role, content)
         messages = await db.get_messages(session, conversation_id)
 
     assert [m.content for m in messages] == [
@@ -1144,7 +1543,11 @@ async def test_history_row_carries_the_score(client_and_sessionmaker, monkeypatc
     body = (await client.get("/api/interviews")).json()
     row = next(item for item in body["items"] if item["id"] == str(conversation_id))
     assert row["status"] == "evaluated"
-    assert row["evaluation"] == {"hired": True, "score": 82}
+    assert row["evaluation"] == {
+        "hired": True,
+        "score": 82,
+        "evaluation_status": "complete",
+    }
     assert row["milestones_completed"] == 1
 
 
@@ -1195,8 +1598,7 @@ async def test_repeat_replans_the_same_role_into_a_new_interview(client_and_sess
     async with sessionmaker() as session:
         row = await db.get_conversation(session, uuid.UUID(repeat["id"]))
         assert row is not None and row.resume_markdown == "# Resume\nPython dev."
-        milestones = await db.get_milestones(session, row.id)
-        prompt = build_interviewer_prompt(row, milestones, row.max_minutes)
+        prompt = system_prompt(row)
         assert row.resume_markdown in prompt
         assert source["job_offer"] in prompt
 
@@ -1403,6 +1805,368 @@ async def test_evaluate_judges_against_the_pinned_level(client_and_sessionmaker,
     assert seen["seniority"] == "junior"
     assert all("expected_evidence" in m for m in seen["milestones"])
 
-    evaluation = body["evaluation"]
-    assert evaluation["seniority_evaluated"] == "mid"  # what the fake returned
-    assert evaluation["calibration_notes"] == ["Skipped trade-off depth: above this level."]
+    assert body["status"] == "evaluation_failed"
+    assert body["evaluation"] is None  # A mismatched level is never persisted as valid.
+
+
+async def test_direct_evaluation_seals_expired_closing_snapshot(
+    client_and_sessionmaker, monkeypatch
+):
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
+    conversation_id = await _seed_finished_interview(sessionmaker)
+    async with sessionmaker() as session:
+        for message in await db.get_messages(session, conversation_id):
+            if message.role == "user":
+                message.metrics = {"stt_confirmed": True}
+        await session.execute(
+            update(db.Conversation)
+            .where(db.Conversation.id == conversation_id)
+            .values(
+                status="closing",
+                closing_id=uuid.uuid4(),
+                closing_owner_id=uuid.uuid4(),
+                closing_deadline_at=datetime.now(UTC) - timedelta(seconds=1),
+                farewell_status="pending",
+                # An expired close has not sealed yet.
+                transcript_sealed_at=None,
+                transcript_integrity=None,
+                transcript_seal_id=None,
+            )
+        )
+        await session.execute(
+            delete(db.TranscriptSeal).where(db.TranscriptSeal.conversation_id == conversation_id)
+        )
+        await session.commit()
+    response = await client.post(f"/api/interviews/{conversation_id}/evaluate")
+    assert response.status_code == 202
+    assert response.json()["transcript_integrity"] == "partial"
+    async with sessionmaker() as session:
+        row = await db.get_conversation(session, conversation_id)
+        assert row.transcript_sealed_at is not None
+        assert row.farewell_status == "timeout"
+        with pytest.raises(ValueError, match="sealed"):
+            await db.insert_message(session, conversation_id, "user", "Late answer")
+    body = await _settled(client, conversation_id)
+    assert body["evaluation"]["evaluation_status"] == "partial"
+    assert body["evaluation"]["score"] is None
+    assert body["evaluation"]["hired"] is None
+
+
+async def test_delayed_automatic_trigger_does_not_reevaluate(client_and_sessionmaker, monkeypatch):
+    client, sessionmaker = client_and_sessionmaker
+    calls = 0
+
+    async def evaluator(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return await _fake_evaluator(*args, **kwargs)
+
+    monkeypatch.setattr(evaluations, "run_evaluator", evaluator)
+    conversation_id = await _seed_finished_interview(sessionmaker)
+    url = f"/api/interviews/{conversation_id}/evaluate?automatic=true"
+    assert (await client.post(url)).status_code == 202
+    assert (await _settled(client, conversation_id))["status"] == "evaluated"
+    assert (await client.post(url)).json()["status"] == "evaluated"
+    await asyncio.sleep(0.05)
+    assert calls == 1
+    assert (await client.post(f"/api/interviews/{conversation_id}/evaluate")).status_code == 202
+    await _settled(client, conversation_id)
+    assert calls == 2
+
+
+async def test_integrity_incident_hides_published_global_without_rewriting_history(
+    client_and_sessionmaker, monkeypatch
+):
+    from interview_agent.interview.transcription import admit_candidate
+
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
+    interview_id = await _seed_finished_interview(sessionmaker)
+    await client.post(f"/api/interviews/{interview_id}/evaluate")
+    before = await _settled(client, interview_id)
+    assert before["evaluation"]["score"] is not None
+    async with sessionmaker() as session:
+        await admit_candidate(
+            session,
+            interview_id,
+            content="Late omitted content",
+            source_id="late",
+            metrics={"stt_confirmed": True},
+        )
+    after = (await client.get(f"/api/interviews/{interview_id}")).json()
+    assert after["capture_integrity_pending"]
+    assert after["evaluation"]["score"] is None and after["evaluation"]["hired"] is None
+    transcript = (await client.get(f"/api/interviews/{interview_id}/transcript")).json()
+    assert transcript["incidents"][0]["content"] == "Late omitted content"
+    async with sessionmaker() as session:
+        row = await db.get_conversation(session, interview_id)
+        assert row.evaluation.score == before["evaluation"]["score"]
+
+
+async def test_capture_incident_during_evaluation_prevents_publication(
+    client_and_sessionmaker, monkeypatch
+):
+    client, sessionmaker = client_and_sessionmaker
+    interview_id = await _seed_finished_interview(sessionmaker)
+
+    async def evaluate(settings, **kwargs):
+        async with sessionmaker() as session:
+            row = await db.get_conversation(session, interview_id)
+            row.capture_integrity_pending = True
+            await session.commit()
+        return await _fake_evaluator(settings, **kwargs)
+
+    monkeypatch.setattr(evaluations, "run_evaluator", evaluate)
+    await client.post(f"/api/interviews/{interview_id}/evaluate")
+    result = await _settled(client, interview_id)
+    assert result["status"] == "evaluation_failed" and result["evaluation"] is None
+
+
+async def test_evaluation_requires_a_seal(client_and_sessionmaker):
+    client, sessions = client_and_sessionmaker
+    interview_id = uuid.uuid4()
+    async with sessions() as transaction:
+        transaction.add(
+            db.Conversation(id=interview_id, status="completed", job_offer="o", resume_markdown="r")
+        )
+        await transaction.commit()
+    result = await client.post(f"/api/interviews/{interview_id}/evaluate")
+    assert result.status_code == 409 and result.json()["detail"] == "Transcript is not sealed"
+
+
+async def test_question_replay_api_is_idempotent_and_rejects_answered_question(
+    client_and_sessionmaker,
+):
+    from interview_agent.interview.delivery import save_question
+    from interview_agent.interview.transcription import admit_candidate
+
+    client, sessions = client_and_sessionmaker
+    interview_id = await _seed_finished_interview(sessions)
+    question_id = uuid.uuid4()
+    async with sessions() as transaction:
+        row = await transaction.get(db.Conversation, interview_id)
+        row.status = "interviewing"
+        transaction.add(
+            db.TurnRun(
+                id=question_id,
+                conversation_id=interview_id,
+                turn_id="saved",
+                decision={"spoken_text": "Saved question?"},
+            )
+        )
+        await transaction.flush()
+        await save_question(transaction, interview_id, question_id, "Saved question?")
+        await transaction.commit()
+    result = (await client.get(f"/api/interviews/{interview_id}/question")).json()
+    assert result["question"]["id"] == str(question_id)
+    payload = {"question_id": str(question_id), "request_id": str(uuid.uuid4())}
+    url = f"/api/interviews/{interview_id}/question/replay"
+    first = await client.post(url, json=payload)
+    second = await client.post(url, json=payload)
+    assert first.status_code == second.status_code == 202 and first.json() == second.json()
+    async with sessions() as transaction:
+        await admit_candidate(
+            transaction,
+            interview_id,
+            content="An answer",
+            source_id="answer",
+            metrics={"stt_confirmed": True},
+        )
+    assert (await client.post(url, json=payload)).status_code == 409
+    assert (await client.get(f"/api/interviews/{interview_id}/question")).json()["question"] is None
+
+
+async def test_join_dispatches_the_configured_worker_with_only_the_interview_id(
+    client_and_sessionmaker, monkeypatch
+):
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(settings, "livekit_api_key", "devkey")
+    monkeypatch.setattr(settings, "livekit_api_secret", "devsecret" * 4)
+    ready, unconfigured = uuid.uuid4(), uuid.uuid4()
+    async with sessionmaker() as session:
+        session.add_all(
+            [
+                db.Conversation(
+                    id=ready,
+                    status="planned",
+                    job_offer="Synthetic",
+                    resume_markdown="Synthetic",
+                    run_config={
+                        "models": {
+                            "interviewer": {"model": "gpt-6-astra", "reasoning_effort": "low"}
+                        }
+                    },
+                ),
+                db.Conversation(
+                    id=unconfigured,
+                    status="planned",
+                    job_offer="Synthetic",
+                    resume_markdown="Synthetic",
+                ),
+            ]
+        )
+        await session.commit()
+    response = await client.get(f"/api/interviews/{ready}/token")
+    assert response.status_code == 200 and "protocol_version" not in response.json()
+    claims = jwt.decode(
+        response.json()["token"],
+        settings.livekit_api_secret,
+        algorithms=["HS256"],
+        issuer=settings.livekit_api_key,
+    )
+    agent = claims["roomConfig"]["agents"][0]
+    assert agent["agentName"] == settings.livekit_agent_name
+    assert json.loads(agent["metadata"]) == {"conversation_id": str(ready)}
+    # A row without a saved model snapshot cannot start with silent defaults.
+    assert (await client.get(f"/api/interviews/{unconfigured}/token")).status_code == 409
+
+
+@pytest.mark.parametrize("clock_offset", [-3650, 3650])
+async def test_live_elapsed_uses_database_time_and_preserves_start_on_refresh(
+    client_and_sessionmaker, monkeypatch, clock_offset
+):
+    client, sessions = client_and_sessionmaker
+    cid, owner = uuid.uuid4(), uuid.uuid4()
+    async with sessions() as session:
+        now = await session.scalar(select(func.clock_timestamp()))
+        start = now - timedelta(seconds=123)
+        session.add(
+            db.Conversation(
+                id=cid,
+                status="interviewing",
+                job_offer="Synthetic offer",
+                resume_markdown="Synthetic resume",
+                started_at=start,
+                max_minutes=8,
+                worker_owner_id=owner,
+                worker_epoch=1,
+                worker_lease_until=now + timedelta(seconds=15),
+            )
+        )
+        await session.commit()
+
+    class SkewedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) + timedelta(days=clock_offset)
+
+    monkeypatch.setattr(routes, "datetime", SkewedClock)
+    for _ in range(2):
+        response = await client.get(f"/api/interviews/{cid}")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "interviewing"
+        assert 123 <= body["elapsed_seconds"] < 128
+    async with sessions() as session:
+        assert (await session.get(db.Conversation, cid)).started_at == start
+
+
+async def test_detail_exposes_written_farewell_and_closing_bound_from_database_clock(
+    client_and_sessionmaker,
+):
+    client, sessions = client_and_sessionmaker
+    lost, closing = uuid.uuid4(), uuid.uuid4()
+    async with sessions() as session:
+        now = await session.scalar(select(func.clock_timestamp()))
+        session.add_all(
+            [
+                db.Conversation(
+                    id=lost,
+                    status="completed",
+                    job_offer="Synthetic offer",
+                    resume_markdown="Synthetic resume",
+                    agent_settings={"language": "es"},
+                    ended_reason="worker_lost",
+                    farewell_status="not_possible",
+                    transcript_sealed_at=now,
+                    transcript_integrity="partial",
+                ),
+                db.Conversation(
+                    id=closing,
+                    status="closing",
+                    job_offer="Synthetic offer",
+                    resume_markdown="Synthetic resume",
+                    closing_id=uuid.uuid4(),
+                    closing_started_at=now,
+                    closing_deadline_at=now + timedelta(seconds=35),
+                    closing_ack_deadline_at=now + timedelta(seconds=30),
+                    farewell_status="pending",
+                ),
+            ]
+        )
+        await session.commit()
+    body = (await client.get(f"/api/interviews/{lost}")).json()
+    assert body["ended_reason"] == "worker_lost"
+    assert body["farewell_text"].startswith("Gracias por compartir")
+    assert body["closing_remaining_seconds"] is None
+    body = (await client.get(f"/api/interviews/{closing}")).json()
+    assert body["farewell_text"] is None
+    assert 35 < body["closing_remaining_seconds"] <= 40
+
+
+async def test_repeat_of_failed_auto_classification_reclassifies_instead_of_pinning_mid(
+    client_and_sessionmaker, monkeypatch
+):
+    client, _ = client_and_sessionmaker
+    requested = []
+
+    async def _boom(*args, **kwargs):
+        requested.append(kwargs["seniority"])
+        raise RuntimeError("classification failed")
+
+    async def _detecting(settings, resume_markdown, job_offer, **kwargs):
+        requested.append(kwargs["seniority"])
+        return _plan(detected=Seniority.SENIOR)
+
+    monkeypatch.setattr(routes, "run_planner", _boom)
+    job_offer = f"offer-{uuid.uuid4()}"
+    assert (await client.post("/api/interviews", **_upload(job_offer))).status_code == 500
+    source = next(
+        row
+        for row in (await client.get("/api/interviews")).json()["items"]
+        if row["status"] == "error"
+    )
+    assert source["seniority_source"] == "fallback"
+
+    monkeypatch.setattr(routes, "run_planner", _detecting)
+    repeat = (await client.post(f"/api/interviews/{source['id']}/repeat")).json()
+    assert requested == [None, None]
+    assert repeat["seniority"] == "senior"
+    assert repeat["seniority_source"] == "detected"
+
+
+async def test_question_limit_above_eight_is_reachable_and_effective_limit_is_honest(
+    client_and_sessionmaker, monkeypatch
+):
+    client, _ = client_and_sessionmaker
+    planned = {"count": 12}
+
+    async def planner(settings, resume_markdown, job_offer, **kwargs):
+        spec = _plan().milestones[0]
+        return _plan().model_copy(
+            update={
+                "milestones": [
+                    spec.model_copy(update={"title": f"M{i}"}) for i in range(planned["count"])
+                ]
+            }
+        )
+
+    monkeypatch.setattr(routes, "run_planner", planner)
+    full = (
+        await client.post(
+            "/api/interviews",
+            **_upload(seniority="senior", interviewer=_interviewer(question_limit=12)),
+        )
+    ).json()
+    assert full["question_limit"] == 12 and len(full["milestones"]) == 12
+    planned["count"] = 9
+    fewer = (
+        await client.post(
+            "/api/interviews",
+            **_upload(seniority="senior", interviewer=_interviewer(question_limit=12)),
+        )
+    ).json()
+    # One primary question per planned topic: never display an unreachable 12.
+    assert fewer["question_limit"] == 9
+    assert fewer["run_config"]["requested_question_limit"] == 12

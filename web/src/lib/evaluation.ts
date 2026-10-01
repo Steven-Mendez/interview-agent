@@ -15,13 +15,13 @@ export function shouldShowInterviewResults(
 ): boolean {
   return (
     status !== "error" &&
+    phase !== "closing" &&
     (phase === "ended" || (phase === "idle" && TERMINAL_STATUSES.has(status)))
   )
 }
 
 // 180 s past the anchor the evaluation is considered stuck; the endpoint is
-// re-invocable, so the results panel then offers to (re)start it by hand —
-// same policy as app.js's MAX_EVAL_POLLS (90 * 2s).
+// re-invocable, so the results panel then offers to (re)start it by hand.
 export const EVAL_TIMEOUT_MS = 180_000
 
 /** The instant the evaluation-timeout clock counts from.

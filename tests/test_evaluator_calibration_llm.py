@@ -1,10 +1,10 @@
 """Live regression for the seniority calibration. Costs real tokens, so it is
-skipped unless OPENAI_API_KEY is set (CI has no key).
+skipped unless RUN_LIVE_LLM_TESTS=1. Importing the voice worker loads .env,
+so key presence alone makes test collection order accidentally spend tokens.
 
-The unit tests prove the prompt is assembled correctly. Only this one proves
-the behaviour actually changed: the SAME transcript of short-but-correct
-answers must pass as a junior and fall short as a senior, and the junior run
-must not list "no metrics / no trade-offs / lacked depth" as a weakness.
+This narrow live smoke checks the SAME short-but-correct transcript against
+explicit junior and senior criteria. It does not measure an improvement over
+a baseline or replace the approved bilingual quality benchmark.
 """
 
 from __future__ import annotations
@@ -18,7 +18,9 @@ from interview_agent.config import Settings
 from interview_agent.interview.evaluator import run_evaluator
 from interview_agent.interview.models import Seniority
 
-pytestmark = pytest.mark.skipif(not os.getenv("OPENAI_API_KEY"), reason="needs a real OpenAI key")
+pytestmark = pytest.mark.skipif(
+    os.getenv("RUN_LIVE_LLM_TESTS") != "1", reason="requires RUN_LIVE_LLM_TESTS=1"
+)
 
 # Short, correct, specific answers about database optimization — exactly the
 # shape the old prompt punished as "lacking depth, metrics or trade-offs".
@@ -91,13 +93,28 @@ ABOVE_LEVEL_PATTERN = re.compile(
 
 
 async def _evaluate(seniority: Seniority):
+    # The v2 evaluator follows the planner's pinned criterion, rather than
+    # secretly raising an identical passing bar because the level changed.
+    milestones = [dict(m) for m in MILESTONES]
+    if seniority is Seniority.SENIOR:
+        milestones[0]["expected_evidence"] = (
+            "Uses an execution plan to diagnose the actual bottleneck, compares index "
+            "alternatives and their write cost, and validates representative load."
+        )
+        milestones[1]["expected_evidence"] = (
+            "Explains a concrete production incident, diagnoses its root cause, "
+            "and establishes regression coverage and monitoring to prevent recurrence."
+        )
     return await run_evaluator(
         Settings(),
         resume_markdown=RESUME,
         job_offer=JOB_OFFER,
         plan=PLAN,
-        milestones=MILESTONES,
-        transcript=TRANSCRIPT,
+        milestones=milestones,
+        transcript=[
+            {"id": f"message-{i + 1}", "role": role, "content": content}
+            for i, (role, content) in enumerate(TRANSCRIPT)
+        ],
         ended_reason="plan_complete",
         seniority=seniority,
     )

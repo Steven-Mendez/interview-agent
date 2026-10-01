@@ -16,15 +16,16 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Text,
-    and_,
+    UniqueConstraint,
     delete,
     exists,
     func,
-    or_,
     select,
     update,
 )
@@ -37,6 +38,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm.attributes import flag_modified
 
 from interview_agent.voices import DEFAULT_AGENT_NAME, DEFAULT_LANGUAGE, DEFAULT_VOICE
 
@@ -56,7 +58,7 @@ class Conversation(Base):
     # Bumped on every UPDATE (status changes included); the capacity check
     # uses it to ignore orphaned "interviewing" rows from crashed workers.
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
-    # created | planned | interviewing | completed | evaluating
+    # created | planned | interviewing | closing | completed | evaluating
     # | evaluation_failed | evaluated | error
     status: Mapped[str] = mapped_column(Text, default="created", server_default="created")
     job_offer: Mapped[str] = mapped_column(Text)
@@ -83,13 +85,13 @@ class Conversation(Base):
         Text, default="standard", server_default="standard"
     )
     # Time cap for THIS interview, derived from interview_length and clamped by
-    # the global setting. NULL on legacy rows — callers fall back to it.
+    # the global setting. Set at creation; NULL only before planning.
     max_minutes: Mapped[int | None] = mapped_column(Integer)
     # Snapshot of the app settings taken at creation time, with the voice
     # already resolved to a concrete tts_model/tts_voice pair: {"agent_name",
     # "language", "voice", "tts_model", "tts_voice"}. Editing the settings
-    # never affects an interview already planned. NULL on legacy rows — the
-    # worker falls back to the catalog defaults.
+    # never affects an interview already planned. The worker refuses rows
+    # without it.
     agent_settings: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     # Set when this interview was started as a re-run of an earlier one, and
     # always points at the ROOT of the chain (repeating a repeat re-points at
@@ -99,13 +101,54 @@ class Conversation(Base):
     repeat_of_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("conversations.id", ondelete="SET NULL")
     )
-    # plan_complete | timeout | candidate_left | idle_timeout
-    # | connection_lost (the worker died; set when the orphan is evaluated)
+    # question_limit | plan_exhausted | candidate_requested | timeout
+    # | idle_timeout | candidate_left | abandoned | worker_lost | connection_lost
     ended_reason: Mapped[str | None] = mapped_column(Text)
     # Per-component LLM spend, accumulated over the conversation's lifecycle:
     # {"planner" | "interviewer" | "evaluator":
     #   {"input_tokens": int, "output_tokens": int, "total_tokens": int}}
     token_usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    run_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    state_revision: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    question_limit: Mapped[int | None] = mapped_column(Integer)
+    followup_limit: Mapped[int | None] = mapped_column(Integer)
+    started_at: Mapped[datetime | None] = mapped_column()
+    worker_owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    worker_epoch: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
+    worker_acquired_at: Mapped[datetime | None] = mapped_column()
+    worker_lease_until: Mapped[datetime | None] = mapped_column()
+    worker_activity_at: Mapped[datetime | None] = mapped_column()
+    worker_disconnected_at: Mapped[datetime | None] = mapped_column()
+    evaluation_request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    transcript_seal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey(
+            "transcript_seals.id", name="conversation_seal_fk", use_alter=True, ondelete="SET NULL"
+        )
+    )
+    capture_integrity_pending: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="false"
+    )
+    closing_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    closing_owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    closing_started_at: Mapped[datetime | None] = mapped_column()
+    closing_acquired_at: Mapped[datetime | None] = mapped_column()
+    closing_ack_deadline_at: Mapped[datetime | None] = mapped_column()
+    closing_audio_timeout_seconds: Mapped[float | None] = mapped_column(Float)
+    closing_delivery_at: Mapped[datetime | None] = mapped_column()
+    closing_audio_size: Mapped[int | None] = mapped_column(Integer)
+    closing_audio_mime: Mapped[str | None] = mapped_column(Text)
+    closing_ack_received_at: Mapped[datetime | None] = mapped_column()
+    closing_ack_status: Mapped[str | None] = mapped_column(Text)
+    closing_playback_seconds: Mapped[float | None] = mapped_column(Float)
+    closing_playback_exceeded_budget: Mapped[bool | None] = mapped_column(Boolean)
+    closing_deadline_at: Mapped[datetime | None] = mapped_column()
+    closing_stream_id: Mapped[str | None] = mapped_column(Text)
+    closing_attempt_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    transcript_sealed_at: Mapped[datetime | None] = mapped_column()
+    transcript_integrity: Mapped[str | None] = mapped_column(Text)
+    stt_drain: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    farewell_status: Mapped[str | None] = mapped_column(Text)
+    evaluation_claim_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
 
     # lazy="selectin": async sessions cannot lazy-load on attribute access
     # (MissingGreenlet), so both relationships load eagerly with the parent.
@@ -134,18 +177,28 @@ class Milestone(Base):
     # The bar, materialized at planning time: what the candidate must say for
     # this milestone to count as covered AT THE PINNED LEVEL. Travels to the
     # evaluator so it judges against a written criterion instead of
-    # re-deriving how deep the topic "should" go. NULL on legacy rows.
+    # re-deriving how deep the topic "should" go.
     expected_evidence: Mapped[str | None] = mapped_column(Text)
     completed: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     completed_at: Mapped[datetime | None] = mapped_column()
     notes: Mapped[str | None] = mapped_column(Text)
+    lifecycle: Mapped[str] = mapped_column(Text, default="pending", server_default="pending")
+    close_reason: Mapped[str | None] = mapped_column(Text)
+    essential: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
+    competency: Mapped[str | None] = mapped_column(Text)
+    primary_questions: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    followups: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    clarifications: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     conversation: Mapped[Conversation] = relationship(back_populates="milestones")
 
 
 class Message(Base):
     __tablename__ = "messages"
-    __table_args__ = (Index("messages_conv_idx", "conversation_id", "id"),)
+    __table_args__ = (
+        Index("messages_conv_idx", "conversation_id", "id"),
+        UniqueConstraint("conversation_id", "source_id", name="messages_source_unique"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     conversation_id: Mapped[uuid.UUID] = mapped_column(
@@ -156,9 +209,122 @@ class Message(Base):
     # Turn order, assigned synchronously in the worker's event handler. The
     # autoincrement id reflects COMMIT order, and the persist tasks are
     # fire-and-forget — under latency two inserts can commit out of order.
-    # Nullable for rows that predate the column; get_messages falls back to id.
+    # Allocated under the conversation lock; get_messages breaks ties by id.
     seq: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    source_id: Mapped[str | None] = mapped_column(Text)
+    turn_id: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int | None] = mapped_column(Integer)
+    interrupted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    metrics: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+
+
+class CapturedTurn(Base):
+    """One logical voice turn, regardless of the SDK message IDs it receives."""
+
+    __tablename__ = "captured_turns"
+    __table_args__ = (
+        UniqueConstraint("message_id", name="captured_turn_message_unique"),
+        UniqueConstraint("conversation_id", "capture_order", name="captured_turn_order_unique"),
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True
+    )
+    turn_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"))
+    capture_order: Mapped[int] = mapped_column(BigInteger)
+    captured_at: Mapped[datetime] = mapped_column(server_default=func.clock_timestamp())
+
+
+class MessageVersion(Base):
+    """Immutable text/provenance snapshots of each candidate capture version."""
+
+    __tablename__ = "message_versions"
+    __table_args__ = (CheckConstraint("version >= 1", name="message_version_positive"),)
+    message_id: Mapped[int] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True
+    )
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    content: Mapped[str] = mapped_column(Text)
+    source_id: Mapped[str] = mapped_column(Text)
+    interrupted: Mapped[bool] = mapped_column(Boolean)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.clock_timestamp())
+
+
+class CaptureSource(Base):
+    """Producer aliases survive restarts without becoming new logical turns."""
+
+    __tablename__ = "capture_sources"
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True
+    )
+    source_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    turn_id: Mapped[str] = mapped_column(Text)
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"))
+
+
+class CaptureIncident(Base):
+    """Retain conflicting/late content without silently changing canonical evidence."""
+
+    __tablename__ = "capture_incidents"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    turn_id: Mapped[str] = mapped_column(Text)
+    kind: Mapped[str] = mapped_column(Text)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    fingerprint: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.clock_timestamp())
+    resolved_at: Mapped[datetime | None] = mapped_column()
+    seal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("transcript_seals.id", ondelete="CASCADE")
+    )
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "fingerprint", name="capture_incident_unique"),
+    )
+
+
+class TranscriptSeal(Base):
+    __tablename__ = "transcript_seals"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer)
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("transcript_seals.id", ondelete="CASCADE")
+    )
+    records: Mapped[list[dict]] = mapped_column(JSONB)
+    provenance: Mapped[dict] = mapped_column(JSONB)
+    transcript_hash: Mapped[str] = mapped_column(Text)
+    integrity: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.clock_timestamp())
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "version", name="transcript_seal_version_unique"),
+        CheckConstraint("version >= 1", name="transcript_seal_version_positive"),
+    )
+
+
+class IncidentResolution(Base):
+    __tablename__ = "incident_resolutions"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE")
+    )
+    incident_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("capture_incidents.id", ondelete="CASCADE"), unique=True
+    )
+    decision: Mapped[str] = mapped_column(Text)
+    rationale: Mapped[str] = mapped_column(Text)
+    reviewer: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.clock_timestamp())
+    __table_args__ = (
+        CheckConstraint(
+            "decision IN ('duplicate','post_cut','omission')", name="incident_resolution_decision"
+        ),
+    )
 
 
 class Evaluation(Base):
@@ -167,8 +333,8 @@ class Evaluation(Base):
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True
     )
-    hired: Mapped[bool] = mapped_column(Boolean)
-    score: Mapped[int] = mapped_column(Integer)  # 0..100
+    hired: Mapped[bool | None] = mapped_column(Boolean)
+    score: Mapped[int | None] = mapped_column(Integer)  # 0..100, or not assessable
     strengths: Mapped[list[str]] = mapped_column(JSONB)
     weaknesses: Mapped[list[str]] = mapped_column(JSONB)
     rationale: Mapped[str] = mapped_column(Text)
@@ -179,8 +345,243 @@ class Evaluation(Base):
     calibration_notes: Mapped[list[str] | None] = mapped_column(JSONB)
     ended_by: Mapped[str] = mapped_column(Text)  # same values as ended_reason
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
     conversation: Mapped[Conversation] = relationship(back_populates="evaluation")
+
+
+class EvaluationRequest(Base):
+    __tablename__ = "evaluation_requests"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    automatic: Mapped[bool] = mapped_column(Boolean)
+    transcript_hash: Mapped[str] = mapped_column(Text)
+    seal_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("transcript_seals.id", ondelete="CASCADE")
+    )
+    status: Mapped[str] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(server_default=func.clock_timestamp())
+    deadline_at: Mapped[datetime] = mapped_column()
+    __table_args__ = (
+        Index(
+            "evaluation_automatic_once",
+            "conversation_id",
+            unique=True,
+            postgresql_where=automatic.is_(True),
+        ),
+        CheckConstraint("attempts BETWEEN 0 AND 3", name="evaluation_request_budget"),
+    )
+
+
+class EvaluationRun(Base):
+    __tablename__ = "evaluation_runs"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    request_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("evaluation_requests.id", ondelete="CASCADE"), index=True
+    )
+    ordinal: Mapped[int | None] = mapped_column(Integer)
+    started_at: Mapped[datetime | None] = mapped_column()
+    lease_until: Mapped[datetime | None] = mapped_column()
+    finished_at: Mapped[datetime | None] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    status: Mapped[str] = mapped_column(Text)
+    transcript_hash: Mapped[str] = mapped_column(Text)
+    config: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    error: Mapped[str | None] = mapped_column(Text)
+
+
+class TurnRun(Base):
+    __tablename__ = "turn_runs"
+    __table_args__ = (UniqueConstraint("conversation_id", "turn_id", name="turn_runs_unique"),)
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    turn_id: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    decision: Mapped[dict[str, Any]] = mapped_column(JSONB)
+
+
+class QuestionDelivery(Base):
+    __tablename__ = "question_deliveries"
+    id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("turn_runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    text: Mapped[str] = mapped_column(Text)
+    capture_order: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.clock_timestamp())
+
+
+class QuestionAttempt(Base):
+    __tablename__ = "question_attempts"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    question_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("question_deliveries.id", ondelete="CASCADE"), index=True
+    )
+    explicit: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    status: Mapped[str] = mapped_column(Text, default="requested", server_default="requested")
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    owner_epoch: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.clock_timestamp())
+    started_at: Mapped[datetime | None] = mapped_column()
+    finished_at: Mapped[datetime | None] = mapped_column()
+
+
+class TurnExecution(Base):
+    """A logical turn's durable budget and short exclusive decision lease."""
+
+    __tablename__ = "turn_executions"
+    __table_args__ = (
+        UniqueConstraint("conversation_id", "turn_id", name="turn_executions_unique"),
+        CheckConstraint("invocations_reserved BETWEEN 0 AND 2", name="turn_execution_budget"),
+        Index("turn_executions_queue_idx", "conversation_id", "status", "created_at"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE")
+    )
+    turn_id: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    status: Mapped[str] = mapped_column(Text, default="queued", server_default="queued")
+    invocations_reserved: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # First reservation is atomic with the claim; recovery never moves its deadline.
+    decision_deadline_at: Mapped[datetime | None] = mapped_column()
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    producer_owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    producer_epoch: Mapped[int | None] = mapped_column(BigInteger)
+    lease_until: Mapped[datetime | None] = mapped_column()
+    last_owner_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    notice_claimed_at: Mapped[datetime | None] = mapped_column()
+    waiters: Mapped[dict[str, float]] = mapped_column(JSONB, default=dict, server_default="{}")
+
+
+class TurnInvocation(Base):
+    """Reservations are not evidence that an HTTP request or token was used."""
+
+    __tablename__ = "turn_invocations"
+    __table_args__ = (
+        UniqueConstraint("execution_id", "ordinal", name="turn_invocations_unique"),
+        CheckConstraint("ordinal BETWEEN 1 AND 2", name="turn_invocation_ordinal"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    execution_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("turn_executions.id", ondelete="CASCADE"), index=True
+    )
+    ordinal: Mapped[int] = mapped_column(Integer)
+    owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    state_revision: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column()
+    outcome: Mapped[str | None] = mapped_column(Text)
+
+
+class Evidence(Base):
+    __tablename__ = "evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "milestone_id",
+            "message_id",
+            "message_version",
+            "quote",
+            name="evidence_unique",
+            postgresql_nulls_not_distinct=True,
+        ),
+        ForeignKeyConstraint(
+            ["message_id", "message_version"],
+            ["message_versions.message_id", "message_versions.version"],
+            ondelete="CASCADE",
+            name="evidence_message_version_fk",
+        ),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    milestone_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("milestones.id", ondelete="CASCADE"))
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"))
+    message_version: Mapped[int | None] = mapped_column(Integer)
+    quote: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+
+class MetricEvent(Base):
+    __tablename__ = "metric_events"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    turn_id: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), index=True)
+    component: Mapped[str] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(Text)
+    value: Mapped[float | None] = mapped_column(Float)
+    dimensions: Mapped[dict[str, Any]] = mapped_column(JSONB)
+
+
+class ProcessManifest(Base):
+    """Effective process configuration; no source documents or credentials."""
+
+    __tablename__ = "process_manifests"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
+    )
+    role: Mapped[str] = mapped_column(Text)
+    snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.clock_timestamp(), index=True)
+
+
+class ExternalTrace(Base):
+    """Durable external deletion job; tombstones survive local content deletion."""
+
+    __tablename__ = "external_traces"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("conversations.id", ondelete="SET NULL"), index=True
+    )
+    endpoint: Mapped[str] = mapped_column(Text)
+    project_name: Mapped[str] = mapped_column(Text)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    created_at: Mapped[datetime] = mapped_column(server_default=func.clock_timestamp())
+    expires_at: Mapped[datetime] = mapped_column(index=True)
+    state: Mapped[str] = mapped_column(Text, default="active", server_default="active")
+    deletion_requested_at: Mapped[datetime | None]
+    deletion_submitted_at: Mapped[datetime | None]
+    deleted_at: Mapped[datetime | None]
+    next_attempt_at: Mapped[datetime | None] = mapped_column(index=True)
+    lease_owner: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    lease_until: Mapped[datetime | None]
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    failures: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
+class MetricAggregate(Base):
+    """No transcript, candidate ID, or link to a purged conversation."""
+
+    __tablename__ = "metric_aggregates"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    bucket_date: Mapped[datetime] = mapped_column(index=True)
+    dimensions: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    component: Mapped[str] = mapped_column(Text)
+    name: Mapped[str] = mapped_column(Text)
+    count: Mapped[int] = mapped_column(Integer)
+    unknown_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    total: Mapped[float] = mapped_column(Float)
+    minimum: Mapped[float | None] = mapped_column(Float)
+    maximum: Mapped[float | None] = mapped_column(Float)
+    histogram: Mapped[dict[str, int]] = mapped_column(JSONB, default=dict, server_default="{}")
 
 
 class AppSettings(Base):
@@ -288,9 +689,116 @@ async def insert_message(
     role: str,
     content: str,
     seq: int | None = None,
-) -> None:
-    session.add(Message(conversation_id=conversation_id, role=role, content=content, seq=seq))
-    await session.commit()
+    *,
+    source_id: str | None = None,
+    turn_id: str | None = None,
+    interrupted: bool = False,
+    metrics: dict | None = None,
+    commit: bool = True,
+) -> Message:
+    # Allocate order under the conversation lock; two jobs cannot interleave
+    # their local counters after a reconnect. Tests may pin seq explicitly.
+    conversation = await session.scalar(
+        select(Conversation)
+        .where(Conversation.id == conversation_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if source_id is not None:
+        existing = await session.scalar(
+            select(Message).where(
+                Message.conversation_id == conversation_id, Message.source_id == source_id
+            )
+        )
+        if existing is not None:
+            if existing.version is not None:
+                raise ValueError("Versioned messages require durable capture admission")
+            if metrics:
+                previous_metrics = existing.metrics or {}
+                previous = previous_metrics.get("stt_confirmed")
+                merged_metrics = {**previous_metrics, **metrics}
+                current = merged_metrics.get("stt_confirmed")
+                provenance_changed = (
+                    ("stt_confirmed" in previous_metrics) != ("stt_confirmed" in merged_metrics)
+                    or type(current) is not type(previous)
+                    or current != previous
+                )
+                if provenance_changed and conversation is not None:
+                    if conversation.transcript_sealed_at is not None:
+                        raise ValueError("Sealed STT eligibility cannot be changed")
+                    conversation.state_revision += 1
+                existing.metrics = merged_metrics
+                if provenance_changed:
+                    # JSON dirty checking uses Python equality: True == 1.
+                    # Force persistence of a source-type change as well.
+                    flag_modified(existing, "metrics")
+            if interrupted and not existing.interrupted:
+                if conversation is not None and conversation.transcript_sealed_at is not None:
+                    raise ValueError("Sealed message interruption cannot be changed")
+                existing.interrupted = True
+                if conversation is not None:
+                    conversation.state_revision += 1
+            if commit:
+                await session.commit()
+            else:
+                await session.flush()
+            return existing
+    if conversation is not None and (
+        conversation.transcript_sealed_at is not None
+        or (
+            conversation.closing_id is not None
+            and conversation.status
+            not in (
+                "planned",
+                "interviewing",
+                "closing",
+            )
+        )
+    ):
+        raise ValueError("The canonical transcript is sealed; new messages are rejected")
+    if seq is None:
+        highest = await session.scalar(
+            select(func.max(Message.seq)).where(Message.conversation_id == conversation_id)
+        )
+        seq = (highest if highest is not None else -1) + 1
+    message = Message(
+        conversation_id=conversation_id,
+        role=role,
+        content=content,
+        seq=seq,
+        source_id=source_id,
+        turn_id=turn_id,
+        interrupted=interrupted,
+        metrics=metrics,
+    )
+    session.add(message)
+    if conversation is not None:
+        conversation.state_revision += 1
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
+    return message
+
+
+async def begin_interview(session: AsyncSession, conversation_id: uuid.UUID) -> str | None:
+    """Late dispatches never reopen closing or terminal conversations."""
+    conversation = await session.scalar(
+        select(Conversation)
+        .where(Conversation.id == conversation_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if conversation is None:
+        return None
+    if conversation.status in ("planned", "interviewing"):
+        if conversation.status != "interviewing" or conversation.started_at is None:
+            conversation.state_revision += 1
+        conversation.status = "interviewing"
+        if conversation.started_at is None:
+            conversation.started_at = await session.scalar(select(func.clock_timestamp()))
+        await session.commit()
+    return conversation.status
 
 
 async def count_active_interviews(session: AsyncSession, window_minutes: int) -> int:
@@ -302,7 +810,7 @@ async def count_active_interviews(session: AsyncSession, window_minutes: int) ->
         select(func.count())
         .select_from(Conversation)
         .where(
-            Conversation.status == "interviewing",
+            Conversation.status.in_(("interviewing", "closing")),
             Conversation.updated_at >= func.now() - timedelta(minutes=window_minutes),
         )
     )
@@ -315,7 +823,10 @@ async def set_status(
     status: str,
     ended_reason: str | None = None,
 ) -> None:
-    values: dict[str, Any] = {"status": status}
+    values: dict[str, Any] = {
+        "status": status,
+        "state_revision": Conversation.state_revision + 1,
+    }
     if ended_reason is not None:
         values["ended_reason"] = ended_reason
     await session.execute(
@@ -330,49 +841,32 @@ EVALUATION_CLAIMABLE = ("completed", "evaluation_failed", "evaluated")
 
 
 async def claim_evaluation(
-    session: AsyncSession, conversation_id: uuid.UUID, stale_after: timedelta
+    session: AsyncSession,
+    conversation_id: uuid.UUID,
+    stale_after: timedelta,
+    *,
+    automatic: bool = False,
+    recover: bool = False,
+    request_id: uuid.UUID | None = None,
+) -> uuid.UUID | None:
+    from interview_agent.interview.evaluation_requests import claim
+
+    return await claim(
+        session,
+        conversation_id,
+        stale_after,
+        automatic=automatic,
+        recover=recover,
+        request_id=request_id,
+    )
+
+
+async def heartbeat_evaluation(
+    session: AsyncSession, conversation_id: uuid.UUID, claim_id: uuid.UUID | None = None
 ) -> bool:
-    """Move the row into "evaluating" in ONE statement, so two callers racing
-    to evaluate the same interview (the worker's trigger and a retry from the
-    browser) cannot both start a run: exactly one sees the row change.
+    from interview_agent.interview.evaluation_requests import heartbeat
 
-    Claimable: any EVALUATION_CLAIMABLE status, or an "evaluating" row whose
-    updated_at is older than `stale_after` — a live run heartbeats that
-    column, so one that stopped moving belongs to a process that died.
-    """
-    result = await session.execute(
-        update(Conversation)
-        .where(
-            Conversation.id == conversation_id,
-            or_(
-                Conversation.status.in_(EVALUATION_CLAIMABLE),
-                and_(
-                    Conversation.status == "evaluating",
-                    Conversation.updated_at < func.now() - stale_after,
-                ),
-            ),
-        )
-        .values(status="evaluating")
-        .returning(Conversation.id)
-    )
-    claimed = result.scalar_one_or_none() is not None
-    await session.commit()
-    return claimed
-
-
-async def heartbeat_evaluation(session: AsyncSession, conversation_id: uuid.UUID) -> bool:
-    """Bump updated_at while an evaluation runs. Returns False once the row
-    has left "evaluating" (finished, or reclaimed by someone else), which
-    tells the caller to stop."""
-    result = await session.execute(
-        update(Conversation)
-        .where(Conversation.id == conversation_id, Conversation.status == "evaluating")
-        .values(updated_at=func.now())
-        .returning(Conversation.id)
-    )
-    alive = result.scalar_one_or_none() is not None
-    await session.commit()
-    return alive
+    return await heartbeat(session, conversation_id, claim_id, timedelta(minutes=2))
 
 
 async def set_status_if(
@@ -411,6 +905,8 @@ async def add_token_usage(
     conversation_id: uuid.UUID,
     component: str,
     usage: dict[str, int],
+    *,
+    commit: bool = True,
 ) -> None:
     """Merge one component's token counts into conversations.token_usage.
 
@@ -418,7 +914,9 @@ async def add_token_usage(
     run concurrently for one conversation — planning precedes the interview,
     and the worker flushes interviewer usage before triggering evaluation.
     """
-    conversation = await session.get(Conversation, conversation_id)
+    conversation = await session.scalar(
+        select(Conversation).where(Conversation.id == conversation_id).with_for_update()
+    )
     if conversation is None:
         return
     current = dict(conversation.token_usage or {})
@@ -430,7 +928,8 @@ async def add_token_usage(
     # Reassign the whole dict: JSONB columns have no mutation tracking, so
     # in-place updates would never be flushed (same pattern as `.plan`).
     conversation.token_usage = current
-    await session.commit()
+    if commit:
+        await session.commit()
 
 
 async def get_app_settings(session: AsyncSession) -> AppSettings:
@@ -468,6 +967,13 @@ async def delete_conversations_older_than(session: AsyncSession, days: int) -> l
         await session.scalars(select(Conversation.id).where(Conversation.created_at < cutoff))
     )
     if ids:
+        from interview_agent.privacy import retire_traces
+
+        for identifier in ids:
+            await session.scalar(
+                select(Conversation.id).where(Conversation.id == identifier).with_for_update()
+            )
+            await retire_traces(session, conversation_id=identifier)
         await session.execute(delete(Conversation).where(Conversation.id.in_(ids)))
         await session.commit()
     return ids

@@ -10,12 +10,12 @@ Tres agentes, un solo flujo:
 
 1. **Planner** — lee el currículum y la oferta, y diseña la entrevista (persona del entrevistador, hitos a cubrir) en el idioma que configuraste.
 2. **Interviewer** — un agente de voz en tiempo real que conduce la entrevista en el navegador sobre LiveKit, va marcando los hitos y usa el currículum completo y la oferta en su contexto para fundamentar las preguntas.
-3. **Evaluator** — cuando la entrevista termina (plan completado, límite de tiempo, o cierras la pestaña), evalúa el transcript automáticamente: contratado o no, puntuación, fortalezas y debilidades.
+3. **Evaluator** — tras el cierre y un sello inmutable del transcript, evalúa cada criterio con evidencia del candidato. Las entrevistas parciales o insuficientes no reciben puntuación ni veredicto global. Las solicitudes recuperables conservan sus intentos y resultados anteriores.
 
 ## Stack
 
 - **LiveKit Agents** — pipeline de audio en tiempo real (STT, TTS, detección de turnos)
-- **LangGraph** — el cerebro del entrevistador (grafo ReAct + tools)
+- **LangGraph** — decisiones de entrevista validadas y persistidas transaccionalmente
 - **OpenAI** — LLMs para planificación, entrevista y evaluación
 - **PostgreSQL** — conversaciones, hitos, transcripts, evaluaciones
 - **FastAPI** — el API, bajo `/api` (también sirve el frontend compilado)
@@ -25,7 +25,7 @@ Tres agentes, un solo flujo:
 
 - Docker
 - Una API key de OpenAI
-- Un proyecto gratuito de LiveKit Cloud (URL + API key + secret) — [cloud.livekit.io](https://cloud.livekit.io)
+- Un proyecto de LiveKit Cloud (URL + API key + secret) — [cloud.livekit.io](https://cloud.livekit.io)
 
 ## Cómo correrlo
 
@@ -44,30 +44,19 @@ La pantalla **Settings** configura el agente de forma global: su nombre, el idio
 
 ## Contexto de voz y recuperación
 
-El texto extraído del currículum admite hasta 30.000 caracteres y la oferta hasta 20.000. Los documentos mayores reciben HTTP 413 antes de planificar o iniciar la sesión de voz, incluidas las entrevistas guardadas antes de estos límites. El contenido no se trunca silenciosamente. Estos límites acotan el contexto completo para el uso interactivo por voz; la latencia también depende del modelo y de la longitud de la conversación.
+El texto extraído del currículum admite hasta 30.000 caracteres y la oferta hasta 20.000. Los documentos mayores reciben HTTP 413 antes de planificar o iniciar la sesión de voz. El contenido no se trunca silenciosamente. Revisa el texto extraído del PDF antes de enviarlo; el texto revisado queda vinculado al hash del PDF subido.
 
-La generación especulativa está desactivada porque las herramientas de LangGraph guardan hitos y activan el cierre. Interrumpir una respuesta ya confirmada no revierte las herramientas ejecutadas. Los finales duplicados de AssemblyAI se filtran solo cuando su texto normalizado y sus intervalos de audio identifican voz ya recibida. Si faltan tiempos válidos, se conserva la frase y el worker registra una advertencia por stream STT. Las fixtures históricas de texto usan tiempos sintéticos en las pruebas; quedan pendientes los metadatos reales del proveedor y la validación con micrófono.
+Cada entrevista guarda su nivel, idioma, voz, modelos, límites de preguntas y duración efectivos. Reconectar conserva el inicio original y el presupuesto consumido. El contador visible usa el tiempo calculado por PostgreSQL y un intervalo monotónico local entre actualizaciones; si el dato no está disponible, muestra `--:--`.
 
-Los streams de transcripción fallidos o abandonados conservan el texto recibido con la marca **Incomplete transcription**. Una reconexión breve puede continuar el stream existente; un lector sin datos durante 30 segundos se cancela y queda marcado como incompleto sin terminar la entrevista. El control **Enable audio** aparece cuando el navegador bloquea la reproducción.
+Las respuestas del candidato tienen identidades lógicas estables y versiones inmutables de texto. El texto confirmado y su procedencia se guardan antes de utilizarse en decisiones. Las correcciones y capturas tardías o conflictivas permanecen identificables; repetir las mismas palabras no demuestra duplicación. Las transcripciones sin confirmar se conservan como incompletas. Las decisiones especulativas están desactivadas y las decisiones validadas se guardan antes de entregar la pregunta.
 
-Las burbujas del usuario siguen los turnos de conversación, en vez de las frases individuales de STT. El worker publica texto acumulado por `interview.user_transcription` con un mismo identificador hasta que `conversation_item_added` confirma la respuesta exacta. Se conservan las frases repetidas; los turnos confirmados distintos mantienen identificadores diferentes. La voz del agente sigue usando el stream sincronizado `lk.transcription` de LiveKit. Actualiza worker y frontend juntos para este protocolo.
+Una pregunta guardada que nunca empezó puede recuperarse con el mismo ID. Una entrega incierta o interrumpida no se repite automáticamente. **Listen again** (dentro de **Current question**) solicita expresamente la pregunta guardada sin gastar otra pregunta ni decisión de modelo, siempre que una respuesta ya confirmada no impida repetirla.
 
-Si el SDK no confirma un turno del usuario, el texto presente antes de una respuesta sin interrupciones del agente se conserva como incompleto y la siguiente respuesta recibe otro identificador. Esto requiere que no haya nueva voz ni transcripción del usuario durante esa respuesta. Las interrupciones, los finales tardíos de STT y los límites ambiguos conservan el identificador hasta confirmar el turno del usuario. Los envíos finales fallidos se reintentan una vez con el mismo identificador; si el transporte sigue fallando, el parcial queda incompleto y el texto confirmado permanece en Postgres. El cierre del publicador espera como máximo 10,1 segundos.
+En el cierre normal, el navegador reproduce la despedida localizada y envía una confirmación durable. El worker drena el reconocimiento y guarda un sello inmutable del transcript antes de habilitar los resultados. Un timeout o una confirmación ausente no se presenta como reproducción correcta. **Enable audio** aparece si el navegador bloquea el audio. La pérdida del worker, el abandono y la integridad incompleta siguen siendo visibles; el audio perdido no cuenta como una respuesta incorrecta.
 
-La espera mínima de cierre de turno es de 1,5 segundos; la espera para dudas o pausas más largas sigue en 2,5 segundos. Esto cubre, con margen, el final de STT que llegó 1,17 segundos tarde en la prueba de voz del 30 de septiembre, a cambio de hasta 1,2 segundos más de espera que el mínimo anterior. Las regresiones locales con el SDK reproducen la división anterior y verifican que ese fragmento queda en un solo turno. Los retrasos mayores del proveedor pueden requerir más mediciones; quedan pendientes las pruebas con micrófono en Chrome y Safari posteriores al cambio.
+Los resultados separan cobertura de capacidad y muestran evidencia por criterio y práctica sugerida. **Request new assessment** crea una solicitud distinta conservando el feedback anterior; si se pierde la respuesta HTTP, el reintento mantiene la misma identidad. **Evaluation history** incluye resultados anteriores e intentos fallidos. **Review saved answers** permite decidir incidentes expresamente y crear nuevas versiones del transcript; conserva versiones y evaluaciones previas, y una omisión confirmada mantiene oculta la puntuación global antigua afectada. Estos controles son opcionales y no exigen revisión manual para realizar una entrevista.
 
-## Actualización desde la versión con Qdrant
-
-Retirar Qdrant de Compose no elimina sus contenedores ni el volumen `qdrant_data` existente. La tarea actual de retención solo gestiona Postgres; los datos vectoriales antiguos requieren una limpieza única por parte del administrador del despliegue.
-
-Identifica el contenedor y el volumen de Qdrant de este despliegue con `docker ps -a` y `docker volume ls` (las etiquetas de Compose indican el proyecto, servicio y volumen). Si ya no necesitas los datos vectoriales antiguos, elimina únicamente esos recursos de Qdrant:
-
-```bash
-docker rm -f <contenedor-qdrant-antiguo>
-docker volume rm <volumen-qdrant-antiguo>
-```
-
-Conserva el contenedor y el volumen de Postgres: guardan los currículums, entrevistas y evaluaciones de esta versión. No uses una limpieza general de volúmenes. Esta actualización no borra automáticamente los datos antiguos de Qdrant.
+Las esperas actuales de cierre de turno son 1,5 segundos como mínimo y 2,5 segundos para dudas más largas. Las pruebas SDK y de audio sintético cubren los contratos implementados; no acreditan comportamiento del micrófono físico, latencia audible ni mejora de calidad de entrevista. La página **Metrics** muestra latencia, gasto y resultados de cierre registrados solo como metadatos; con `LANGSMITH_API_KEY` se exportan además trazas sin contenido.
 
 ## Desarrollo (local)
 

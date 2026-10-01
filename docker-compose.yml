@@ -51,9 +51,9 @@ services:
     <<: *app-env
     command: python main.py start
     restart: unless-stopped
-    # On SIGTERM the worker stops taking jobs and drains active interviews;
-    # give it time to finish them instead of killing calls after 10s.
-    stop_grace_period: 600s
+    # Allow every supported WORKER_DRAIN_MINUTES (1..60) plus SDK cleanup.
+    # Docker must not kill interviews before the worker's own drain expires.
+    stop_grace_period: 3700s
     depends_on:
       migrate:
         condition: service_completed_successfully

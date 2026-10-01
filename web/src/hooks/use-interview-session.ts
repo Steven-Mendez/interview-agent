@@ -1,15 +1,23 @@
 import * as React from "react"
-import { Room, RoomEvent } from "livekit-client"
+import { Room, RoomEvent, RpcError } from "livekit-client"
 import type { TextStreamHandler } from "livekit-client"
 
 import { getInterviewToken, ApiError } from "@/lib/api"
 import { log } from "@/lib/log"
+import { FarewellPlayback } from "@/lib/farewell"
+import { requestInterviewEnd } from "@/lib/closing-request"
+import { watchResponseOnset } from "@/lib/response-onset"
 
 // Live interview session over LiveKit. Transcript identity comes from the
 // SDK segment id; text similarity alone never proves duplicated speech.
 
-export type SessionPhase = "idle" | "connecting" | "live" | "ended"
+export type SessionPhase = "idle" | "connecting" | "live" | "closing" | "ended"
 export type Who = "user" | "agent"
+
+// Async SDK callbacks may update this ref while connect()/publish() is pending.
+function readSessionPhase(ref: React.RefObject<SessionPhase>): SessionPhase {
+  return ref.current
+}
 
 // This is an inactivity timeout, refreshed by every chunk, not a maximum
 // utterance length. A stalled reader should not stay pending indefinitely.
@@ -28,6 +36,8 @@ export interface ChatMessage {
  *  interview is published through the microphone the candidate just tested. */
 export interface StartOptions {
   audioDeviceId?: string
+  /** Output chosen in the pre-join check; omitted = browser default. */
+  audioOutputDeviceId?: string
   /** Runs once the room is connected, right before the microphone is
    *  published — the moment for the pre-join check to let go of the device.
    *  Anything that fails before this leaves the check untouched. */
@@ -45,13 +55,26 @@ export interface InterviewSession {
   messages: ChatMessage[]
   /** Raw `lk.agent.state` (initializing/listening/thinking/speaking) or null. */
   agentState: string | null
+  /** The interviewer spoke its fixed technical notice instead of a question:
+   *  the candidate may answer again or end. Cleared by the next question. */
+  technicalNotice: boolean
   /** The connected Room, exposed for <RoomContext.Provider> + <RoomAudioRenderer>. */
   room: Room | null
   /** `Date.now()` captured on Disconnected — the evaluation-timeout clock starts here. */
   endedAt: number | null
+  requestEnd: () => void
+  farewellBlocked: boolean
+  closingRecoveryPending: boolean
+  resumeFarewell: () => void
+  syncClosingState: (
+    status: string,
+    closingId: string | null,
+    farewellStatus: string | null,
+    transcriptSealed: boolean
+  ) => void
 }
 
-// Internal per-segment state. Mirrors app.js's `segments` Map values, minus
+// Internal per-segment state, minus
 // the DOM node: `rendered` replaces `seg.el` (a segment only enters the render
 // list once it has non-empty text).
 interface Segment {
@@ -76,11 +99,17 @@ export function useInterviewSession(interviewId: string): InterviewSession {
   const [error, setError] = React.useState<string | null>(null)
   const [messages, setMessages] = React.useState<ChatMessage[]>([])
   const [agentState, setAgentState] = React.useState<string | null>(null)
+  const [technicalNotice, setTechnicalNotice] = React.useState(false)
   const [room, setRoom] = React.useState<Room | null>(null)
   const [endedAt, setEndedAt] = React.useState<number | null>(null)
+  const [farewellBlocked, setFarewellBlocked] = React.useState(false)
+  const [closingRecoveryPending, setClosingRecoveryPending] =
+    React.useState(false)
+  const farewellRef = React.useRef<FarewellPlayback | null>(null)
+  const stopOnsetRef = React.useRef<(() => void) | null>(null)
 
   // Refs for the transcription bookkeeping — mutated imperatively inside the
-  // stream handlers, exactly like the module-level state in app.js.
+  // stream handlers.
   const segmentsRef = React.useRef<Map<string, Segment>>(new Map())
   const readersRef = React.useRef(new Map<AbortController, Segment>())
   const orderRef = React.useRef<string[]>([]) // render order of segment ids
@@ -275,6 +304,8 @@ export function useInterviewSession(interviewId: string): InterviewSession {
         log("agent state:", changed["lk.agent.state"])
         setAgentState(changed["lk.agent.state"])
       }
+      if (!participant.isLocal && "interview.notice" in changed)
+        setTechnicalNotice(changed["interview.notice"] === "technical")
     })
     r.on(RoomEvent.ParticipantConnected, (participant) => {
       const state = participant.attributes["lk.agent.state"]
@@ -290,6 +321,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
 
       void (async () => {
         setPhase("connecting")
+        phaseRef.current = "connecting"
         setError(null)
         let r: Room | null = null
         let handedOver = false
@@ -316,10 +348,52 @@ export function useInterviewSession(interviewId: string): InterviewSession {
               autoGainControl: true,
             },
             publishDefaults: { dtx: true },
+            // Interviewer audio and the farewell clip follow the same output.
+            ...(options?.audioOutputDeviceId
+              ? { audioOutput: { deviceId: options.audioOutputDeviceId } }
+              : {}),
           })
+          farewellRef.current?.dispose()
+          void roomRef.current?.disconnect()
           roomRef.current = r
           registerTranscriptionHandler(r)
           registerAgentStateHandler(r)
+          farewellRef.current = new FarewellPlayback(
+            r,
+            interviewId,
+            {
+              onClosing: (text, closingId) => {
+                if (disposedRef.current) return
+                phaseRef.current = "closing"
+                setPhase("closing")
+                if (text)
+                  setBubbleText(
+                    bubbleFor(`farewell-${closingId}`, "agent"),
+                    text
+                  )
+              },
+              onCompleted: (status) => {
+                if (disposedRef.current) return
+                phaseRef.current = "ended"
+                setEndedAt(Date.now())
+                setPhase("ended")
+                for (const seg of segmentsRef.current.values()) {
+                  if (seg.segmentId.startsWith("farewell-"))
+                    finalizeBubble(seg, status !== "played")
+                }
+                // Sealed: release the microphone even if no worker remains to
+                // close the room (a server-reconciled end).
+                stopOnsetRef.current?.()
+                stopOnsetRef.current = null
+                cancelTranscriptions()
+                void roomRef.current?.disconnect()
+              },
+              onBlocked: setFarewellBlocked,
+              onError: setError,
+              onRecoveryPending: () => setClosingRecoveryPending(true),
+            },
+            token
+          )
           // Until start() hands the room to the UI, a disconnect is a start
           // failure and the catch below owns the phase — including the
           // disconnect the catch itself issues. Flipping to "ended" here
@@ -331,15 +405,21 @@ export function useInterviewSession(interviewId: string): InterviewSession {
               link.lost = true
               return
             }
-            // Interview over (agent deleted the room, or connection lost).
-            log(
-              "disconnected from room (reason:",
-              reason,
-              ") — showing results"
-            )
+            log("disconnected from room (reason:", reason, ")")
             setAgentState(null)
-            setEndedAt(Date.now())
-            setPhase("ended")
+            // Closing is reconciled against saved backend state; a transport
+            // loss alone never proves that the farewell finished playing.
+            if (
+              phaseRef.current !== "closing" &&
+              phaseRef.current !== "ended"
+            ) {
+              phaseRef.current = "idle"
+              setPhase("idle")
+              setRoom(null)
+              setError(
+                "The connection was lost. Rejoin to continue your interview."
+              )
+            }
           })
 
           await r.connect(server_url, token)
@@ -348,33 +428,106 @@ export function useInterviewSession(interviewId: string): InterviewSession {
           // connect returns to a check that is still running.
           handedOver = true
           options?.beforePublish?.()
-          await r.localParticipant.setMicrophoneEnabled(true)
+          if (
+            !farewellRef.current.isClosing &&
+            !farewellRef.current.isFinished
+          ) {
+            await r.localParticipant.setMicrophoneEnabled(true)
+          }
           if (link.lost) {
             throw new Error(
               "The connection dropped before the interview started."
             )
           }
           link.live = true
+          stopOnsetRef.current?.()
+          stopOnsetRef.current = watchResponseOnset(r, interviewId, token)
           log("connected, microphone enabled")
           // Expose the room only now: <RoomAudioRenderer> mounts after the mic
           // gesture and still picks up the agent's (later) audio track.
           setRoom(r)
-          setPhase("live")
+          if (readSessionPhase(phaseRef) === "connecting") {
+            phaseRef.current = "live"
+            setPhase("live")
+          }
         } catch (err) {
           console.error("[app] could not start the interview:", err)
           setError(errorMessage(err))
           roomRef.current = null
+          farewellRef.current?.dispose()
+          farewellRef.current = null
           // A room that did connect (the microphone failed after) would
           // otherwise stay joined — agent dispatched, nobody left to hang
           // up — behind a panel that says idle. A no-op on a room that
           // never connected.
           void r?.disconnect()
+          phaseRef.current = "idle"
           setPhase("idle")
           if (handedOver && !disposedRef.current) options?.onPublishFailed?.()
         }
       })()
     },
-    [interviewId, registerTranscriptionHandler, registerAgentStateHandler]
+    [
+      interviewId,
+      registerTranscriptionHandler,
+      registerAgentStateHandler,
+      bubbleFor,
+      setBubbleText,
+      finalizeBubble,
+      cancelTranscriptions,
+    ]
+  )
+
+  const requestEnd = React.useCallback(() => {
+    const r = roomRef.current
+    if (!r || phaseRef.current !== "live") return
+    const agent = [...r.remoteParticipants.values()].find(
+      (participant) => participant.isAgent
+    )
+    if (!agent) {
+      setError("The interviewer is unavailable. Please wait for reconnection.")
+      return
+    }
+    phaseRef.current = "closing"
+    setPhase("closing")
+    farewellRef.current?.superviseClosing()
+    void requestInterviewEnd(r.localParticipant, agent.identity).catch(
+      (rpcError: unknown) => {
+        if (disposedRef.current || phaseRef.current === "ended") return
+        setError(errorMessage(rpcError))
+        if (
+          rpcError instanceof RpcError &&
+          (rpcError.code === RpcError.ErrorCode.UNSUPPORTED_METHOD ||
+            rpcError.code === RpcError.ErrorCode.RECIPIENT_NOT_FOUND) &&
+          farewellRef.current?.cancelUnacceptedClose()
+        ) {
+          phaseRef.current = "live"
+          setPhase("live")
+        }
+        // A transport timeout can lose the reply after the worker acquired
+        // closing. Keep the independent API supervision and its fixed deadline.
+      }
+    )
+  }, [])
+
+  const resumeFarewell = React.useCallback(() => {
+    void farewellRef.current?.resume()
+  }, [])
+  const syncClosingState = React.useCallback(
+    (
+      status: string,
+      closingId: string | null,
+      farewellStatus: string | null,
+      transcriptSealed: boolean
+    ) => {
+      farewellRef.current?.acceptPersistedState(
+        status,
+        closingId,
+        farewellStatus,
+        transcriptSealed
+      )
+    },
+    []
   )
 
   // Tear the room down on real unmount (navigation away). start() is
@@ -384,10 +537,26 @@ export function useInterviewSession(interviewId: string): InterviewSession {
     disposedRef.current = false
     return () => {
       disposedRef.current = true
+      stopOnsetRef.current?.()
       cancelTranscriptions()
+      farewellRef.current?.dispose()
       void roomRef.current?.disconnect()
     }
   }, [cancelTranscriptions])
 
-  return { phase, start, error, messages, agentState, room, endedAt }
+  return {
+    phase,
+    start,
+    error,
+    messages,
+    agentState,
+    technicalNotice,
+    room,
+    endedAt,
+    requestEnd,
+    farewellBlocked,
+    closingRecoveryPending,
+    resumeFarewell,
+    syncClosingState,
+  }
 }

@@ -1,22 +1,50 @@
-"""Shared LLM plumbing: model tuning, the ChatOpenAI factory and the
-streaming chat node that both LangGraph brains (generic assistant and
-interviewer) use. Previously duplicated in graph.py / interviewer_graph.py.
-"""
+"""Shared LLM plumbing: model tuning, the ChatOpenAI factory and usage totals."""
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Mapping
+import time
+from collections.abc import Mapping
 from typing import Any
 
-from langchain_core.messages import AIMessage, BaseMessageChunk, SystemMessage
+import httpx
 from langchain_core.messages.ai import UsageMetadata
-from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
-from langgraph.config import get_stream_writer
-from langgraph.graph import MessagesState
+from openai import AsyncOpenAI
 from pydantic import SecretStr
 
 from interview_agent.config import Settings
+
+
+class ObservedTransport(httpx.AsyncBaseTransport):
+    """Include failed connection attempts, which HTTP response hooks never see."""
+
+    def __init__(self, observer, transport=None):
+        self.observer = observer
+        self.transport = transport or httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request):
+        started = time.monotonic()
+        try:
+            return await self.transport.handle_async_request(request)
+        except httpx.TransportError as exc:
+            self.observer.telemetry.emit(
+                self.observer.component,
+                "http_transport_errors",
+                1,
+                turn_id=self.observer.turn_id,
+                dimensions={"model": self.observer.model, "error_type": type(exc).__name__},
+            )
+            self.observer.telemetry.emit(
+                self.observer.component,
+                "http_failed_attempt_seconds",
+                time.monotonic() - started,
+                turn_id=self.observer.turn_id,
+                dimensions={"model": self.observer.model},
+            )
+            raise
+
+    async def aclose(self):
+        await self.transport.aclose()
 
 
 def chat_model_tuning(model: str, *, reasoning_effort: str, temperature: float) -> dict[str, Any]:
@@ -24,7 +52,12 @@ def chat_model_tuning(model: str, *, reasoning_effort: str, temperature: float) 
     reasoning effort instead; pre-GPT-5 models are the reverse. The
     `reasoning` dict routes the call to the Responses API — required, since
     Chat Completions rejects reasoning_effort + tools for these models."""
-    if model.startswith("gpt-5"):
+    if model.startswith(("gpt-5", "gpt-6")):
+        allowed = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+        if model.startswith(("gpt-6-astra", "gpt-6.1-sol")):
+            allowed -= {"none", "minimal"}
+        if reasoning_effort not in allowed:
+            raise ValueError(f"Unsupported reasoning effort {reasoning_effort!r} for {model}")
         return {"reasoning": {"effort": reasoning_effort}}
     return {"temperature": temperature}
 
@@ -36,101 +69,51 @@ def build_chat_model(
     reasoning_effort: str,
     stream_usage: bool = False,
     max_retries: int = 3,
+    timeout_seconds: float = 120,
+    telemetry_callback=None,
 ) -> ChatOpenAI:
     """ChatOpenAI with auth, tuning and transport retries in one place.
 
     `max_retries` retries transient failures (connection errors, 429/5xx)
     inside the OpenAI client, before the first streamed chunk — safe for the
     voice path: nothing already spoken is ever re-generated."""
+    tuning = chat_model_tuning(
+        model, reasoning_effort=reasoning_effort, temperature=settings.interviewer_temperature
+    )
+    http_options = {}
+    if telemetry_callback is not None:
+        http_options.update(
+            transport=ObservedTransport(telemetry_callback),
+            event_hooks={
+                "request": [telemetry_callback.http_request],
+                "response": [telemetry_callback.http_response],
+            },
+        )
+    # LangChain caches its default transport. Closing an isolated model must
+    # not poison the client used by the next planner/evaluator in this process.
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(timeout_seconds, connect=min(10, timeout_seconds)),
+        **http_options,
+    )
     return ChatOpenAI(
         model=model,
         api_key=SecretStr(settings.openai_api_key),
         stream_usage=stream_usage,
+        streaming=True,
         max_retries=max_retries,
-        **chat_model_tuning(
-            model,
-            reasoning_effort=reasoning_effort,
-            temperature=settings.interviewer_temperature,
-        ),
+        timeout=timeout_seconds,
+        use_responses_api=True,
+        store=False,
+        http_async_client=http_client,
+        **tuning,
     )
 
 
-def make_json_prefix_filter(emit: Callable[[str], None]) -> Callable[[str], None]:
-    """Wrap a stream writer so a leading JSON object is swallowed.
-
-    Reasoning-free mini models occasionally narrate their tool-call
-    arguments ('{"milestone_number":5,...}') as text right before making
-    the real call — spoken aloud, that is garbage. Legitimate speech never
-    starts with '{', so while the turn's stream opens with one (or several)
-    JSON objects, drop them; everything after flows through untouched.
-    """
-    speaking = False  # once real speech starts, pass everything through
-    depth = 0  # brace depth of the JSON object currently being dropped
-
-    def write(text: str) -> None:
-        nonlocal speaking, depth
-        if speaking:
-            emit(text)
-            return
-        for i, char in enumerate(text):
-            if depth:
-                if char == "{":
-                    depth += 1
-                elif char == "}":
-                    depth -= 1
-                continue
-            if char.isspace():
-                continue
-            if char == "{":
-                depth = 1
-                continue
-            speaking = True
-            emit(text[i:])
-            return
-
-    return write
-
-
-def make_streaming_chat_node(
-    llm: Runnable,
-    system_message: SystemMessage,
-    *,
-    on_usage: Callable[[UsageMetadata], None] | None = None,
-) -> Callable[[MessagesState], Awaitable[dict]]:
-    """Build the `chat` node shared by both graphs.
-
-    `on_usage` is called with the usage_metadata of every completed LLM call
-    (once per ReAct iteration) — the interviewer uses it to meter spend.
-    """
-
-    async def chat(state: MessagesState) -> dict:
-        # LiveKit's LLMAdapter always injects the Agent instructions as the
-        # LEADING SystemMessage, so only prepend ours when the graph runs
-        # standalone (tests, LangGraph Studio) — never double the prompt.
-        # Position 0 is the test, not "any system message": the interviewer
-        # graph appends a per-turn milestone-status SystemMessage later in
-        # the list, which must not suppress the static prompt.
-        messages = state["messages"]
-        if not messages or not isinstance(messages[0], SystemMessage):
-            messages = [system_message, *messages]
-        # The adapter runs this graph with stream_mode="custom": only text
-        # handed to the writer is spoken, so tool outputs never reach TTS.
-        # No-op when run via ainvoke (tests, Studio).
-        speak = make_json_prefix_filter(get_stream_writer())
-        full: AIMessage | BaseMessageChunk | None = None
-        async for chunk in llm.astream(messages):
-            # Summing chunks aggregates tool_call deltas into complete calls.
-            # (chunk + chunk is always a chunk; the __add__ stubs over-widen.)
-            full = chunk if full is None else full + chunk  # type: ignore[assignment,operator]
-            if chunk.text:  # flattens Responses-API content blocks
-                speak(str(chunk.text))
-        # With stream_usage=True the summed chunk carries usage_metadata (on
-        # both the Chat Completions and Responses API paths).
-        if on_usage is not None and full is not None and full.usage_metadata:
-            on_usage(full.usage_metadata)
-        return {"messages": [full]}
-
-    return chat
+async def close_chat_model(model) -> None:
+    """Release the owned SDK client after each isolated planner/decision/evaluation."""
+    client = getattr(model, "root_async_client", None)
+    if isinstance(client, AsyncOpenAI):
+        await client.close()
 
 
 def summarize_usage(usage_by_model: Mapping[str, UsageMetadata]) -> dict[str, int]:

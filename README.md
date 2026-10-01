@@ -10,12 +10,12 @@ Three agents, one flow:
 
 1. **Planner** — reads the resume and the job offer, designs the interview (interviewer persona, milestones to cover) in the language you configured.
 2. **Interviewer** — a real-time voice agent that runs the interview in the browser over LiveKit, checks off milestones as it goes, and uses the full resume and job offer in its context to ground its questions.
-3. **Evaluator** — when the interview ends (plan complete, time cap, or you close the tab), it scores the transcript automatically: hired or not, score, strengths and weaknesses.
+3. **Evaluator** — after closure and an immutable transcript seal, it assesses each criterion with evidence from the candidate. Partial or insufficient interviews have no global score or verdict. Recoverable requests preserve their attempts and previous results.
 
 ## Tech stack
 
 - **LiveKit Agents** — real-time audio pipeline (STT, TTS, turn detection)
-- **LangGraph** — the interviewer's brain (ReAct graph + tools)
+- **LangGraph** — validated interview decisions with transactional persistence
 - **OpenAI** — LLMs for planning, interviewing and evaluation
 - **PostgreSQL** — conversations, milestones, transcripts, evaluations
 - **FastAPI** — the API, under `/api` (also serves the built frontend)
@@ -25,7 +25,7 @@ Three agents, one flow:
 
 - Docker
 - An OpenAI API key
-- A free LiveKit Cloud project (URL + API key + secret) — [cloud.livekit.io](https://cloud.livekit.io)
+- A LiveKit Cloud project (URL + API key + secret) — [cloud.livekit.io](https://cloud.livekit.io)
 
 ## Run it
 
@@ -44,30 +44,19 @@ The **Settings** screen configures the agent globally: its name, the interview l
 
 ## Voice context and recovery
 
-The extracted resume is limited to 30,000 characters and the job offer to 20,000. Oversized sources receive HTTP 413 before planning or starting a voice session, including stored interviews created before these limits. Documents are never silently truncated. These bounds keep the full-document context suitable for interactive voice use; actual response latency still depends on the model and conversation length.
+The extracted resume is limited to 30,000 characters and the job offer to 20,000. Oversized sources receive HTTP 413 before planning or starting a voice session. Documents are never silently truncated. Review the extracted PDF text before submitting it; the reviewed text remains bound to the uploaded PDF's hash.
 
-Speculative generation is disabled because the LangGraph tools persist milestones and signal interview closure. Interrupting an already confirmed response does not roll back tools that have run. AssemblyAI duplicate finals are filtered only when their normalized text and audio boundaries identify previously received speech. When timing evidence is absent, speech is kept and the worker logs one warning per STT stream. Historical text fixtures use synthetic timing in tests; real provider metadata and microphone behavior remain to be verified.
+Each interview saves its effective level, language, voice, models, question limits and duration. Reconnecting retains the original start and consumed budget. The live counter uses elapsed time calculated by PostgreSQL and a local monotonic interval between updates; an unavailable value is shown as `--:--`.
 
-Failed or abandoned transcription streams keep any received text marked **Incomplete transcription**. Brief reconnects can continue the existing stream; a reader that receives no data for 30 seconds is cancelled and marked incomplete without ending the interview. The **Enable audio** control appears when the browser blocks playback.
+Candidate replies have stable logical identities and immutable text versions. Confirmed text and provider provenance are saved before decisions use them. Corrections and late or conflicting captures remain identifiable; repeated wording alone does not establish duplication. Unconfirmed transcription is retained as incomplete. Speculative decisions are disabled, and validated decisions commit before question delivery.
 
-User bubbles follow conversation turns rather than individual STT sentences. The worker forwards cumulative text on `interview.user_transcription` under one id until `conversation_item_added` confirms the exact reply. Repeated sentences are preserved; separate confirmed turns keep separate ids. Agent speech continues using LiveKit's synchronized `lk.transcription` stream. Upgrade worker and frontend together for this protocol.
+A persisted question that never started can resume under the same ID. An uncertain or interrupted delivery is not repeated automatically. **Listen again** (under **Current question**) explicitly requests the saved question without spending another question or model decision, provided no confirmed answer already prevents replay.
 
-If the SDK never confirms a user turn, text already present before uninterrupted agent speech is retained as incomplete and the next answer gets a fresh id. This requires no new user speech or transcription during that agent response. Interruptions, late STT and ambiguous boundaries preserve the current id until the user turn is confirmed. Failed final publications are retried once with the same id; persistent transport failures still leave the partial incomplete, while the confirmed text remains in Postgres. Publisher shutdown drains for at most 10.1 seconds.
+In the normal closing flow, the browser plays the localized farewell and sends a durable playback acknowledgement. The worker drains recognition and writes an immutable transcript seal before results become available. A timeout or missing acknowledgement is not presented as successful playback. **Enable audio** appears when the browser blocks playback. Worker loss, abandonment and incomplete recording remain visible, and missing audio is not treated as a wrong answer.
 
-The minimum endpointing delay is 1.5 seconds; the longer hesitation delay remains 2.5 seconds. This covers the 1.17-second late STT final observed in the September 30 voice test, with a margin, and costs up to 1.2 seconds more waiting than the previous minimum. Local SDK regression tests reproduce the old split and verify that this tail stays in one turn. Longer provider stalls can still require further measurement; post-change microphone tests in Chrome and Safari remain pending.
+The results distinguish coverage from ability and show criterion evidence and suggested practice. **Request new assessment** creates a separate request while retaining the earlier feedback; an uncertain HTTP reply keeps the same request identity on retry. **Evaluation history** includes earlier results and failed attempts. **Review saved answers** supports explicit incident decisions and new transcript versions; it preserves old versions and assessments, and a confirmed omission keeps the affected old global score hidden. These controls are optional and do not require a manual review to conduct an interview.
 
-## Upgrading from the Qdrant version
-
-Removing Qdrant from Compose does not delete existing containers or the `qdrant_data` volume. The current retention job only manages Postgres; legacy vector data needs a one-time cleanup by the deployment operator.
-
-Identify the old Qdrant container and volume belonging to this deployment with `docker ps -a` and `docker volume ls` (Compose labels identify the project, service and volume). If the old vector data is no longer needed, remove only those Qdrant resources:
-
-```bash
-docker rm -f <legacy-qdrant-container>
-docker volume rm <legacy-qdrant-volume>
-```
-
-Keep the Postgres container and volume: they store the resumes, interviews and evaluations used by this version. Do not use a blanket volume cleanup. This upgrade does not automatically delete legacy Qdrant data.
+The current endpointing delays are 1.5 seconds minimum and 2.5 seconds for longer hesitation. SDK and synthetic-audio integration tests cover the implemented contracts; they do not establish physical microphone behavior, audible latency or improved interview quality. The **Metrics** page shows latency, spend and closing outcomes recorded from metadata only; setting `LANGSMITH_API_KEY` additionally exports content-free traces.
 
 ## Development (local)
 

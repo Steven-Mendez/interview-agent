@@ -1,118 +1,85 @@
 """LiveKit/LangGraph regression checks without provider calls or real audio."""
 
 import asyncio
-import json
 import time
 import uuid
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from langchain_core.messages import AIMessageChunk
 from livekit import rtc
 from livekit.agents import Agent, AgentSession, stt
 from livekit.agents.llm import ChatContext
 from livekit.agents.voice.audio_recognition import AudioRecognition
 from livekit.agents.voice.endpointing import BaseEndpointing
 from livekit.agents.voice.turn import TurnDetectionEvent
+from sqlalchemy import func, select
 
 from interview_agent import agent
 from interview_agent.config import settings
-from interview_agent.interview import interviewer_graph
+from interview_agent.interview import db
 from interview_agent.interview.context import MAX_RESUME_CHARS
-from interview_agent.interview.db import Milestone
+from interview_agent.interview.dialogue import DialogueLLM
+from interview_agent.interview.workers import WorkerCoordinator, WorkerOwnershipError
+from interview_agent.playback import closing_state
 
 
-class LocalToolModel:
-    def bind_tools(self, tools):
-        return self
-
-    async def astream(self, messages):
-        yield AIMessageChunk(
-            content="",
-            tool_call_chunks=[
-                {
-                    "name": "complete_milestone",
-                    "args": json.dumps({"milestone_number": 1, "notes": "Explained SQL"}),
-                    "id": "milestone",
-                    "index": 0,
-                },
-                {"name": "end_interview", "args": '{"reason":"Done"}', "id": "end", "index": 1},
-            ],
-        )
-
-
-class LocalSessionMaker:
-    def __call__(self):
-        return self
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args):
-        return None
-
-
-async def test_configured_session_disables_speculation_and_keeps_tools_working(monkeypatch):
-    end_event = asyncio.Event()
-    milestone = Milestone(
-        id=uuid.uuid4(),
-        conversation_id=uuid.uuid4(),
-        position=0,
-        title="SQL",
-        description="Explain",
-        completed=False,
-    )
-    write = AsyncMock()
-    monkeypatch.setattr(interviewer_graph, "build_chat_model", lambda *a, **k: LocalToolModel())
-    monkeypatch.setattr(interviewer_graph.db, "get_milestones", AsyncMock(return_value=[milestone]))
-    monkeypatch.setattr(interviewer_graph.db, "complete_milestone", write)
-    graph = interviewer_graph.build_interviewer_graph(
-        settings, milestone.conversation_id, LocalSessionMaker(), end_event, "Interview"
-    )
-    # Construct the actual AgentSession and LLMAdapter, replacing only audio
-    # providers. No connection or model credentials are needed for this test.
+async def test_configured_session_disables_speculation(monkeypatch):
+    graph = DialogueLLM(SimpleNamespace(settings=settings))
+    # Construct the actual AgentSession, replacing only audio providers.
     ctx = SimpleNamespace(proc=SimpleNamespace(userdata={"vad": None}))
     with monkeypatch.context() as providers:
-        providers.setattr(agent.inference, "STT", lambda **kwargs: None)
+        providers.setattr(agent, "DrainableInferenceSTT", lambda **kwargs: None)
         providers.setattr(agent.inference, "TTS", lambda **kwargs: None)
         providers.setattr(agent.inference, "TurnDetector", lambda: None)
-        session = agent._build_session(ctx, graph, None)
+        session = agent._build_session(
+            ctx,
+            graph,
+            {
+                "language": "en",
+                "stt_model": settings.stt_model,
+                "tts_model": "cartesia/sonic-3",
+                "tts_voice": "voice",
+            },
+        )
     assert session.options.preemptive_generation["enabled"] is False
     assert session.options.endpointing["min_delay"] == 1.5
     assert session.options.endpointing["max_delay"] == 2.5
-    assert not end_event.is_set()
-    write.assert_not_called()
-
-    try:
-        await session.start(Agent(instructions="Interview"), record=False)
-        # A committed text input follows the normal generation path. Tool JSON
-        # never needs to become spoken output for the internal tools to run.
-        await asyncio.wait_for(session.run(user_input="I explained SQL"), timeout=5)
-        write.assert_awaited_once()
-        assert end_event.is_set()
-    finally:
-        await session.aclose()
 
 
-async def test_invalid_worker_context_marks_failure_closes_room_and_releases_engine(monkeypatch):
+async def test_invalid_worker_context_marks_failure_closes_room_and_releases_engine(
+    monkeypatch, postgres_sessionmaker
+):
     conversation_id = uuid.uuid4()
-    conversation = SimpleNamespace(
-        resume_markdown="r" * (MAX_RESUME_CHARS + 1),
-        job_offer="offer",
-        status="planned",
-        plan={},
-        max_minutes=15,
-    )
+    async with postgres_sessionmaker() as transaction:
+        transaction.add(
+            db.Conversation(
+                id=conversation_id,
+                resume_markdown="r" * (MAX_RESUME_CHARS + 1),
+                job_offer="offer",
+                status="planned",
+                plan={},
+                run_config={
+                    "schema_version": 2,
+                    "models": {"interviewer": {"model": "gpt-6-astra", "reasoning_effort": "low"}},
+                    "stt_model": "assemblyai/universal-3-6-pro",
+                },
+                question_limit=2,
+                followup_limit=1,
+                agent_settings={
+                    "language": "es",
+                    "tts_model": "cartesia/sonic-3.6-2026-08-27",
+                    "tts_voice": "test-voice",
+                },
+                max_minutes=15,
+            )
+        )
+        await transaction.commit()
     engine = SimpleNamespace(dispose=AsyncMock())
     monkeypatch.setattr(
-        agent.db, "create_engine_and_sessionmaker", lambda *args: (engine, LocalSessionMaker())
+        agent.db, "create_engine_and_sessionmaker", lambda *args: (engine, postgres_sessionmaker)
     )
-    monkeypatch.setattr(agent.db, "get_conversation", AsyncMock(return_value=conversation))
-    monkeypatch.setattr(agent.db, "get_milestones", AsyncMock(return_value=[]))
-    monkeypatch.setattr(agent.db, "get_messages", AsyncMock(return_value=[]))
-    failed = AsyncMock(return_value=True)
-    monkeypatch.setattr(agent.db, "set_status_if", failed)
     delete = AsyncMock()
     ctx = SimpleNamespace(
         job=SimpleNamespace(room=SimpleNamespace(name="dispatched-room")),
@@ -120,49 +87,147 @@ async def test_invalid_worker_context_marks_failure_closes_room_and_releases_eng
         shutdown=Mock(),
     )
     await agent._run_interview(ctx, conversation_id)
-    failed.assert_awaited_once()
-    assert failed.call_args.args[1:] == (conversation_id, "planned", "error")
+    async with postgres_sessionmaker() as transaction:
+        conversation = await db.get_conversation(transaction, conversation_id)
+        assert conversation.status == "error" and conversation.worker_epoch == 1
     assert delete.await_args.args[0].room == "dispatched-room"
     engine.dispose.assert_awaited_once()
     ctx.shutdown.assert_called_once_with(reason="invalid_source_context")
 
 
-async def test_worker_reaches_session_start_with_a_real_unconnected_room(monkeypatch):
+@pytest.mark.parametrize(
+    "reconnecting,displaced,recovering",
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (False, False, True),
+    ],
+)
+async def test_worker_reaches_session_start_with_a_real_unconnected_room(
+    monkeypatch, postgres_sessionmaker, reconnecting, displaced, recovering
+):
     conversation_id = uuid.uuid4()
-    conversation = SimpleNamespace(
-        status="planned",
-        plan={"language": "es"},
-        max_minutes=8,
-        agent_settings={},
-        ended_reason=None,
-    )
+    async with postgres_sessionmaker() as transaction:
+        transaction.add(
+            db.Conversation(
+                id=conversation_id,
+                status="planned",
+                plan={"language": "es"},
+                resume_markdown="Synthetic CV",
+                job_offer="Synthetic role",
+                max_minutes=8,
+                run_config={
+                    "schema_version": 2,
+                    "models": {"interviewer": {"model": "gpt-6-astra", "reasoning_effort": "low"}},
+                    "stt_model": "assemblyai/universal-3-6-pro",
+                },
+                question_limit=2,
+                followup_limit=1,
+                agent_settings={
+                    "language": "es",
+                    "tts_model": "cartesia/sonic-3.6-2026-08-27",
+                    "tts_voice": "test-voice",
+                },
+            )
+        )
+        await transaction.commit()
+    if reconnecting or recovering:
+        previous = WorkerCoordinator(conversation_id, postgres_sessionmaker)
+        await previous.claim()
+        async with postgres_sessionmaker() as transaction:
+            conversation = await db.get_conversation(transaction, conversation_id)
+            now = await transaction.scalar(select(func.clock_timestamp()))
+            conversation.worker_lease_until = now - timedelta(seconds=1)
+            if reconnecting:
+                conversation.worker_disconnected_at = now - timedelta(seconds=5)
+            if recovering:
+                conversation.status = "closing"
+                conversation.closing_owner_id = previous.owner_id
+                conversation.closing_id, conversation.closing_attempt_id = (
+                    uuid.uuid4(),
+                    uuid.uuid4(),
+                )
+                conversation.closing_stream_id = "already-started-stream"
+                original_closure = conversation.closing_id
+                original_acquisition = now - timedelta(seconds=40)
+                conversation.closing_acquired_at = original_acquisition
+                conversation.closing_deadline_at = now - timedelta(seconds=1)
+            await transaction.commit()
     engine = SimpleNamespace(dispose=AsyncMock())
     monkeypatch.setattr(
-        agent.db, "create_engine_and_sessionmaker", lambda *args: (engine, LocalSessionMaker())
+        agent.db, "create_engine_and_sessionmaker", lambda *args: (engine, postgres_sessionmaker)
     )
-    monkeypatch.setattr(agent.db, "get_conversation", AsyncMock(return_value=conversation))
-    monkeypatch.setattr(agent.db, "get_milestones", AsyncMock(return_value=[]))
-    monkeypatch.setattr(agent.db, "get_messages", AsyncMock(return_value=[]))
-    monkeypatch.setattr(agent.db, "set_status", AsyncMock())
-    monkeypatch.setattr(agent, "build_interviewer_prompt", lambda *args: "Interview")
-    monkeypatch.setattr(agent, "build_interviewer_graph", lambda *args, **kwargs: None)
     monkeypatch.setattr(agent, "_trigger_evaluation", AsyncMock())
     session = AgentSession(vad=None)
-    # Only actual provider/audio startup is doubled. The worker wiring,
-    # subscriptions and pre-connect Room.local_participant guard are real.
+    # Provider/audio startup alone is doubled. Ownership, PostgreSQL fencing,
+    # subscriptions and the pre-connect Room.local_participant guard are real.
     start = AsyncMock()
     monkeypatch.setattr(session, "start", start)
     monkeypatch.setattr(session, "generate_reply", AsyncMock())
     monkeypatch.setattr(agent, "_build_session", lambda *args: session)
     callbacks = []
     room = rtc.Room()
-    ctx = SimpleNamespace(room=room, add_shutdown_callback=callbacks.append)
+    if reconnecting:
+        room._remote_participants["candidate"] = SimpleNamespace(identity="candidate")
+    ctx = SimpleNamespace(
+        room=room,
+        add_shutdown_callback=callbacks.append,
+        shutdown=Mock(),
+        api=SimpleNamespace(room=SimpleNamespace(delete_room=AsyncMock())),
+        job=SimpleNamespace(room=SimpleNamespace(name="dispatched-room")),
+    )
     await agent._run_interview(ctx, conversation_id)
     start.assert_awaited_once()
+    assert start.call_args.kwargs["record"] is False
     assert start.call_args.kwargs["room"] is room
+    assert start.call_args.kwargs["agent"]._worker.lease.epoch == (
+        2 if reconnecting or recovering else 1
+    )
     assert len(callbacks) == 1
+    if reconnecting:
+        async with asyncio.timeout(1):
+            while True:
+                async with postgres_sessionmaker() as transaction:
+                    current = await db.get_conversation(transaction, conversation_id)
+                    if current.worker_disconnected_at is None:
+                        break
+                await asyncio.sleep(0.01)
+    if displaced:
+        async with postgres_sessionmaker() as transaction:
+            current = await db.get_conversation(transaction, conversation_id)
+            current.worker_lease_until = await transaction.scalar(
+                select(func.clock_timestamp())
+            ) - timedelta(seconds=1)
+            await transaction.commit()
+        replacement = WorkerCoordinator(conversation_id, postgres_sessionmaker)
+        assert await replacement.claim()
     await callbacks[0]()
     engine.dispose.assert_awaited_once()
+    async with postgres_sessionmaker() as transaction:
+        conversation = await db.get_conversation(transaction, conversation_id)
+        if displaced:
+            assert (
+                conversation.status == "interviewing" and conversation.transcript_sealed_at is None
+            )
+            assert conversation.worker_owner_id == replacement.owner_id
+            assert conversation.farewell_status is None
+            assert start.call_args.kwargs["agent"]._worker.lost
+        else:
+            assert conversation.status == "completed" and conversation.transcript_sealed_at
+            assert conversation.farewell_status == ("timeout" if recovering else "not_possible")
+            if recovering:
+                assert conversation.closing_id == original_closure
+                assert conversation.closing_acquired_at == original_acquisition
+                assert conversation.closing_stream_id == "already-started-stream"
+                assert conversation.transcript_integrity == "partial"
+                assert conversation.closing_ack_deadline_at == original_acquisition + timedelta(
+                    seconds=35
+                )
+                session.generate_reply.assert_not_awaited()
+    if recovering:
+        state = await closing_state(postgres_sessionmaker, conversation_id)
+        assert 0 <= state["remaining_seconds"] <= 5
 
 
 class LocalEndOfTurnDetector:
@@ -242,7 +307,6 @@ async def test_livekit_endpointing_keeps_observed_late_stt_tail(
         endpointing=BaseEndpointing(min_delay=min_delay, max_delay=2.5),
         stt=None,
         vad=Mock(),
-        using_default_vad=False,
         interruption_detection=None,
         turn_detection=LocalAudioTurnDetector() if audio_detector else LocalEndOfTurnDetector(),
     )
@@ -279,4 +343,31 @@ async def test_livekit_endpointing_keeps_observed_late_stt_tail(
             "Un commit guarda cambios. Le pongo un mensaje que explica qué cambié."
         )
     finally:
-        await recognition.aclose()
+        await recognition._aclose()
+
+
+@pytest.mark.parametrize("node", ["llm_node", "tts_node"])
+async def test_sdk_generation_stops_before_next_chunk_after_ownership_loss(monkeypatch, node):
+    live = True
+
+    def require_local():
+        if not live:
+            raise WorkerOwnershipError("expired")
+
+    worker = SimpleNamespace(require_local=require_local)
+    interviewer = agent.InterviewAgent(instructions="Synthetic", worker=worker)
+
+    async def provider(*args):
+        yield "first"
+        yield "late"
+
+    monkeypatch.setattr(Agent.default, node, staticmethod(provider))
+    stream = (
+        interviewer.llm_node(ChatContext.empty(), [], None)
+        if node == "llm_node"
+        else interviewer.tts_node(provider(), None)
+    )
+    assert await anext(stream) == "first"
+    live = False
+    with pytest.raises(WorkerOwnershipError):
+        await anext(stream)

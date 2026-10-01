@@ -5,10 +5,25 @@ from __future__ import annotations
 import io
 
 from markitdown import MarkItDown
+from pdfminer.pdfdocument import PDFDocument
+from pdfminer.pdfpage import PDFPage
+from pdfminer.pdfparser import PDFParser
 
 # One instance for the process: construction scans converter plugins, and
 # convert() itself is stateless per call.
 _MARKITDOWN = MarkItDown()
+
+
+def validate_pdf(data: bytes) -> None:
+    """Validate the document independently of editable extracted text."""
+    if b"%PDF-" not in data[:1024]:
+        raise ValueError("The uploaded document is not a PDF")
+    document = PDFDocument(PDFParser(io.BytesIO(data)))
+    if not document.is_extractable:
+        raise ValueError("The PDF does not permit text extraction")
+    pages = sum(1 for _ in PDFPage.create_pages(document))
+    if pages == 0:
+        raise ValueError("The PDF has no readable pages")
 
 
 def pdf_to_markdown(data: bytes, filename: str = "resume.pdf") -> str:

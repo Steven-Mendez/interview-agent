@@ -19,7 +19,7 @@ import {
 
 import {
   ApiError,
-  LENGTH_LABELS,
+  durationLabel,
   SENIORITY_LABELS,
   repeatInterview,
 } from "@/lib/api"
@@ -51,6 +51,7 @@ const STATUS_FILTERS = [
   "created",
   "planned",
   "interviewing",
+  "closing",
   "completed",
   "evaluating",
   "evaluated",
@@ -87,6 +88,7 @@ interface StatusMeta {
 
 /** How each status reads, and the badge tone that carries it. */
 const STATUS_META: Record<InterviewStatus, StatusMeta> = {
+  closing: { label: "Closing", variant: "secondary" },
   created: { label: "Planning…", variant: "outline" },
   planned: { label: "Ready to start", variant: "outline" },
   interviewing: { label: "In progress", variant: "default" },
@@ -348,18 +350,20 @@ function HistoryRow({
   const evaluation = item.evaluation
   // Same traffic light as the scorecard: green once hired, otherwise red/amber
   // by how far the score sits from a pass.
-  const scoreClass = evaluation
-    ? evaluation.hired
-      ? "text-success"
-      : evaluation.score < 40
-        ? "text-destructive"
-        : "text-warning"
-    : ""
+  const hasVerdict = evaluation?.score != null && evaluation.hired !== null
+  const scoreClass =
+    evaluation && hasVerdict
+      ? evaluation.hired
+        ? "text-success"
+        : evaluation.score! < 40
+          ? "text-destructive"
+          : "text-warning"
+      : ""
 
   return (
     <Card>
       <CardContent className="flex flex-col gap-4 @2xl/main:flex-row @2xl/main:items-center">
-        {evaluation && (
+        {evaluation && hasVerdict && (
           <div className="flex shrink-0 items-baseline gap-1 @2xl/main:w-24">
             <span className={cn("text-3xl leading-none font-bold", scoreClass)}>
               {evaluation.score}
@@ -380,7 +384,13 @@ function HistoryRow({
             <Badge variant={meta.variant}>{meta.label}</Badge>
             {evaluation && (
               <Badge variant={evaluation.hired ? "secondary" : "outline"}>
-                {evaluation.hired ? "Hired" : "Not hired"}
+                {!hasVerdict
+                  ? evaluation.evaluation_status === "insufficient"
+                    ? "Insufficient evidence"
+                    : "Partial assessment"
+                  : evaluation.hired
+                    ? "Hired"
+                    : "Not hired"}
               </Badge>
             )}
             {item.repeat_of_id && (
@@ -403,7 +413,9 @@ function HistoryRow({
               {SENIORITY_LABELS[item.seniority]}
               {item.seniority_source === "detected" && " · auto"}
             </span>
-            <span>{LENGTH_LABELS[item.interview_length]}</span>
+            <span>
+              {durationLabel(item.interview_length, item.max_minutes)}
+            </span>
             {item.milestones_total > 0 && (
               <span className="flex items-center gap-1.5 tabular-nums">
                 <ListChecksIcon className="size-3.5" />

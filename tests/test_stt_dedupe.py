@@ -7,6 +7,7 @@ candidate, 4 of them redundant aggregates.
 """
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 from livekit.agents import Agent, ModelSettings, stt
@@ -281,10 +282,20 @@ def test_audio_clock_regression_resets_history():
     assert keep(final())
 
 
-@pytest.mark.parametrize("model", ["deepgram/nova-3", "assemblyai/universal-streaming"])
+@pytest.mark.parametrize("model", ["deepgram/nova-3", "deepgram/flux-general-multi"])
 def test_other_models_are_never_filtered(model):
     keep = _make_duplicate_final_filter(model=model)
     assert keep(final())
+
+
+@pytest.mark.parametrize(
+    "model", ["assemblyai/universal-streaming", "assemblyai/universal-3-6-pro"]
+)
+def test_updated_assembly_models_preserve_audio_identity_dedupe(model):
+    keep = _make_duplicate_final_filter(model=model)
+    assert keep(final())
+    assert not keep(final())
+    assert keep(final(start=10, end=12))  # Same words spoken again are preserved.
     assert keep(final())
 
 
@@ -331,6 +342,7 @@ async def test_new_stt_node_resets_history_and_other_models_pass_through(
 
     monkeypatch.setattr(Agent.default, "stt_node", default_node)
     agent = InterviewAgent(instructions="Test", stt_model=model)
+    monkeypatch.setattr(agent, "_get_activity_or_raise", lambda: SimpleNamespace(stt=None))
     for _ in range(2):
         events = [event async for event in agent.stt_node(None, ModelSettings())]
         assert len(events) == expected

@@ -1,0 +1,88 @@
+"""Reviewed static application log templates. Unknown messages fail closed.
+
+Regenerate from literal logging calls after reviewing source changes.
+Never add candidate or generated content to this catalog.
+"""
+
+SAFE_LOG_TEMPLATES = frozenset(
+    (
+        "Closing background task failed: %s",
+        "Completion publication failed; persistent state remains available",
+        "Could not persist evaluation failure",
+        "Displaced worker cleanup did not complete",
+        "Evaluation crashed for %s",
+        "Evaluation failed for %s",
+        "Evaluation heartbeat failed",
+        "Evaluation recovery failed",
+        "External deletion sweep failed",
+        "Failed startup engine disposal did not complete",
+        "Farewell audio output metric not recorded",
+        "Farewell delivery failed",
+        "Farewell writer cleanup did not finish",
+        "Interview background task failed: %s",
+        "Interview job initialization failed",
+        "Interview session startup failed",
+        "LangSmith metadata export failed: %s",
+        "Lifecycle reconciliation failed",
+        "Lifecycle sweep failed",
+        "Lifecycle sweep metric could not be persisted",
+        "Metric persistence failed: %s/%s",
+        "Question recovery failed; delivery remains uncertain",
+        "Shutdown cleanup failed: %s",
+        "Technical notice attribute could not be published",
+        "Telemetry drain deadline expired for %d tasks",
+        "Turn waiter cleanup failed: %s",
+        "Worker engine disposal did not complete",
+        "Worker shutdown exceeded its total cleanup budget",
+        "Worker shutdown failed",
+        "auto-evaluation triggered: HTTP %s",
+        "capacity reached: %s active interviews, rejecting %s",
+        "closing an orphaned interview for evaluation",
+        "complete_milestone failed for %s",
+        "could not close room for invalid source context",
+        "could not mark invalid source context as failed",
+        "could not publish user turn transcription",
+        "creating interview",
+        "dropped duplicate stt final: matching text and audio boundaries",
+        "evaluation already running",
+        "evaluation never triggered for %s; retry it from the UI",
+        "evaluation scheduled",
+        (
+            "evaluation trigger for %s timed out waiting for the response (%s); "
+            "the evaluation is probably still running — not re-sent"
+        ),
+        "evaluation trigger unreachable (attempt %s): %s",
+        "failed to auto-trigger evaluation",
+        "failed to persist interviewer token usage",
+        "failed to persist transcript item",
+        "failed to record candidate_left",
+        "finishing interview %s (%s)",
+        "healthz failed: %s",
+        "idle timeout for %s",
+        "interview planned",
+        "invalid interview source context for %s",
+        "job for room %r carries no conversation id; skipping",
+        (
+            "kept stt final: insufficient audio timing evidence; "
+            "deduplication requires provider audio boundaries"
+        ),
+        "kept stt final: matching text but different audio boundaries",
+        "milestone status refresh failed for %s",
+        "planning failed for %s",
+        "refusing stale reconnect",
+        "repeating interview",
+        "reset stt dedupe history: audio clock regressed",
+        "reset stt dedupe history: request changed; preserving speech",
+        "resuming interview %s: %d prior messages",
+        "retention purge disabled (RETENTION_DAYS=0)",
+        "retention purge done",
+        "retention purge failed; retrying next cycle",
+        "server ready",
+        "settings updated",
+        "time cap warning for %s",
+        "token issued",
+        "unparseable conversation id in job metadata",
+        "user turn transcription publisher stopped before draining",
+        "web/dist/client missing; serving API only (run: cd web && pnpm build)",
+    )
+)

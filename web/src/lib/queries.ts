@@ -17,6 +17,7 @@ const POLLING_STATUSES: ReadonlySet<InterviewStatusValue> = new Set([
   "created",
   "planned",
   "interviewing",
+  "closing",
   "completed",
   "evaluating",
 ])

@@ -1,7 +1,7 @@
 /** @vitest-environment jsdom */
 import { act, renderHook } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { RoomEvent } from "livekit-client"
+import { RoomEvent, RpcError } from "livekit-client"
 import type { TextStreamHandler, TextStreamReader } from "livekit-client"
 import type * as LiveKit from "livekit-client"
 
@@ -11,9 +11,14 @@ const mocks = vi.hoisted(() => {
   const rooms: MockRoom[] = []
   class MockRoom {
     handlers = new Map<string, TextStreamHandler>()
+    remoteParticipants = new Map([
+      ["agent", { identity: "agent", isAgent: true, setVolume: vi.fn() }],
+    ])
+    options = {}
     listeners = new Map<string, Array<() => void>>()
     localParticipant = {
       setMicrophoneEnabled: vi.fn().mockResolvedValue(undefined),
+      performRpc: vi.fn().mockResolvedValue('{"accepted":true}'),
     }
     connect = vi.fn().mockResolvedValue(undefined)
     disconnect = vi.fn().mockResolvedValue(undefined)
@@ -23,6 +28,9 @@ const mocks = vi.hoisted(() => {
     registerTextStreamHandler(topic: string, handler: TextStreamHandler) {
       this.handlers.set(topic, handler)
     }
+    registerByteStreamHandler = vi.fn()
+    unregisterByteStreamHandler = vi.fn()
+    off = vi.fn()
     on(event: string, handler: () => void) {
       this.listeners.set(event, [...(this.listeners.get(event) ?? []), handler])
       return this
@@ -53,6 +61,8 @@ vi.mock("livekit-client", async (original) => ({
   Room: mocks.Room,
 }))
 vi.mock("@/lib/api", () => ({
+  acknowledgeFarewell: vi.fn().mockResolvedValue({ accepted: true }),
+  getClosingState: vi.fn().mockRejectedValue(new Error("No closing state")),
   getInterviewToken: vi.fn().mockResolvedValue({
     server_url: "ws://test",
     token: "test",
@@ -136,6 +146,99 @@ async function connected() {
 }
 
 describe("interview transcription lifecycle", () => {
+  it("offers answer-again or end only while the technical notice is active", async () => {
+    const { room, result, unmount } = await connected()
+    const changed = (attributes: Record<string, string>) =>
+      act(async () => {
+        for (const handler of room.listeners.get(
+          RoomEvent.ParticipantAttributesChanged
+        ) ?? [])
+          Reflect.apply(handler, undefined, [attributes, { isLocal: false }])
+        await flush()
+      })
+    expect(result.current.technicalNotice).toBe(false)
+    await changed({ "interview.notice": "technical" })
+    expect(result.current.technicalNotice).toBe(true)
+    await changed({ "lk.agent.state": "speaking" })
+    expect(result.current.technicalNotice).toBe(true)
+    await changed({ "interview.notice": "" })
+    expect(result.current.technicalNotice).toBe(false)
+    unmount()
+  })
+
+  it("leaves the live panel when the server seals a lost-worker interview", async () => {
+    const { room, result, unmount } = await connected()
+    expect(result.current.phase).toBe("live")
+    await act(async () => {
+      result.current.syncClosingState("completed", null, "not_possible", true)
+      await flush()
+    })
+    expect(result.current.phase).toBe("ended")
+    expect(result.current.endedAt).not.toBeNull()
+    expect(room.disconnect).toHaveBeenCalled()
+    unmount()
+  })
+
+  it("shows bounded recovery when request_end succeeds without control or audio", async () => {
+    const { room, result, unmount } = await connected()
+    await act(async () => {
+      result.current.requestEnd()
+      await flush()
+    })
+    expect(room.localParticipant.performRpc).toHaveBeenCalledOnce()
+    expect(result.current.phase).toBe("closing")
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(45_000)
+    })
+    expect(result.current.closingRecoveryPending).toBe(true)
+    expect(result.current.phase).toBe("closing")
+    expect(result.current.endedAt).toBeNull()
+    unmount()
+  })
+
+  it("keeps supervision when the worker's RPC reply may have been lost", async () => {
+    const { room, result, unmount } = await connected()
+    room.localParticipant.performRpc.mockRejectedValueOnce(
+      new Error("RPC timeout")
+    )
+    await act(async () => {
+      result.current.requestEnd()
+      await flush()
+    })
+    expect(result.current.phase).toBe("closing")
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(46_000)
+    })
+    expect(result.current.closingRecoveryPending).toBe(true)
+    unmount()
+  })
+
+  it.each([
+    RpcError.ErrorCode.UNSUPPORTED_METHOD,
+    RpcError.ErrorCode.RECIPIENT_NOT_FOUND,
+  ])(
+    "allows retry after a definitive unaccepted RPC error %s",
+    async (code) => {
+      const { room, result, unmount } = await connected()
+      room.localParticipant.performRpc.mockRejectedValueOnce(
+        new RpcError(code, "Not accepted")
+      )
+      await act(async () => {
+        result.current.requestEnd()
+        await flush()
+      })
+      expect(result.current.phase).toBe("live")
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(46_000)
+      })
+      expect(result.current.closingRecoveryPending).toBe(false)
+      expect(
+        room.remoteParticipants.get("agent")?.setVolume
+      ).not.toHaveBeenCalled()
+      unmount()
+    }
+  )
+
   it("keeps an orphan incomplete before the next agent and user messages", async () => {
     const { room, result } = await connected()
     const orphan = new ControlledReader("orphan")

@@ -1,3 +1,12 @@
+import { InterviewTimer } from "@/components/interview-timer"
+import { InterviewEnding } from "@/components/interview-ending"
+import { RepeatOptions } from "@/components/repeat-options"
+import { ClosingPanel } from "@/components/closing-panel"
+import { AssessmentRequest } from "@/components/assessment-request"
+import { useEvaluationRequest } from "@/hooks/use-evaluation-request"
+import { TranscriptReview } from "@/components/transcript-review"
+import { EvaluationHistory } from "@/components/evaluation-history"
+import { QuestionRecovery } from "@/components/question-recovery"
 import * as React from "react"
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router"
 import {
@@ -15,7 +24,9 @@ import {
 import {
   AlertCircleIcon,
   CheckCircle2Icon,
+  CircleDotIcon,
   ChevronDownIcon,
+  ClockIcon,
   HistoryIcon,
   ListChecksIcon,
   MessagesSquareIcon,
@@ -31,15 +42,24 @@ import {
   XCircleIcon,
 } from "lucide-react"
 
+import {
+  CriterionFeedback,
+  EvaluationOutcome,
+} from "@/components/evaluation-feedback"
+import {
+  InterviewLimits,
+  TopicStatus,
+  isSettled,
+} from "@/components/interview-progress"
+
 import { interviewQueryOptions, transcriptQueryOptions } from "@/lib/queries"
 import {
   ApiError,
-  LENGTH_LABELS,
+  durationLabel,
   SENIORITY_LABELS,
-  evaluateInterview,
   repeatInterview,
 } from "@/lib/api"
-import type { Interview } from "@/lib/api"
+import type { Interview, RepeatRequest } from "@/lib/api"
 import {
   EVAL_TIMEOUT_MS,
   evaluationAnchor,
@@ -104,7 +124,6 @@ function InterviewSessionRoute() {
   return <InterviewSessionPage key={interviewId} interviewId={interviewId} />
 }
 
-// Same labels as frontend/app.js's AGENT_STATE_LABELS.
 const AGENT_STATE_LABELS: Partial<Record<string, string>> = {
   initializing: "Connecting…",
   listening: "Listening…",
@@ -122,6 +141,20 @@ function InterviewSessionPage({ interviewId }: { interviewId: string }) {
     interviewQueryOptions(interviewId)
   )
   const session = useInterviewSession(interviewId)
+  React.useEffect(() => {
+    session.syncClosingState(
+      interview.status,
+      interview.closing_id,
+      interview.farewell_status,
+      interview.transcript_sealed ?? false
+    )
+  }, [
+    session.syncClosingState,
+    interview.status,
+    interview.closing_id,
+    interview.farewell_status,
+    interview.transcript_sealed,
+  ])
 
   // Results replace the live panel once the interview ends: either this tab
   // saw the disconnect (phase 'ended'), or we deep-linked into an already
@@ -143,6 +176,10 @@ function InterviewSessionPage({ interviewId }: { interviewId: string }) {
     // Preparation or the worker failed: a disconnect cannot turn this into
     // an evaluation that will never run.
     <FailedPanel interview={interview} />
+  ) : interview.status === "closing" && session.phase === "idle" ? (
+    // Reloaded (or opened) while the server closes: there is no clip to
+    // replay here, only the durable outcome to wait for.
+    <ClosingPanel interview={interview} />
   ) : interview.status === "interviewing" &&
     !interview.can_start &&
     session.phase === "idle" ? (
@@ -154,12 +191,12 @@ function InterviewSessionPage({ interviewId }: { interviewId: string }) {
   )
 
   // Once the room exists, wrap everything in RoomContext: <RoomAudioRenderer>
-  // plays the agent track (replaces app.js's manual TrackSubscribed→attach) and
-  // the live panel's <BarVisualizer> reads the same room via useVoiceAssistant.
+  // plays the agent track and the live panel's <BarVisualizer> reads the same
+  // room via useVoiceAssistant.
   return session.room ? (
     <RoomContext.Provider value={session.room}>
       <RoomAudioRenderer />
-      {session.phase === "live" && (
+      {(session.phase === "live" || session.phase === "closing") && (
         <div className="mx-auto w-full max-w-6xl px-4 pt-2">
           <InterviewAudioRecovery />
         </div>
@@ -189,6 +226,7 @@ function InterviewPanel({
   if (phase === "idle") {
     return (
       <PreJoinPanel
+        interview={interview}
         preview={preview}
         error={error}
         // An `interviewing` row that can still start is one this candidate
@@ -198,6 +236,7 @@ function InterviewPanel({
         onStart={() =>
           start({
             audioDeviceId: preview.micId || undefined,
+            audioOutputDeviceId: preview.speakerId || undefined,
             // The check holds the microphone LiveKit is about to reopen, so
             // it lets go right before the publish — and takes it back should
             // the start fall through, so the meter is live on the way back
@@ -211,7 +250,7 @@ function InterviewPanel({
   }
 
   const milestones = interview.milestones
-  const completedMilestones = milestones.filter((m) => m.completed).length
+  const completedMilestones = milestones.filter(isSettled).length
   const milestonePct =
     milestones.length > 0
       ? Math.round((completedMilestones / milestones.length) * 100)
@@ -229,22 +268,42 @@ function InterviewPanel({
           <div className="flex items-center gap-2 text-sm font-medium">
             <MicIcon className="size-4 text-muted-foreground" />
             Interview
-            {phase === "live" && <LiveTimer />}
+            {phase === "live" && (
+              <InterviewTimer elapsedSeconds={interview.elapsed_seconds} />
+            )}
           </div>
           <div className="flex items-center gap-2">
-            {phase === "connecting" ? (
+            {phase === "closing" ? (
+              <StatusPill
+                text={
+                  session.closingRecoveryPending
+                    ? "Recovery pending"
+                    : "Closing interview…"
+                }
+              />
+            ) : phase === "connecting" ? (
               <StatusPill text="Connecting…" />
             ) : (
               <AgentStatus />
             )}
             {phase === "live" && (
+              <Button variant="outline" size="sm" onClick={session.requestEnd}>
+                <PhoneOffIcon className="size-4" />
+                End
+              </Button>
+            )}
+            {phase === "closing" && session.farewellBlocked && (
+              <Button size="sm" onClick={session.resumeFarewell}>
+                Enable farewell audio
+              </Button>
+            )}
+            {phase === "closing" && session.closingRecoveryPending && (
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => void session.room?.disconnect()}
+                render={<Link to="/interviews" />}
               >
-                <PhoneOffIcon className="size-4" />
-                End
+                View saved interviews
               </Button>
             )}
           </div>
@@ -267,6 +326,21 @@ function InterviewPanel({
           </div>
         )}
 
+        {phase === "live" && session.technicalNotice && (
+          <Alert className="rounded-none border-x-0 border-t-0">
+            <AlertDescription className="flex flex-wrap items-center justify-between gap-2">
+              <span>
+                The interviewer had a technical difficulty. Answer again by
+                speaking, or end the interview.
+              </span>
+              <Button variant="outline" size="sm" onClick={session.requestEnd}>
+                <PhoneOffIcon className="size-4" />
+                End interview
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
+        {phase === "live" && <QuestionRecovery interviewId={interview.id} />}
         <MessageScrollerProvider>
           <MessageScroller className="min-h-0 flex-1">
             <MessageScrollerViewport>
@@ -377,20 +451,17 @@ function InterviewPanel({
               <ol className="flex flex-col gap-3">
                 {milestones.map((m, i) => (
                   <li key={m.id} className="flex items-start gap-2.5 text-sm">
-                    {m.completed ? (
-                      <CheckCircle2Icon className="mt-0.5 size-4 shrink-0 text-success" />
+                    {isSettled(m) ? (
+                      <CircleDotIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
                     ) : (
                       <span className="mt-0.5 flex size-4 shrink-0 items-center justify-center rounded-full border text-[10px] font-medium text-muted-foreground tabular-nums">
                         {i + 1}
                       </span>
                     )}
-                    <span
-                      className={cn(
-                        m.completed && "text-muted-foreground line-through"
-                      )}
-                    >
-                      {m.title}
-                    </span>
+                    <div className="flex min-w-0 flex-1 flex-col gap-1">
+                      <span>{m.title}</span>
+                      <TopicStatus milestone={m} />
+                    </div>
                   </li>
                 ))}
               </ol>
@@ -456,12 +527,14 @@ const timeFormat = new Intl.DateTimeFormat(undefined, { timeStyle: "short" })
  *  its room waits for the candidate — until `rejoinUntil` (ISO), when the
  *  backend says so. */
 function PreJoinPanel({
+  interview,
   preview,
   error,
   rejoin,
   rejoinUntil,
   onStart,
 }: {
+  interview: Interview
   preview: DevicePreview
   error: string | null
   rejoin: boolean
@@ -507,6 +580,7 @@ function PreJoinPanel({
           </p>
         </div>
 
+        <InterviewLimits interview={interview} />
         <Card>
           <CardContent className="flex flex-col gap-4">
             {preview.status === "idle" ? (
@@ -557,6 +631,42 @@ function PreJoinPanel({
                     <FieldDescription>
                       Say something — the bar should move.
                     </FieldDescription>
+                  </Field>
+
+                  <Field>
+                    <FieldLabel htmlFor="speaker">Speaker</FieldLabel>
+                    {preview.outputSelectable && preview.speakers.length > 0 ? (
+                      <Select
+                        value={preview.speakerId}
+                        onValueChange={(next) =>
+                          preview.selectSpeaker(next ?? "")
+                        }
+                      >
+                        <SelectTrigger id="speaker" className="w-full">
+                          <SelectValue>
+                            {(value: string) =>
+                              preview.speakers.find((d) => d.deviceId === value)
+                                ?.label || "System default"
+                            }
+                          </SelectValue>
+                        </SelectTrigger>
+                        <SelectContent>
+                          {preview.speakers.map((device) => (
+                            <SelectItem
+                              key={device.deviceId}
+                              value={device.deviceId}
+                            >
+                              {device.label || "Speaker"}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    ) : (
+                      <FieldDescription>
+                        This browser plays the interview through its default
+                        audio output; it cannot be changed here.
+                      </FieldDescription>
+                    )}
                   </Field>
 
                   <Field>
@@ -723,27 +833,6 @@ function AgentStateLabel() {
   )
 }
 
-// Elapsed-time counter, anchored at first render (mounts when phase→live).
-function LiveTimer() {
-  const startRef = React.useRef(Date.now())
-  const [elapsed, setElapsed] = React.useState(0)
-  React.useEffect(() => {
-    const id = setInterval(
-      () => setElapsed(Math.floor((Date.now() - startRef.current) / 1000)),
-      1000
-    )
-    return () => clearInterval(id)
-  }, [])
-  const mm = String(Math.floor(elapsed / 60)).padStart(2, "0")
-  const ss = String(elapsed % 60).padStart(2, "0")
-  return (
-    <span className="ml-1 flex items-center gap-1.5 text-xs font-normal text-muted-foreground tabular-nums">
-      <span className="size-1.5 animate-pulse rounded-full bg-primary" />
-      {mm}:{ss}
-    </span>
-  )
-}
-
 // ---- Results ----------------------------------------------------------------
 
 function ResultsPanel({
@@ -755,7 +844,6 @@ function ResultsPanel({
   interviewId: string
   endedAt: number | null
 }) {
-  const queryClient = useQueryClient()
   const [timedOut, setTimedOut] = React.useState(false)
 
   const status = interview.status
@@ -784,24 +872,9 @@ function ResultsPanel({
     return () => clearTimeout(timer)
   }, [waiting, status, anchor])
 
-  const retry = useMutation({
-    // 202: the row back in `evaluating`, no verdict yet — seeding it resumes
-    // the poll, and the poll brings the evaluated row.
-    mutationFn: () => evaluateInterview(interviewId),
-    onSuccess: (row) => {
-      queryClient.setQueryData(interviewQueryOptions(interviewId).queryKey, row)
-      // The history row for this interview still reads "Ended" in any cached
-      // page — and a page is fresh for 10 s after it was fetched.
-      void queryClient.invalidateQueries({ queryKey: ["interviews"] })
-      setTimedOut(false)
-      log("evaluation restarted:", row.status)
-    },
-    onError: (error) => {
-      console.error("[app] evaluation retry failed:", error)
-    },
-  })
+  const retry = useEvaluationRequest(interviewId)
 
-  if (status === "evaluated" && interview.evaluation) {
+  if (interview.evaluation) {
     return <Evaluation interview={interview} />
   }
 
@@ -822,6 +895,7 @@ function ResultsPanel({
         variant="narrow"
         className="flex flex-col items-center gap-4 text-center"
       >
+        <InterviewEnding interview={interview} />
         {!showRetry && (
           <p className="flex items-center gap-2 text-sm text-muted-foreground">
             <Spinner />
@@ -846,6 +920,17 @@ function ResultsPanel({
             {retry.isPending ? "Starting…" : `${action} evaluation`}
           </Button>
         )}
+        <div className="flex w-full flex-col gap-4 text-left">
+          <EvaluationHistory
+            interviewId={interview.id}
+            milestones={interview.milestones}
+            duration={durationLabel(
+              interview.interview_length,
+              interview.max_minutes
+            )}
+          />
+          <TranscriptReview interviewId={interview.id} />
+        </div>
       </PageContainer>
     </PageShell>
   )
@@ -857,7 +942,7 @@ function useRepeatInterview(interviewId: string) {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: () => repeatInterview(interviewId),
+    mutationFn: (body?: RepeatRequest) => repeatInterview(interviewId, body),
     onSuccess: (next) => {
       log("interview repeated:", next.id)
       // The response is the new row: seed its detail so the landing needs no
@@ -880,6 +965,9 @@ function useRepeatInterview(interviewId: string) {
  *  on offer is a fresh plan off the same resume and offer. */
 function FailedPanel({ interview }: { interview: Interview }) {
   const repeat = useRepeatInterview(interview.id)
+  // A closing that could not be persisted also lands here; it ran, but its
+  // transcript cannot be evaluated.
+  const ran = interview.closing_id !== null
   return (
     <PageShell center>
       <PageContainer
@@ -890,11 +978,15 @@ function FailedPanel({ interview }: { interview: Interview }) {
           <AlertCircleIcon className="size-6" />
         </span>
         <h1 className="text-lg font-medium">
-          This interview could not be planned
+          {ran
+            ? "This interview could not be saved"
+            : "This interview could not be planned"}
         </h1>
         <p className="text-sm text-muted-foreground">
-          {interview.ended_reason ??
-            "Something went wrong while preparing the questions."}{" "}
+          {ran
+            ? "The interview ended, but its transcript could not be saved completely, so it cannot be evaluated."
+            : (interview.ended_reason ??
+              "Something went wrong while preparing the questions.")}{" "}
           Repeating it plans a new interview from the same resume and offer.
         </p>
         {repeat.isError && (
@@ -907,43 +999,31 @@ function FailedPanel({ interview }: { interview: Interview }) {
             <HistoryIcon />
             History
           </Button>
-          <Button onClick={() => repeat.mutate()} disabled={repeat.isPending}>
+          <Button
+            onClick={() => repeat.mutate(undefined)}
+            disabled={repeat.isPending}
+          >
             <RotateCcwIcon />
             {repeat.isPending ? "Planning…" : "Repeat this interview"}
           </Button>
         </div>
+        <RepeatOptions
+          interview={interview}
+          pending={repeat.isPending}
+          onRepeat={(body) => repeat.mutate(body)}
+        />
       </PageContainer>
     </PageShell>
   )
 }
 
 /** An `interviewing` row past its reconnect window: the worker died mid-run
- *  (a crash never marks the row completed), so there is no room left to
- *  rejoin. What remains is the transcript up to the cut — evaluate it as it
- *  stands, or plan the interview again. */
+ *  and the server has not sealed it yet, so there is no room left to rejoin.
+ *  What remains is the transcript up to the cut — evaluate it as it stands,
+ *  or plan the interview again. */
 function InterruptedPanel({ interview }: { interview: Interview }) {
-  const queryClient = useQueryClient()
   const repeat = useRepeatInterview(interview.id)
-  const evaluate = useMutation({
-    mutationFn: () => evaluateInterview(interview.id),
-    onSuccess: (row) => {
-      log("evaluation started for the interrupted interview:", row.status)
-      // 202 with the row in `evaluating`: seeding it is what swaps this panel
-      // for the results one, whose poll then carries the row to its verdict.
-      queryClient.setQueryData(
-        interviewQueryOptions(interview.id).queryKey,
-        row
-      )
-      // The history row still reads "Interrupted" in any cached page.
-      void queryClient.invalidateQueries({ queryKey: ["interviews"] })
-    },
-    onError: (error) => {
-      console.error(
-        "[app] could not evaluate the interrupted interview:",
-        error
-      )
-    },
-  })
+  const evaluate = useEvaluationRequest(interview.id)
   const busy = evaluate.isPending || repeat.isPending
 
   return (
@@ -975,7 +1055,7 @@ function InterruptedPanel({ interview }: { interview: Interview }) {
           </Button>
           <Button
             variant="outline"
-            onClick={() => repeat.mutate()}
+            onClick={() => repeat.mutate(undefined)}
             disabled={busy}
             title="Plan a fresh interview for the same role and resume"
           >
@@ -987,6 +1067,11 @@ function InterruptedPanel({ interview }: { interview: Interview }) {
             {evaluate.isPending ? "Starting…" : "Evaluate what was recorded"}
           </Button>
         </div>
+        <RepeatOptions
+          interview={interview}
+          pending={busy}
+          onRepeat={(body) => repeat.mutate(body)}
+        />
       </PageContainer>
     </PageShell>
   )
@@ -999,72 +1084,28 @@ function Evaluation({ interview }: { interview: Interview }) {
   if (!ev) return null
 
   const milestones = interview.milestones
-  const completed = milestones.filter((m) => m.completed).length
-
-  // Traffic-light verdict: green once actually hired, otherwise red/yellow by
-  // how far the score sits from a pass — replaces the separate HIRED/NOT
-  // HIRED badge with a single colored status where the score bar lives.
-  const tier = ev.hired ? "success" : ev.score < 40 ? "destructive" : "warning"
-  const verdictLabel = ev.hired ? "Hired" : "Not hired"
-  const verdictTextClass = {
-    success: "text-success",
-    warning: "text-warning",
-    destructive: "text-destructive",
-  }[tier]
-  const verdictBarClass = {
-    success: "bg-success",
-    warning: "bg-warning",
-    destructive: "bg-destructive",
-  }[tier]
+  const completed = milestones.filter(isSettled).length
 
   return (
     <PageShell>
       <PageContainer variant="wide">
         <div className="flex flex-col gap-6">
-          {/* Score banner — horizontal: score and a progress bar tinted with
-              the traffic-light verdict color (red / yellow / green). */}
-          <Card>
-            <CardContent className="flex flex-col gap-4 @xl/main:flex-row @xl/main:items-center @xl/main:gap-8">
-              <div className="flex items-baseline gap-1">
-                <span className="text-5xl leading-none font-bold">
-                  {ev.score}
-                </span>
-                <span className="text-xl text-muted-foreground">/100</span>
-              </div>
-              <div className="flex flex-1 flex-col gap-1.5">
-                <span className="flex items-center gap-2">
-                  <span className={cn("text-xs font-medium", verdictTextClass)}>
-                    {verdictLabel}
-                  </span>
-                  {/* The score is relative to this bar, so say which bar. */}
-                  <span
-                    className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs text-muted-foreground"
-                    title={
-                      interview.seniority_evidence ??
-                      (interview.seniority_source === "explicit"
-                        ? "Level you selected"
-                        : "Level used by default")
-                    }
-                  >
-                    <GaugeIcon className="size-3" />
-                    Scored as {SENIORITY_LABELS[interview.seniority]}
-                    {interview.seniority_source === "detected" && " · auto"}
-                  </span>
-                  <span className="text-xs text-muted-foreground">
-                    {LENGTH_LABELS[interview.interview_length]}
-                  </span>
-                </span>
-                <div className="h-2 w-full overflow-hidden rounded-full bg-muted">
-                  <div
-                    className={cn("h-full rounded-full", verdictBarClass)}
-                    style={{
-                      width: `${Math.min(Math.max(ev.score, 0), 100)}%`,
-                    }}
-                  />
-                </div>
-              </div>
-            </CardContent>
-          </Card>
+          <AssessmentRequest interview={interview} />
+          <InterviewEnding interview={interview} />
+          <EvaluationOutcome
+            evaluation={ev}
+            level={SENIORITY_LABELS[interview.seniority]}
+            duration={durationLabel(
+              interview.interview_length,
+              interview.max_minutes
+            )}
+            transcriptPartial={interview.transcript_integrity === "partial"}
+            captureIntegrityPending={
+              interview.capture_integrity_pending ||
+              interview.evaluation_invalidated
+            }
+          />
+          <CriterionFeedback evaluation={ev} milestones={milestones} />
 
           {/* Milestones — full-width chip row, stretched like the panels below. */}
           {milestones.length > 0 && (
@@ -1083,16 +1124,13 @@ function Evaluation({ interview }: { interview: Interview }) {
                       key={m.id}
                       className="inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-sm"
                     >
-                      {m.completed ? (
-                        <CheckCircle2Icon className="size-4 shrink-0 text-success" />
+                      {isSettled(m) ? (
+                        <CircleDotIcon className="size-4 shrink-0 text-muted-foreground" />
                       ) : (
-                        <XCircleIcon className="size-4 shrink-0 text-destructive" />
+                        <ClockIcon className="size-4 shrink-0 text-muted-foreground" />
                       )}
-                      <span
-                        className={cn(!m.completed && "text-muted-foreground")}
-                      >
-                        {m.title}
-                      </span>
+                      <span>{m.title}</span>
+                      <TopicStatus milestone={m} />
                     </li>
                   ))}
                 </ul>
@@ -1177,6 +1215,15 @@ function Evaluation({ interview }: { interview: Interview }) {
             </Card>
           )}
 
+          <TranscriptReview interviewId={interview.id} />
+          <EvaluationHistory
+            interviewId={interview.id}
+            milestones={milestones}
+            duration={durationLabel(
+              interview.interview_length,
+              interview.max_minutes
+            )}
+          />
           <TranscriptCard interviewId={interview.id} />
 
           {repeat.isError && (
@@ -1192,7 +1239,7 @@ function Evaluation({ interview }: { interview: Interview }) {
             </Button>
             <Button
               variant="outline"
-              onClick={() => repeat.mutate()}
+              onClick={() => repeat.mutate(undefined)}
               disabled={repeat.isPending}
               title="Plan a fresh interview for the same role and resume"
             >
@@ -1201,6 +1248,11 @@ function Evaluation({ interview }: { interview: Interview }) {
             </Button>
             <Button render={<Link to="/" />}>New interview</Button>
           </div>
+          <RepeatOptions
+            interview={interview}
+            pending={repeat.isPending}
+            onRepeat={(body) => repeat.mutate(body)}
+          />
         </div>
       </PageContainer>
     </PageShell>
@@ -1242,6 +1294,23 @@ function TranscriptCard({ interviewId }: { interviewId: string }) {
       </CardHeader>
       {open && (
         <CardContent>
+          {query.data?.capture_integrity_pending && (
+            <Alert variant="destructive" className="mb-4">
+              <AlertDescription>
+                This transcript has unresolved capture incidents and requires
+                review.
+              </AlertDescription>
+            </Alert>
+          )}
+          {query.data?.incidents?.map((incident) => (
+            <details key={incident.id} className="mb-3 text-sm">
+              <summary>
+                Capture incident ·{" "}
+                {incident.resolved_at ? "Reviewed" : "Pending review"}
+              </summary>
+              <p className="whitespace-pre-wrap">{incident.content}</p>
+            </details>
+          ))}
           {query.isPending ? (
             <p className="flex items-center gap-2 text-sm text-muted-foreground">
               <Spinner />
@@ -1260,7 +1329,7 @@ function TranscriptCard({ interviewId }: { interviewId: string }) {
               {messages.map((m, i) => {
                 const isUser = m.role === "user"
                 return (
-                  <Message key={i} align={isUser ? "end" : "start"}>
+                  <Message key={m.id ?? i} align={isUser ? "end" : "start"}>
                     <MessageAvatar>
                       <Avatar>
                         <AvatarFallback
@@ -1282,6 +1351,37 @@ function TranscriptCard({ interviewId }: { interviewId: string }) {
                         variant={isUser ? "default" : "tinted"}
                       >
                         <BubbleContent>{m.content}</BubbleContent>
+                        {m.version != null && (
+                          <p className="text-xs opacity-70">
+                            Version {m.version}
+                          </p>
+                        )}
+                        {isUser &&
+                          m.metrics &&
+                          m.metrics.stt_confirmed !== true && (
+                            <p className="text-xs">Unconfirmed transcription</p>
+                          )}
+                        {isUser &&
+                          m.metrics?.stt_segmentation === "unknown" && (
+                            <p className="text-xs">
+                              Turn boundaries unverified
+                            </p>
+                          )}
+                        {(m.versions?.length ?? 0) > 1 && (
+                          <details className="mt-2 text-xs">
+                            <summary>Earlier versions</summary>
+                            {m.versions
+                              ?.filter((v) => v.version !== m.version)
+                              .map((v) => (
+                                <p
+                                  key={v.version}
+                                  className="whitespace-pre-wrap"
+                                >
+                                  Version {v.version}: {v.content}
+                                </p>
+                              ))}
+                          </details>
+                        )}
                       </Bubble>
                     </MessageContent>
                   </Message>

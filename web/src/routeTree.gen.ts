@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as SettingsRouteImport } from './routes/settings'
+import { Route as MetricsRouteImport } from './routes/metrics'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as InterviewsIndexRouteImport } from './routes/interviews.index'
 import { Route as InterviewsInterviewIdRouteImport } from './routes/interviews.$interviewId'
@@ -17,6 +18,11 @@ import { Route as InterviewsInterviewIdRouteImport } from './routes/interviews.$
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
   path: '/settings',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const MetricsRoute = MetricsRouteImport.update({
+  id: '/metrics',
+  path: '/metrics',
   getParentRoute: () => rootRouteImport,
 } as any)
 const IndexRoute = IndexRouteImport.update({
@@ -37,12 +43,14 @@ const InterviewsInterviewIdRoute = InterviewsInterviewIdRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/metrics': typeof MetricsRoute
   '/settings': typeof SettingsRoute
   '/interviews/$interviewId': typeof InterviewsInterviewIdRoute
   '/interviews/': typeof InterviewsIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/metrics': typeof MetricsRoute
   '/settings': typeof SettingsRoute
   '/interviews/$interviewId': typeof InterviewsInterviewIdRoute
   '/interviews': typeof InterviewsIndexRoute
@@ -50,21 +58,30 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/metrics': typeof MetricsRoute
   '/settings': typeof SettingsRoute
   '/interviews/$interviewId': typeof InterviewsInterviewIdRoute
   '/interviews/': typeof InterviewsIndexRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/settings' | '/interviews/$interviewId' | '/interviews/'
+  fullPaths:
+    '/' | '/metrics' | '/settings' | '/interviews/$interviewId' | '/interviews/'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/settings' | '/interviews/$interviewId' | '/interviews'
+  to:
+    '/' | '/metrics' | '/settings' | '/interviews/$interviewId' | '/interviews'
   id:
-    '__root__' | '/' | '/settings' | '/interviews/$interviewId' | '/interviews/'
+    | '__root__'
+    | '/'
+    | '/metrics'
+    | '/settings'
+    | '/interviews/$interviewId'
+    | '/interviews/'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  MetricsRoute: typeof MetricsRoute
   SettingsRoute: typeof SettingsRoute
   InterviewsInterviewIdRoute: typeof InterviewsInterviewIdRoute
   InterviewsIndexRoute: typeof InterviewsIndexRoute
@@ -77,6 +94,13 @@ declare module '@tanstack/react-router' {
       path: '/settings'
       fullPath: '/settings'
       preLoaderRoute: typeof SettingsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/metrics': {
+      id: '/metrics'
+      path: '/metrics'
+      fullPath: '/metrics'
+      preLoaderRoute: typeof MetricsRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/': {
@@ -105,6 +129,7 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  MetricsRoute: MetricsRoute,
   SettingsRoute: SettingsRoute,
   InterviewsInterviewIdRoute: InterviewsInterviewIdRoute,
   InterviewsIndexRoute: InterviewsIndexRoute,

@@ -15,8 +15,14 @@ export interface DevicePreview {
   error: string | null
   mics: MediaDeviceInfo[]
   cams: MediaDeviceInfo[]
+  /** Audio outputs; empty when the browser cannot route media elements. */
+  speakers: MediaDeviceInfo[]
   micId: string
   camId: string
+  /** "" = the browser's default output. */
+  speakerId: string
+  /** Whether HTMLMediaElement.setSinkId exists, so a choice can be honored. */
+  outputSelectable: boolean
   /** True only while the live stream carries a video track. */
   cameraOn: boolean
   /** Smoothed 0..1 input level of the selected microphone. */
@@ -28,6 +34,7 @@ export interface DevicePreview {
   selectMic: (id: string) => void
   selectCam: (id: string) => void
   toggleCamera: () => void
+  selectSpeaker: (id: string) => void
   /** Hand the microphone over: LiveKit opens its own track on the same
    *  device, so the preview must stop capturing audio first. A permission
    *  prompt still pending is cancelled too — its stream would otherwise
@@ -73,6 +80,11 @@ export function useDevicePreview(): DevicePreview {
   const [error, setError] = React.useState<string | null>(null)
   const [mics, setMics] = React.useState<MediaDeviceInfo[]>([])
   const [cams, setCams] = React.useState<MediaDeviceInfo[]>([])
+  const [speakers, setSpeakers] = React.useState<MediaDeviceInfo[]>([])
+  const [speakerId, setSpeakerId] = React.useState("")
+  const outputSelectable =
+    typeof HTMLMediaElement !== "undefined" &&
+    "setSinkId" in HTMLMediaElement.prototype
   const [micId, setMicId] = React.useState("")
   const [camId, setCamId] = React.useState("")
   const [cameraOn, setCameraOn] = React.useState(false)
@@ -243,6 +255,8 @@ export function useDevicePreview(): DevicePreview {
         if (stale()) return
         setMics(devices.filter((d) => d.kind === "audioinput"))
         setCams(devices.filter((d) => d.kind === "videoinput"))
+        if (outputSelectable)
+          setSpeakers(devices.filter((d) => d.kind === "audiooutput"))
         setMicId(next.getAudioTracks()[0]?.getSettings().deviceId ?? nextMicId)
         // A camera that failed is not worth retrying by default: the next
         // "Turn on" goes back to the system default instead.
@@ -252,7 +266,7 @@ export function useDevicePreview(): DevicePreview {
         )
       })()
     },
-    [startMeter]
+    [startMeter, outputSelectable]
   )
 
   const request = React.useCallback(() => {
@@ -275,6 +289,8 @@ export function useDevicePreview(): DevicePreview {
     },
     [open, micId]
   )
+
+  const selectSpeaker = React.useCallback((id: string) => setSpeakerId(id), [])
 
   const toggleCamera = React.useCallback(() => {
     const next = !wantCameraRef.current
@@ -323,8 +339,11 @@ export function useDevicePreview(): DevicePreview {
     error,
     mics,
     cams,
+    speakers,
     micId,
     camId,
+    speakerId,
+    outputSelectable,
     cameraOn,
     level,
     stream,
@@ -332,6 +351,7 @@ export function useDevicePreview(): DevicePreview {
     selectMic,
     selectCam,
     toggleCamera,
+    selectSpeaker,
     releaseMic,
     reclaimMic,
     stop,

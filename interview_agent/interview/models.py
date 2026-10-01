@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Seniority(StrEnum):
@@ -49,6 +49,10 @@ class MilestoneSpec(BaseModel):
             "covered. Write the passing threshold, not the ideal answer."
         )
     )
+    essential: bool = Field(default=True, description="Required to make an overall assessment.")
+    competency: str = Field(
+        default="", description="Competency assessed, independent of topic count."
+    )
 
 
 class InterviewPlan(BaseModel):
@@ -87,16 +91,53 @@ class InterviewPlan(BaseModel):
     # prompt, so the schema must not fight it.
     milestones: list[MilestoneSpec] = Field(
         description="Ordered milestones, as many as the prompt asks for.",
-        min_length=3,
-        max_length=8,
+        min_length=1,
+        # 12 = the typed primary-question ceiling; length profiles stay lower.
+        max_length=12,
     )
+
+
+class Assessment(StrEnum):
+    # Above the criterion's own bar, with evidence beyond its expected_evidence.
+    EXCEEDS = "exceeds"
+    MEETS = "meets"
+    PARTIAL = "partial"
+    BELOW = "below"
+    NOT_ASSESSABLE = "not_assessable"
+
+
+class EvidenceRef(BaseModel):
+    message_id: str = Field(description="Exact candidate message ID from the supplied transcript.")
+    message_version: int | None = Field(
+        default=None,
+        ge=1,
+        description="Exact supplied version of the cited candidate message.",
+    )
+    quote: str = Field(min_length=1, max_length=1200, description="Verbatim candidate evidence.")
+
+
+class CriterionEvaluation(BaseModel):
+    milestone_id: str
+    assessment: Assessment
+    evidence: list[EvidenceRef]
+    rationale: str
+    practice: str = Field(
+        description="One specific next practice exercise, or empty if unnecessary."
+    )
+
+
+class FeedbackFinding(BaseModel):
+    kind: str = Field(pattern="^(strength|weakness)$")
+    text: str
+    milestone_id: str
+    evidence: list[EvidenceRef]
 
 
 class EvaluationResult(BaseModel):
     """Evaluator output: the hiring decision over the interview transcript."""
 
-    hired: bool = Field(description="Final decision: would you hire this candidate?")
-    score: int = Field(
+    hired: bool | None = Field(description="Hiring simulation; null unless assessment is complete.")
+    score: int | None = Field(
         description="Overall score from 0 to 100, RELATIVE to the bar for the role's level.",
         ge=0,
         le=100,
@@ -106,9 +147,16 @@ class EvaluationResult(BaseModel):
     rationale: str = Field(
         description="Concise reasoning behind the decision and score, in the interview language."
     )
-    seniority_evaluated: Seniority = Field(
-        description="The seniority level you judged this interview against."
+    score_gap: str = Field(
+        default="",
+        description=(
+            "When the score is below the top of its band (100, 89, 69 or 39): what "
+            "specifically kept it from the top, citing the answers, in the interview "
+            "language. Empty only at the top of a band or without a score."
+        ),
     )
+    # Keep enum references bare: the provider rejects description beside $ref.
+    seniority_evaluated: Seniority
     calibration_notes: list[str] = Field(
         default_factory=list,
         description=(
@@ -117,3 +165,45 @@ class EvaluationResult(BaseModel):
             "out of `weaknesses`."
         ),
     )
+    evaluation_status: str = Field(default="complete", pattern="^(complete|partial|insufficient)$")
+    criteria: list[CriterionEvaluation] = Field(default_factory=list)
+    findings: list[FeedbackFinding] = Field(default_factory=list)
+    coverage: float = Field(
+        default=0.0, ge=0, le=1, description="Fraction of criteria observed, not ability."
+    )
+
+    @model_validator(mode="after")
+    def _no_verdict_without_complete_assessment(self) -> EvaluationResult:
+        if self.evaluation_status != "complete" and (
+            self.score is not None or self.hired is not None
+        ):
+            raise ValueError(
+                "Partial or insufficient evidence cannot produce an overall score/verdict"
+            )
+        return self
+
+
+class MilestoneUpdate(BaseModel):
+    milestone_id: str
+    status: str = Field(pattern="^(active|closed|skipped)$")
+    close_reason: str | None = Field(
+        default=None,
+        description=(
+            "covered, budget_exhausted, candidate_declined, time_limit; closed is not passed."
+        ),
+    )
+    evidence: list[EvidenceRef] = Field(default_factory=list)
+
+
+class TurnDecision(BaseModel):
+    action: str = Field(pattern="^(question|clarification|followup|advance|close)$")
+    spoken_text: str = Field(
+        max_length=700, description="One natural question, at most 50 words; empty for close."
+    )
+    target_milestone_id: str | None = None
+    updates: list[MilestoneUpdate] = Field(default_factory=list)
+    close_reason: str | None = Field(
+        default=None,
+        description="plan_complete, plan_exhausted, timeout, candidate_requested, question_limit",
+    )
+    closure_evidence: list[EvidenceRef] = Field(default_factory=list)

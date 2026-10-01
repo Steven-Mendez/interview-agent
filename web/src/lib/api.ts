@@ -19,6 +19,7 @@ export type InterviewStatus =
   | "created"
   | "planned"
   | "interviewing"
+  | "closing"
   | "completed"
   | "evaluating"
   | "evaluated"
@@ -71,27 +72,65 @@ export interface Milestone {
   position: number
   title: string
   description: string
-  /** The bar set for this milestone at the pinned level. Null on legacy rows. */
+  /** The bar set for this milestone at the pinned level. */
   expected_evidence: string | null
   completed: boolean
   notes: string | null
+  lifecycle?: "pending" | "active" | "closed" | "skipped"
+  close_reason?: string | null
+  essential?: boolean
+  competency?: string | null
+  primary_questions?: number
+  followups?: number
+  clarifications?: number
+}
+
+export type Assessment =
+  "exceeds" | "meets" | "partial" | "below" | "not_assessable"
+export type EvaluationStatus = "complete" | "partial" | "insufficient"
+export interface EvidenceRef {
+  message_id: string
+  message_version?: number | null
+  quote: string
+}
+export interface CriterionEvaluation {
+  milestone_id: string
+  assessment: Assessment
+  evidence: EvidenceRef[]
+  rationale: string
+  practice: string
 }
 
 export interface Evaluation {
-  hired: boolean
-  score: number
+  hired: boolean | null
+  score: number | null
   strengths: string[]
   weaknesses: string[]
   rationale: string
+  /** What kept the score from the top of its band; empty at a band's top. */
+  score_gap?: string
   /** The level the evaluator judged against. */
   seniority_evaluated: Seniority | null
   /** Expectations discarded for sitting above that level. */
   calibration_notes: string[]
   ended_by: string
+  /** Complete, partial or insufficient evidence for a verdict. */
+  evaluation_status: EvaluationStatus
+  coverage?: number
+  criteria?: CriterionEvaluation[]
+  findings?: {
+    kind: "strength" | "weakness"
+    text: string
+    milestone_id: string
+    evidence: EvidenceRef[]
+  }[]
 }
 
 export interface Interview {
   id: string
+  /** Live elapsed wall time from the persisted start, measured by PostgreSQL.
+   * Unknown before the first start or when talking to an older API. */
+  elapsed_seconds?: number | null
   /** ISO-8601, UTC. */
   created_at: string
   updated_at: string
@@ -99,9 +138,8 @@ export interface Interview {
   ended_reason: string | null
   /** Whether Start (or a rejoin) can be attempted: true for `planned`, and
    *  for `interviewing` rows still inside their reconnect window. False for
-   *  an `interviewing` row past it — its worker died (a crash never marks
-   *  the row completed), so it can only be evaluated as recorded, or
-   *  repeated. */
+   *  an `interviewing` row past it — its worker died and the server has not
+   *  sealed it yet, so it can only be evaluated as recorded, or repeated. */
   can_start: boolean
   /** ISO-8601, UTC: until when the room waits for a rejoin. Non-null only on
    *  `interviewing` rows. */
@@ -119,7 +157,20 @@ export interface Interview {
   seniority_evidence: string | null
   interview_length: InterviewLength
   max_minutes: number | null
-  /** Who conducted it, snapshotted at creation. Null on legacy rows. */
+  closing_id: string | null
+  farewell_status: string | null
+  /** Localized written farewell when the audio was not (provably) heard. */
+  farewell_text?: string | null
+  /** Server-clock bound for a closing observed after a reload; else null. */
+  closing_remaining_seconds?: number | null
+  transcript_sealed?: boolean
+  run_config: Record<string, unknown> | null
+  question_limit: number | null
+  followup_limit: number | null
+  transcript_integrity?: "complete" | "partial" | "failed" | null
+  capture_integrity_pending?: boolean
+  evaluation_invalidated?: boolean
+  /** Who conducted it, snapshotted at creation. */
   interviewer: {
     agent_name: string | null
     language: string | null
@@ -127,6 +178,8 @@ export interface Interview {
   } | null
   milestones: Milestone[]
   evaluation: Evaluation | null
+  evaluation_request_id?: string | null
+  evaluation_is_previous?: boolean
   token_usage: unknown
 }
 
@@ -151,7 +204,11 @@ export interface InterviewSummary {
   repeat_of_id: string | null
   milestones_total: number
   milestones_completed: number
-  evaluation: { hired: boolean; score: number } | null
+  evaluation: {
+    hired: boolean | null
+    score: number | null
+    evaluation_status?: EvaluationStatus
+  } | null
 }
 
 export interface InterviewPage {
@@ -162,16 +219,46 @@ export interface InterviewPage {
 }
 
 export interface TranscriptMessage {
+  id?: string
+  version?: number | null
+  versions?: { version: number; content: string }[]
+  metrics?: { stt_confirmed?: unknown; stt_segmentation?: string } | null
   role: "user" | "assistant"
   content: string
   created_at: string
 }
 
-/** Both fields inherit from the source when omitted; `seniority: "auto"` asks
- *  the planner to classify the role again instead of inheriting. */
+export interface TranscriptResponse {
+  messages: TranscriptMessage[]
+  capture_integrity_pending?: boolean
+  incidents?: {
+    id: string
+    turn_id: string
+    kind: string
+    content: string | null
+    created_at: string
+    resolved_at: string | null
+  }[]
+}
+
+/** Level and length inherit. Limits inherit for the same length, or are
+ *  recalculated for a changed profile before applying explicit overrides. */
 export interface RepeatRequest {
   seniority?: string
   interview_length?: string
+  question_limit?: number
+  followup_limit?: number
+  max_minutes?: number
+}
+
+/** The stored cap is authoritative, including overridden durations. */
+export function durationLabel(
+  length: InterviewLength,
+  maxMinutes: number | null
+): string {
+  return maxMinutes === null
+    ? LENGTH_LABELS[length]
+    : `${length[0].toUpperCase()}${length.slice(1)} — up to ${maxMinutes} min`
 }
 
 export interface TokenResponse {
@@ -253,6 +340,74 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T
 }
 
+export interface PlaybackAcknowledgement {
+  closing_id: string
+  stream_id: string
+  attempt_id: string
+  status: "played" | "failed" | "timeout"
+  duration_seconds: number | null
+  /** The pre-join choice, or the browser default; never a guessed device. */
+  audio_output?: "selected" | "default"
+}
+
+export interface ClosingState {
+  status: InterviewStatus
+  closing_id: string | null
+  farewell_status: string | null
+  transcript_sealed: boolean
+  transcript_integrity: string | null
+  remaining_seconds: number | null
+  playback_exceeded_budget: boolean | null
+}
+
+export function acknowledgeFarewell(
+  interviewId: string,
+  participantToken: string,
+  body: PlaybackAcknowledgement,
+  signal?: AbortSignal
+): Promise<{
+  accepted: boolean
+  status?: string | null
+  provisional?: boolean
+  reason?: string
+}> {
+  return request(`/interviews/${interviewId}/closing/ack`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${participantToken}`,
+    },
+    body: JSON.stringify(body),
+    signal,
+  })
+}
+
+export function recordResponseOnset(
+  interviewId: string,
+  participantToken: string,
+  body: { sample_id: string; seconds: number }
+): Promise<{ accepted: boolean }> {
+  return request(`/interviews/${interviewId}/metrics/response-onset`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${participantToken}`,
+    },
+    body: JSON.stringify(body),
+  })
+}
+
+export function getClosingState(
+  interviewId: string,
+  participantToken: string,
+  signal?: AbortSignal
+): Promise<ClosingState> {
+  return request(`/interviews/${interviewId}/closing`, {
+    headers: { Authorization: `Bearer ${participantToken}` },
+    signal,
+  })
+}
+
 // ---- Settings -----------------------------------------------------------------
 
 export function getSettings(): Promise<Settings> {
@@ -281,6 +436,30 @@ export interface InterviewerInput {
   voice?: string
   persona?: string
   custom_instructions?: string
+  question_limit?: number
+  followup_limit?: number
+  max_minutes?: number
+}
+
+export interface ResumePreview {
+  filename: string | null
+  text: string
+  characters: number
+  pdf_sha256: string
+}
+
+/** No planner call or stored interview; bind subsequent edits to this PDF. */
+export function previewResume(
+  file: File,
+  signal?: AbortSignal
+): Promise<ResumePreview> {
+  const body = new FormData()
+  body.append("resume", file)
+  return request<ResumePreview>("/resumes/preview", {
+    method: "POST",
+    body,
+    signal,
+  })
 }
 
 /** `formData` must contain a `resume` (PDF) file field and a `job_offer` text field. */
@@ -304,10 +483,8 @@ export function listInterviews(params?: {
 
 export function getTranscript(
   interviewId: string
-): Promise<{ messages: TranscriptMessage[] }> {
-  return request<{ messages: TranscriptMessage[] }>(
-    `/interviews/${interviewId}/transcript`
-  )
+): Promise<TranscriptResponse> {
+  return request<TranscriptResponse>(`/interviews/${interviewId}/transcript`)
 }
 
 /** Plans a NEW interview off the stored resume and offer — the source row is
@@ -327,6 +504,60 @@ export function getInterview(interviewId: string): Promise<Interview> {
   return request<Interview>(`/interviews/${interviewId}`)
 }
 
+export interface MetricFilters {
+  days?: number
+  graph_version?: string
+  model?: string
+  language?: string
+  seniority?: string
+  length?: string
+}
+export interface MetricSeries {
+  series_id: string
+  component: string
+  name: string
+  dimensions: Record<string, string | number | boolean>
+  count: number
+  unknown_count: number
+  total: number
+  mean: number | null
+  minimum: number | null
+  maximum: number | null
+  p50: number | null
+  p95: number | null
+}
+export interface MetricsReport {
+  days: number
+  items: MetricSeries[]
+  facets: Record<string, string[]>
+  percentiles: { method: string; relative_bucket_width: number }
+}
+export interface MetricTraceEvent {
+  id: string
+  created_at: string
+  component: string
+  name: string
+  value: number | null
+  dimensions: Record<string, string | number | boolean>
+}
+function metricQuery(params: MetricFilters & { trace_id?: string }): string {
+  return new URLSearchParams(
+    Object.entries(params)
+      .filter(([, value]) => value !== undefined && value !== "")
+      .map(([key, value]) => [key, String(value)])
+  ).toString()
+}
+export function getMetrics(
+  filters: MetricFilters = {}
+): Promise<MetricsReport> {
+  return request<MetricsReport>(`/metrics?${metricQuery(filters)}`)
+}
+export function getMetricTraces(
+  filters: MetricFilters & { trace_id?: string } = {}
+): Promise<{ items: MetricTraceEvent[]; has_more: boolean }> {
+  return request(`/metrics/traces?${metricQuery(filters)}`)
+}
+
 export function getInterviewToken(interviewId: string): Promise<TokenResponse> {
   return request<TokenResponse>(`/interviews/${interviewId}/token`)
 }
@@ -343,8 +574,143 @@ export function getInterviewToken(interviewId: string): Promise<TokenResponse> {
  *  `completed` with ended_reason "connection_lost" and evaluated as recorded.
  *  409 for a live interview still inside the window and for a row with no
  *  transcript; 404 for an unknown id. */
-export function evaluateInterview(interviewId: string): Promise<Interview> {
-  return request<Interview>(`/interviews/${interviewId}/evaluate`, {
+export function evaluateInterview(
+  interviewId: string,
+  requestId?: string
+): Promise<Interview> {
+  const suffix = requestId ? `?request_id=${encodeURIComponent(requestId)}` : ""
+  return request<Interview>(`/interviews/${interviewId}/evaluate${suffix}`, {
     method: "POST",
   })
+}
+
+export interface RecoverableQuestion {
+  id: string
+  text: string
+  status: "pending" | "requested" | "started" | "sdk_completed" | "interrupted"
+}
+
+export function getQuestion(interviewId: string) {
+  return request<{ question: RecoverableQuestion | null }>(
+    `/interviews/${interviewId}/question`
+  )
+}
+
+export function replayQuestion(
+  interviewId: string,
+  questionId: string,
+  requestId: string
+) {
+  return request<{ request_id: string }>(
+    `/interviews/${interviewId}/question/replay`,
+    {
+      method: "POST",
+      body: JSON.stringify({ question_id: questionId, request_id: requestId }),
+    }
+  )
+}
+
+export function getEvaluationHistory(interviewId: string) {
+  return request<{
+    current_request_id: string | null
+    requests: {
+      id: string
+      automatic: boolean
+      seal_id?: string | null
+      seal_version?: number | null
+      status: string
+      attempts: number
+      created_at: string
+    }[]
+    attempts: {
+      id: string
+      request_id: string | null
+      ordinal: number | null
+      status: string
+      invalidated?: boolean
+      result: Evaluation | null
+      error: string | null
+      created_at: string
+    }[]
+  }>(`/interviews/${interviewId}/evaluations`)
+}
+
+export type IncidentDecision = "duplicate" | "post_cut" | "omission"
+export interface SealHistory {
+  current_seal_id: string | null
+  seals: {
+    id: string
+    version: number
+    integrity: string
+    invalidated: boolean
+    records: { id: string; role: string; content: string; version?: number }[]
+    provenance: { incorporated_incident_ids?: string[] }
+    created_at: string
+  }[]
+  incidents: {
+    id: string
+    content: string | null
+    review: {
+      decision: IncidentDecision
+      reviewer: string
+      rationale: string
+    } | null
+  }[]
+}
+export function getSealHistory(interviewId: string) {
+  return request<SealHistory>(`/interviews/${interviewId}/seals`)
+}
+export function reviewCaptureIncident(
+  interviewId: string,
+  incidentId: string,
+  body: {
+    review_id: string
+    decision: IncidentDecision
+    rationale: string
+    reviewer: string
+  }
+) {
+  return request(`/interviews/${interviewId}/incidents/${incidentId}/review`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  })
+}
+export function createReviewedSnapshot(
+  interviewId: string,
+  body: {
+    seal_id: string
+    parent_id: string
+    incident_ids: string[]
+    rationale: string
+    reviewer: string
+    confirm_complete: boolean
+  }
+) {
+  return request<{
+    seal_id: string
+    version: number
+    evaluation_required: boolean
+  }>(`/interviews/${interviewId}/seals`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  })
+}
+
+export interface ExternalDeletionReport {
+  counts: Partial<Record<string, number>>
+  items: {
+    id: string
+    state: string
+    attempts: number
+    failures: number
+    last_error: string | null
+    requested_at: string | null
+    submitted_at: string | null
+    verified_at: string | null
+    next_attempt_at: string | null
+  }[]
+}
+
+export function getExternalDeletions() {
+  return request<ExternalDeletionReport>("/metrics/deletions")
 }

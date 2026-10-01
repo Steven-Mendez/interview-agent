@@ -1,13 +1,4 @@
-"""Background evaluation runs.
-
-POST /interviews/{id}/evaluate used to run the evaluator INSIDE the request:
-an HTTP call that lasted as long as a high-reasoning LLM call, a worker that
-had to wait on it with retries and timeouts, and a duplicate run whenever
-anything in between gave up early. The endpoint now CLAIMS the row (one
-atomic UPDATE into "evaluating", see db.claim_evaluation) and hands the id to
-the runner below, which evaluates in the API process, heartbeats the row
-while it does, and writes the outcome. Clients poll GET /interviews/{id}.
-"""
+"""Background evaluations with an immutable input and an ownership token."""
 
 from __future__ import annotations
 
@@ -18,231 +9,345 @@ from contextlib import suppress
 from datetime import timedelta
 
 from langchain_core.callbacks import UsageMetadataCallbackHandler
-from sqlalchemy import update
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from interview_agent.config import settings
 from interview_agent.interview import db
+from interview_agent.interview.evaluation_contract import (
+    canonical_message_records,
+    validate_evaluation,
+)
+from interview_agent.interview.evaluation_requests import owned
 from interview_agent.interview.evaluator import run_evaluator
+from interview_agent.interview.models import Seniority
+from interview_agent.interview.seals import seal_invalid
 from interview_agent.llm import summarize_usage
+from interview_agent.observability import LLMObserver, Telemetry, content_hash
+from interview_agent.runtime import process_manifest, record_manifest
 
 logger = logging.getLogger("interview_agent.server")
-
-# A live run bumps the row's updated_at this often. A row in "evaluating"
-# that has not moved for STALE_AFTER belongs to a process that died (the API
-# restarted mid-run) and can be claimed again; the UI's own "taking too long"
-# clock is anchored on the same column, so it only ever fires for dead runs.
 HEARTBEAT_SECONDS = 30
 STALE_AFTER = timedelta(minutes=2)
 
 
-async def record_spent_usage(
-    session: AsyncSession,
-    conversation_id: uuid.UUID,
-    component: str,
-    handler: UsageMetadataCallbackHandler,
-) -> None:
-    """Book the tokens a FAILED planner/evaluator run consumed. The callback
-    fires per retry attempt, so a run that never produced a usable result
-    still spent whatever it reports; only a run that never reached the model
-    (nothing to book) is skipped."""
+async def record_spent_usage(session, conversation_id, component, handler):
     usage = summarize_usage(handler.usage_metadata)
     if any(usage.values()):
         await db.add_token_usage(session, conversation_id, component, usage)
 
 
 class EvaluationRunner:
-    """Owns the in-flight evaluations of one API process."""
-
-    def __init__(self, sessionmaker: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(self, sessionmaker):
         self._sessionmaker = sessionmaker
-        self._tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
+        self._tasks = {}
 
     @property
-    def running(self) -> int:
+    def running(self):
         return len(self._tasks)
 
-    def start(self, interview_id: uuid.UUID) -> None:
-        """Schedule the run for a row the caller has ALREADY claimed."""
-        task = asyncio.create_task(self._run(interview_id), name=f"evaluate-{interview_id}")
-        self._tasks[interview_id] = task
-        task.add_done_callback(lambda done: self._forget(interview_id, done))
+    def start(self, interview_id: uuid.UUID, claim_id: uuid.UUID | None = None):
+        key = (interview_id, claim_id)
+        if key in self._tasks:
+            return
+        task = asyncio.create_task(
+            self._run(interview_id, claim_id), name=f"evaluate-{interview_id}"
+        )
+        self._tasks[key] = task
+        task.add_done_callback(lambda done: self._forget(key, done))
 
-    def _forget(self, interview_id: uuid.UUID, task: asyncio.Task[None]) -> None:
+    def _forget(self, interview_id, task):
         if self._tasks.get(interview_id) is task:
             del self._tasks[interview_id]
 
-    async def wait_idle(self) -> None:
-        """Block until every scheduled run has finished."""
+    async def wait_idle(self):
         while self._tasks:
             await asyncio.gather(*list(self._tasks.values()), return_exceptions=True)
 
-    async def shutdown(self) -> None:
-        """Cancel what is still running. Each run marks its row
-        evaluation_failed on the way out, so the UI offers a retry instead of
-        a spinner over a row nobody is working on any more."""
+    async def reconcile_pending(self):
+        recovered = 0
+        cursor = None
+        while True:
+            async with self._sessionmaker() as session:
+                query = (
+                    select(db.Conversation.id)
+                    .where(
+                        db.Conversation.status.in_(
+                            ("completed", "evaluating", "evaluation_failed")
+                        ),
+                        (db.Conversation.evaluation_request_id.is_not(None))
+                        | (db.Conversation.transcript_sealed_at.is_not(None)),
+                    )
+                    .order_by(db.Conversation.id)
+                    .limit(128)
+                )
+                if cursor is not None:
+                    query = query.where(db.Conversation.id > cursor)
+                ids = list(await session.scalars(query))
+            for interview_id in ids:
+                try:
+                    async with asyncio.timeout(2), self._sessionmaker() as session:
+                        conversation = await session.get(db.Conversation, interview_id)
+                        if conversation is None:
+                            continue
+                        claim_id = await db.claim_evaluation(
+                            session,
+                            interview_id,
+                            STALE_AFTER,
+                            automatic=conversation.evaluation_request_id is None,
+                            recover=conversation.evaluation_request_id is not None,
+                        )
+                    if claim_id is not None:
+                        self.start(interview_id, claim_id)
+                        recovered += 1
+                except Exception:
+                    logger.exception("Evaluation recovery failed")
+            if len(ids) < 128:
+                return recovered
+            cursor = ids[-1]
+
+    async def shutdown(self):
         for task in list(self._tasks.values()):
             task.cancel()
         await self.wait_idle()
 
-    async def _run(self, interview_id: uuid.UUID) -> None:
-        heartbeat = asyncio.create_task(self._heartbeat(interview_id))
+    async def _run(self, interview_id, claim_id):
+        if claim_id is None:
+            async with self._sessionmaker() as session:
+                conversation = await db.get_conversation(session, interview_id)
+                claim_id = conversation.evaluation_claim_id if conversation else None
+        if claim_id is None:
+            return
+        heartbeat = asyncio.create_task(self._heartbeat(interview_id, claim_id))
         try:
-            await self._evaluate(interview_id)
+            await self._evaluate(interview_id, claim_id)
         except asyncio.CancelledError:
-            await self._fail(interview_id)
+            # Shutdown: the row stays `evaluating` and the lease expires, so the
+            # sweeper of the next process recovers the same request.
             raise
         except Exception:
-            logger.exception("evaluation run crashed for %s", interview_id)
-            await self._fail(interview_id)
+            logger.exception("Evaluation crashed for %s", interview_id)
+            await self._fail(interview_id, claim_id)
         finally:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat
 
-    async def _heartbeat(self, interview_id: uuid.UUID) -> None:
+    async def _heartbeat(self, interview_id, claim_id):
         while True:
             await asyncio.sleep(HEARTBEAT_SECONDS)
             try:
                 async with self._sessionmaker() as session:
-                    alive = await db.heartbeat_evaluation(session, interview_id)
+                    alive = await db.heartbeat_evaluation(session, interview_id, claim_id)
             except Exception:
-                logger.exception("heartbeat failed for %s; retrying", interview_id)
+                logger.exception("Evaluation heartbeat failed")
                 continue
             if not alive:
-                # Finished, or reclaimed by another process: not ours any more.
                 return
 
-    async def _fail(
-        self, interview_id: uuid.UUID, usage: UsageMetadataCallbackHandler | None = None
-    ) -> None:
+    async def _fail(self, interview_id, claim_id, usage=None):
         try:
             async with self._sessionmaker() as session:
-                # Spend first, status last: the status flip is what a poller
-                # acts on, so everything it will read must already be there.
-                if usage is not None:
-                    await record_spent_usage(session, interview_id, "evaluator", usage)
-                # Guarded: a run that lost its claim (reclaimed after going
-                # stale) must not stamp its failure over the newer run.
-                await db.set_status_if(session, interview_id, "evaluating", "evaluation_failed")
-        except Exception:
-            logger.exception("could not record the failed evaluation of %s", interview_id)
-
-    async def _evaluate(self, interview_id: uuid.UUID) -> None:
-        # Session 1 (short): load everything the evaluator needs, then release
-        # the connection — the LLM call can take minutes, and holding a
-        # transaction open across it is pure waste.
-        async with self._sessionmaker() as session:
-            conversation = await db.get_conversation(session, interview_id)
-            if conversation is None or conversation.status != "evaluating":
-                logger.warning(
-                    "evaluation of %s skipped: row is %s",
-                    interview_id,
-                    conversation.status if conversation else "gone",
+                conversation = await session.scalar(
+                    select(db.Conversation)
+                    .where(db.Conversation.id == interview_id)
+                    .with_for_update()
                 )
+                run = await session.get(db.EvaluationRun, claim_id)
+                if run is None:
+                    return
+                if run.status != "running":
+                    if usage is not None and run.usage is None:
+                        run.usage = summarize_usage(usage.usage_metadata)
+                        await db.add_token_usage(
+                            session, interview_id, "evaluator", run.usage, commit=False
+                        )
+                        await session.commit()
+                    return
+                current = await owned(session, conversation, run)
+                run.status = "failed"
+                run.error = "evaluation_contract_or_provider_error"
+                run.finished_at = await session.scalar(select(func.clock_timestamp()))
+                if usage is not None:
+                    run.usage = summarize_usage(usage.usage_metadata)
+                    await db.add_token_usage(
+                        session, interview_id, "evaluator", run.usage, commit=False
+                    )
+                if current:
+                    # A provider or contract failure is final for this request; the
+                    # UI offers a manual retry, which creates a new one. Only an
+                    # expired lease (crash) is recovered automatically.
+                    request = await session.get(db.EvaluationRequest, run.request_id)
+                    request.status = "failed"
+                    conversation.status = "evaluation_failed"
+                await session.commit()
+        except Exception:
+            logger.exception("Could not persist evaluation failure")
+
+    async def _evaluate(self, interview_id, claim_id):
+        async with self._sessionmaker() as session:
+            conversation = await session.scalar(
+                select(db.Conversation).where(db.Conversation.id == interview_id).with_for_update()
+            )
+            run = await session.get(db.EvaluationRun, claim_id)
+            if not await owned(session, conversation, run):
                 return
             messages = await db.get_messages(session, interview_id)
             milestones = await db.get_milestones(session, interview_id)
-            resume_markdown = conversation.resume_markdown
-            job_offer = conversation.job_offer
+            request = await session.get(db.EvaluationRequest, run.request_id)
+            seal = await session.get(db.TranscriptSeal, request.seal_id)
+            records = seal.records
+            if content_hash(canonical_message_records(messages)) != seal.provenance.get(
+                "canonical_hash"
+            ):
+                raise ValueError("Canonical transcript changed after sealing")
+            criteria = [
+                {
+                    "id": str(m.id),
+                    "title": m.title,
+                    "description": m.description,
+                    "expected_evidence": m.expected_evidence,
+                    "essential": m.essential,
+                    "lifecycle": m.lifecycle,
+                    "close_reason": m.close_reason,
+                }
+                for m in milestones
+            ]
+            resume = conversation.resume_markdown
+            offer = conversation.job_offer
             plan = conversation.plan or {}
-            ended_reason = conversation.ended_reason or "unknown"
-            custom_instructions = conversation.custom_instructions
+            reason = conversation.ended_reason or "unknown"
+            custom = conversation.custom_instructions
             seniority = conversation.seniority
-        if not messages:
-            logger.error("evaluation of %s has no transcript to score", interview_id)
-            await self._fail(interview_id)
-            return
-
-        logger.info(
-            "evaluating interview",
-            extra={"conversation": str(interview_id), "messages": len(messages)},
-        )
-        evaluator_usage = UsageMetadataCallbackHandler()
-        try:
-            result = await run_evaluator(
-                settings,
-                resume_markdown=resume_markdown,
-                job_offer=job_offer,
-                plan=plan,
-                milestones=[
-                    {
-                        "title": m.title,
-                        "description": m.description,
-                        "expected_evidence": m.expected_evidence,
-                        "completed": m.completed,
-                        "notes": m.notes,
-                    }
-                    for m in milestones
-                ],
-                transcript=[(m.role, m.content) for m in messages],
-                ended_reason=ended_reason,
-                seniority=seniority,
-                custom_instructions=custom_instructions,
-                usage_callback=evaluator_usage,
+            transcript_complete = (
+                seal.integrity not in ("partial", "failed")
+                and not conversation.capture_integrity_pending
+                and not await seal_invalid(session, request.seal_id)
             )
-        except Exception:
-            # Surface the failure: the frontend polls status and offers a retry
-            # instead of spinning forever.
-            logger.exception("evaluation failed for %s", interview_id)
-            await self._fail(interview_id, evaluator_usage)
-            return
-
-        if result.seniority_evaluated.value != seniority:
-            # The level is pinned and handed to the evaluator; an echo of a
-            # different one means the calibration did not hold on this run.
-            # Stored as returned (it is what the score was judged against) but
-            # made visible here.
-            logger.warning(
-                "evaluator judged %s against '%s' instead of the pinned '%s'",
-                interview_id,
-                result.seniority_evaluated.value,
-                seniority,
+            capture_integrity_pending = conversation.capture_integrity_pending
+            language = (conversation.agent_settings or {}).get(
+                "language", plan.get("language", "en")
             )
-
-        # Session 2 (write): upsert instead of delete+insert, and the status
-        # UNGUARDED — a result is never wrong, so even a run that lost its
-        # claim (reclaimed after a heartbeat outage) gets to land it; the
-        # newer run overwrites it when it finishes, last commit wins.
-        values = {
-            "hired": result.hired,
-            "score": result.score,
-            "strengths": result.strengths,
-            "weaknesses": result.weaknesses,
-            "rationale": result.rationale,
-            "seniority_evaluated": result.seniority_evaluated.value,
-            "calibration_notes": result.calibration_notes,
-            "ended_by": ended_reason,
-        }
-        async with self._sessionmaker() as session:
-            # Spend first, status last: the flip to "evaluated" is what a
-            # poller acts on, so the result and the usage must land before it.
-            # Re-evaluations accumulate on purpose: those tokens were spent.
-            await db.add_token_usage(
-                session,
-                interview_id,
+            config = conversation.run_config or {}
+            model_config = config.get("models", {}).get("evaluator", {})
+            effective = settings.model_copy(
+                update={
+                    "evaluator_model": model_config.get("model", settings.evaluator_model),
+                    "evaluator_reasoning_effort": model_config.get(
+                        "reasoning_effort", settings.evaluator_reasoning_effort
+                    ),
+                }
+            )
+            request = await session.get(db.EvaluationRequest, run.request_id)
+            now = await session.scalar(select(func.clock_timestamp()))
+            remaining_seconds = max(0, (request.deadline_at - now).total_seconds())
+            input_hash = content_hash(records)
+            if input_hash != run.transcript_hash:
+                raise ValueError("Evaluation request transcript changed before execution")
+            run.config = {
+                **config,
+                "model": effective.evaluator_model,
+                "reasoning_effort": effective.evaluator_reasoning_effort,
+                "language": language,
+                "seniority": seniority,
+                "transcript_complete": transcript_complete,
+            }
+            manifest = await process_manifest(
+                effective,
                 "evaluator",
-                summarize_usage(evaluator_usage.usage_metadata),
+                config=config,
+                functions=(self._evaluate.__func__, run_evaluator),
             )
-            await session.execute(
-                pg_insert(db.Evaluation)
-                .values(conversation_id=interview_id, **values)
-                .on_conflict_do_update(index_elements=["conversation_id"], set_=values)
-            )
-            await session.execute(
-                update(db.Conversation)
-                .where(db.Conversation.id == interview_id)
-                .values(status="evaluated")
-            )
+            run.config["runtime_manifest_id"] = manifest["id"]
             await session.commit()
 
-        logger.info(
-            "interview evaluated",
-            extra={
-                "conversation": str(interview_id),
+        await record_manifest(self._sessionmaker, manifest, conversation_id=interview_id)
+        telemetry = Telemetry(self._sessionmaker, interview_id, effective, config)
+        observer = LLMObserver(
+            telemetry, "evaluator", effective.evaluator_model, effective.evaluator_reasoning_effort
+        )
+        usage = UsageMetadataCallbackHandler()
+        try:
+            async with asyncio.timeout(remaining_seconds):
+                result = await run_evaluator(
+                    effective,
+                    resume_markdown=resume,
+                    job_offer=offer,
+                    plan=plan,
+                    milestones=criteria,
+                    transcript=records,
+                    ended_reason=reason,
+                    seniority=seniority,
+                    custom_instructions=custom,
+                    language=language,
+                    usage_callback=usage,
+                    telemetry_callback=observer,
+                    transcript_complete=transcript_complete,
+                )
+            # Also validates mocked/custom evaluator integrations at the write boundary.
+            result = validate_evaluation(
+                result,
+                seniority=Seniority(seniority),
+                milestones=criteria,
+                records=records,
+                transcript_complete=transcript_complete,
+            )
+            values = {
                 "hired": result.hired,
                 "score": result.score,
-                "seniority": result.seniority_evaluated.value,
-            },
-        )
+                "strengths": result.strengths,
+                "weaknesses": result.weaknesses,
+                "rationale": result.rationale,
+                "seniority_evaluated": result.seniority_evaluated.value,
+                "calibration_notes": result.calibration_notes,
+                "ended_by": reason,
+                "result": result.model_dump(mode="json"),
+            }
+            async with self._sessionmaker() as session:
+                # Lock once: ownership, spend, immutable history and the public result
+                # all land in the same transaction.
+                conversation = await session.scalar(
+                    select(db.Conversation)
+                    .where(db.Conversation.id == interview_id)
+                    .with_for_update()
+                )
+                run = await session.get(db.EvaluationRun, claim_id)
+                run.result = result.model_dump(mode="json")
+                run.usage = summarize_usage(usage.usage_metadata)
+                owns = await owned(session, conversation, run)
+                request = await session.get(db.EvaluationRequest, run.request_id)
+                sealed = await session.get(db.TranscriptSeal, request.seal_id)
+                current_records = sealed.records
+                if owns and content_hash(
+                    canonical_message_records(await db.get_messages(session, interview_id))
+                ) != sealed.provenance.get("canonical_hash"):
+                    raise ValueError("Canonical transcript changed after sealing")
+                if owns and conversation.capture_integrity_pending != capture_integrity_pending:
+                    raise ValueError("Capture integrity changed during evaluation")
+                if owns and content_hash(current_records) != input_hash:
+                    raise ValueError("Transcript changed during evaluation")
+                if run.status == "running":
+                    run.status = "completed" if owns else "superseded"
+                run.finished_at = await session.scalar(select(func.clock_timestamp()))
+                await db.add_token_usage(
+                    session, interview_id, "evaluator", run.usage, commit=False
+                )
+                if owns:
+                    request = await session.get(db.EvaluationRequest, run.request_id)
+                    request.status = "completed"
+                    values["result"]["request_id"] = str(request.id)
+                    values["result"]["seal_id"] = str(request.seal_id)
+                    await session.execute(
+                        pg_insert(db.Evaluation)
+                        .values(conversation_id=interview_id, **values)
+                        .on_conflict_do_update(index_elements=["conversation_id"], set_=values)
+                    )
+                    conversation.status = "evaluated"
+                await session.commit()
+            telemetry.emit("evaluation", "coverage", result.coverage)
+            telemetry.emit("evaluation", "complete", int(result.evaluation_status == "complete"))
+        except Exception:
+            logger.exception("Evaluation failed for %s", interview_id)
+            await self._fail(interview_id, claim_id, usage)
+        finally:
+            await telemetry.drain()

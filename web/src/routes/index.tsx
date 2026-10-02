@@ -5,6 +5,7 @@ import {
   ArrowRightIcon,
   ChevronRightIcon,
   HistoryIcon,
+  LogInIcon,
   MicIcon,
   PlayIcon,
   PlusIcon,
@@ -24,6 +25,7 @@ import { PageContainer, PageShell, Section } from "@/components/ui/page"
 import { Skeleton } from "@/components/ui/skeleton"
 import { ApiError, SENIORITY_LABELS, durationLabel } from "@/lib/api"
 import type { InterviewSummary } from "@/lib/api"
+import { authEnabled, useAuth } from "@/lib/auth"
 import { recentInterviewsQueryOptions } from "@/lib/queries"
 import { pageHead } from "@/lib/head"
 
@@ -47,13 +49,24 @@ function errorMessage(error: unknown): string {
 }
 
 function HomePage() {
-  const recent = useQuery(recentInterviewsQueryOptions({ limit: RECENT_LIMIT }))
-  const planned = useQuery(
-    recentInterviewsQueryOptions({ limit: 5, status: "planned" })
-  )
-  const interviewing = useQuery(
-    recentInterviewsQueryOptions({ limit: 5, status: "interviewing" })
-  )
+  // The home page is public: interviews load once someone is signed in (or
+  // always, without sign-in). Until the session is known — the whole
+  // prerender — it looks the same as loading.
+  const { user, isPending: sessionPending } = useAuth()
+  const signedOut = authEnabled && !sessionPending && user === null
+  const enabled = !authEnabled || user !== null
+  const recent = useQuery({
+    ...recentInterviewsQueryOptions({ limit: RECENT_LIMIT }),
+    enabled,
+  })
+  const planned = useQuery({
+    ...recentInterviewsQueryOptions({ limit: 5, status: "planned" }),
+    enabled,
+  })
+  const interviewing = useQuery({
+    ...recentInterviewsQueryOptions({ limit: 5, status: "interviewing" }),
+    enabled,
+  })
 
   // Ready = planned and never started, or left mid-call with the room still
   // waiting. An `interviewing` row past its window cannot be joined.
@@ -80,11 +93,24 @@ function HomePage() {
               on every answer.
             </p>
             <div className="flex flex-wrap items-center gap-3">
-              <LinkButton to="/new" size="lg" variant="create">
-                <PlusIcon />
-                New interview
-              </LinkButton>
-              {continueRow ? (
+              {signedOut ? (
+                <LinkButton
+                  to="/auth/$pathname"
+                  params={{ pathname: "sign-in" }}
+                  search={{ redirectTo: "/new" }}
+                  size="lg"
+                  variant="create"
+                >
+                  <LogInIcon />
+                  Sign in to start
+                </LinkButton>
+              ) : (
+                <LinkButton to="/new" size="lg" variant="create">
+                  <PlusIcon />
+                  New interview
+                </LinkButton>
+              )}
+              {signedOut ? null : continueRow ? (
                 <LinkButton
                   to="/interviews/$interviewId"
                   params={{ interviewId: continueRow.id }}
@@ -113,7 +139,7 @@ function HomePage() {
           </div>
         </section>
 
-        {recent.isError && (
+        {!signedOut && recent.isError && (
           <Alert variant="destructive">
             <AlertCircleIcon />
             <AlertDescription>
@@ -131,7 +157,7 @@ function HomePage() {
           </Alert>
         )}
 
-        {ready.length > 0 && (
+        {!signedOut && ready.length > 0 && (
           <Section title="Ready to start">
             <ul className="divide-y overflow-hidden rounded-xl border">
               {ready.map((row) => (
@@ -141,7 +167,7 @@ function HomePage() {
           </Section>
         )}
 
-        {recent.isPending ? (
+        {signedOut ? null : recent.isPending ? (
           <Section title="Recent interviews">
             <RowsSkeleton />
           </Section>

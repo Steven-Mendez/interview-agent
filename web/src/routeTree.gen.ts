@@ -15,6 +15,7 @@ import { Route as MascotLabRouteImport } from './routes/mascot-lab'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as InterviewsIndexRouteImport } from './routes/interviews.index'
 import { Route as InterviewsInterviewIdRouteImport } from './routes/interviews.$interviewId'
+import { Route as AuthPathnameRouteImport } from './routes/auth.$pathname'
 
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
@@ -46,12 +47,18 @@ const InterviewsInterviewIdRoute = InterviewsInterviewIdRouteImport.update({
   path: '/interviews/$interviewId',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AuthPathnameRoute = AuthPathnameRouteImport.update({
+  id: '/auth/$pathname',
+  path: '/auth/$pathname',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/mascot-lab': typeof MascotLabRoute
   '/new': typeof NewRoute
   '/settings': typeof SettingsRoute
+  '/auth/$pathname': typeof AuthPathnameRoute
   '/interviews/$interviewId': typeof InterviewsInterviewIdRoute
   '/interviews/': typeof InterviewsIndexRoute
 }
@@ -60,6 +67,7 @@ export interface FileRoutesByTo {
   '/mascot-lab': typeof MascotLabRoute
   '/new': typeof NewRoute
   '/settings': typeof SettingsRoute
+  '/auth/$pathname': typeof AuthPathnameRoute
   '/interviews/$interviewId': typeof InterviewsInterviewIdRoute
   '/interviews': typeof InterviewsIndexRoute
 }
@@ -69,6 +77,7 @@ export interface FileRoutesById {
   '/mascot-lab': typeof MascotLabRoute
   '/new': typeof NewRoute
   '/settings': typeof SettingsRoute
+  '/auth/$pathname': typeof AuthPathnameRoute
   '/interviews/$interviewId': typeof InterviewsInterviewIdRoute
   '/interviews/': typeof InterviewsIndexRoute
 }
@@ -79,6 +88,7 @@ export interface FileRouteTypes {
     | '/mascot-lab'
     | '/new'
     | '/settings'
+    | '/auth/$pathname'
     | '/interviews/$interviewId'
     | '/interviews/'
   fileRoutesByTo: FileRoutesByTo
@@ -87,6 +97,7 @@ export interface FileRouteTypes {
     | '/mascot-lab'
     | '/new'
     | '/settings'
+    | '/auth/$pathname'
     | '/interviews/$interviewId'
     | '/interviews'
   id:
@@ -95,6 +106,7 @@ export interface FileRouteTypes {
     | '/mascot-lab'
     | '/new'
     | '/settings'
+    | '/auth/$pathname'
     | '/interviews/$interviewId'
     | '/interviews/'
   fileRoutesById: FileRoutesById
@@ -104,6 +116,7 @@ export interface RootRouteChildren {
   MascotLabRoute: typeof MascotLabRoute
   NewRoute: typeof NewRoute
   SettingsRoute: typeof SettingsRoute
+  AuthPathnameRoute: typeof AuthPathnameRoute
   InterviewsInterviewIdRoute: typeof InterviewsInterviewIdRoute
   InterviewsIndexRoute: typeof InterviewsIndexRoute
 }
@@ -152,6 +165,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof InterviewsInterviewIdRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/auth/$pathname': {
+      id: '/auth/$pathname'
+      path: '/auth/$pathname'
+      fullPath: '/auth/$pathname'
+      preLoaderRoute: typeof AuthPathnameRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
@@ -160,6 +180,7 @@ const rootRouteChildren: RootRouteChildren = {
   MascotLabRoute: MascotLabRoute,
   NewRoute: NewRoute,
   SettingsRoute: SettingsRoute,
+  AuthPathnameRoute: AuthPathnameRoute,
   InterviewsInterviewIdRoute: InterviewsInterviewIdRoute,
   InterviewsIndexRoute: InterviewsIndexRoute,
 }

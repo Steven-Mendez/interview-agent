@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   preview: vi.fn(),
   settings: vi.fn(),
   create: vi.fn(),
+  me: vi.fn(),
   navigate: vi.fn(),
 }))
 vi.mock("@/lib/api", async (original) => ({
@@ -23,6 +24,7 @@ vi.mock("@/lib/api", async (original) => ({
   previewResume: mocks.preview,
   getSettings: mocks.settings,
   createInterview: mocks.create,
+  getMe: mocks.me,
 }))
 vi.mock("@tanstack/react-router", async (original) => ({
   ...(await original<typeof Router>()),
@@ -46,6 +48,16 @@ beforeEach(() => {
     pdf_sha256: "a".repeat(64),
   })
   mocks.create.mockImplementation(() => new Promise(() => {}))
+  mocks.me.mockResolvedValue({
+    id: "user",
+    email: null,
+    name: null,
+    is_admin: false,
+    interviews_used: 0,
+    interview_limit: 3,
+    interviews_remaining: 3,
+    demo_capacity_available: true,
+  })
 })
 afterEach(cleanup)
 
@@ -122,6 +134,45 @@ describe("reviewed interview inputs", () => {
     expect(screen.queryByLabelText("Main questions")).toBeNull()
     expect(mocks.create).not.toHaveBeenCalled()
     expect(mocks.preview).toHaveBeenCalledTimes(1)
+  })
+
+  it("loads the sample resume the same way as a picked file", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(new Blob(["%PDF-sample"]), { status: 200 })
+        )
+      )
+    )
+    try {
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      })
+      render(
+        <QueryClientProvider client={client}>
+          <UploadPage />
+        </QueryClientProvider>
+      )
+      expect(
+        screen.getByText(
+          "Your resume is processed by OpenAI to plan the interview."
+        )
+      ).toBeTruthy()
+      fireEvent.click(screen.getByRole("button", { name: "Use sample resume" }))
+      await screen.findByText("sample-resume.pdf")
+      expect(fetch).toHaveBeenCalledWith("/sample-resume.pdf")
+      fireEvent.change(screen.getByLabelText("Job offer"), {
+        target: { value: "Backend engineer" },
+      })
+      next()
+      await screen.findByLabelText("Extracted resume text")
+      const file = mocks.preview.mock.calls[0][0] as File
+      expect(file.name).toBe("sample-resume.pdf")
+      expect(file.type).toBe("application/pdf")
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 
   it("rejects out-of-range limits before opening the last step", async () => {

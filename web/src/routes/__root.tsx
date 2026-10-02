@@ -8,6 +8,7 @@ import { TanStackDevtools } from "@tanstack/react-devtools"
 import type { QueryClient } from "@tanstack/react-query"
 
 import { Mascot } from "@/components/mascot"
+import { AuthProvider } from "@/components/auth-provider"
 import { ShellProvider } from "@/components/app-shell"
 import { ThemeProvider } from "@/components/theme-provider"
 import { EmptyState } from "@/components/ui/empty-state"
@@ -79,9 +80,11 @@ function RootDocument({ children }: { children: React.ReactNode }) {
       </head>
       <body>
         <ThemeProvider>
-          <TooltipProvider>
-            <ShellProvider>{children}</ShellProvider>
-          </TooltipProvider>
+          <AuthProvider>
+            <TooltipProvider>
+              <ShellProvider>{children}</ShellProvider>
+            </TooltipProvider>
+          </AuthProvider>
           <Toaster />
           <TanStackDevtools
             config={{

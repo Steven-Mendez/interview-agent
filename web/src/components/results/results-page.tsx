@@ -44,6 +44,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { useEvaluationWait } from "@/hooks/use-evaluation-wait"
+import { interviewErrorMessage, quotaBlock, useMe } from "@/hooks/use-me"
 import { useRepeatInterview } from "@/hooks/use-repeat-interview"
 import { ApiError, SENIORITY_LABELS, durationLabel } from "@/lib/api"
 import type { Interview } from "@/lib/api"
@@ -69,6 +70,9 @@ export function ResultsPage({
   endedAt: number | null
 }) {
   const repeat = useRepeatInterview(interview.id)
+  const me = useMe()
+  // An exhausted guest cannot repeat: the reason shows instead of a 429.
+  const quotaBlocked = quotaBlock(me.data)
   const [repeatOpen, setRepeatOpen] = React.useState(false)
   const agentName = interview.interviewer?.agent_name || "Interviewer"
   const milestones = interview.milestones
@@ -134,8 +138,11 @@ export function ResultsPage({
             <Button
               variant="outline"
               onClick={() => repeat.mutate(undefined)}
-              disabled={repeat.isPending}
-              title="Plan a fresh interview for the same role and resume"
+              disabled={repeat.isPending || quotaBlocked !== null}
+              title={
+                quotaBlocked ??
+                "Plan a fresh interview for the same role and resume"
+              }
             >
               <RotateCcwIcon />
               {repeat.isPending ? "Planning…" : "Repeat"}
@@ -161,7 +168,7 @@ export function ResultsPage({
               </Tooltip>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem
-                  disabled={repeat.isPending}
+                  disabled={repeat.isPending || quotaBlocked !== null}
                   onClick={() => setRepeatOpen(true)}
                 >
                   <SlidersHorizontalIcon />
@@ -172,11 +179,17 @@ export function ResultsPage({
           </div>
         </header>
 
-        {repeat.isError && (
+        {repeat.isError ? (
           <Alert variant="destructive">
             <AlertCircleIcon />
-            <AlertDescription>{errorMessage(repeat.error)}</AlertDescription>
+            <AlertDescription>
+              {interviewErrorMessage(repeat.error, me.data)}
+            </AlertDescription>
           </Alert>
+        ) : (
+          quotaBlocked && (
+            <p className="text-sm text-muted-foreground">{quotaBlocked}</p>
+          )
         )}
 
         <Tabs defaultValue="overview">

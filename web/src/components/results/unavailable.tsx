@@ -15,19 +15,37 @@ import { EmptyState } from "@/components/ui/empty-state"
 import { LinkButton } from "@/components/ui/link-button"
 import { PageShell } from "@/components/ui/page"
 import { useEvaluationRequest } from "@/hooks/use-evaluation-request"
+import { interviewErrorMessage, quotaBlock, useMe } from "@/hooks/use-me"
 import { useRepeatInterview } from "@/hooks/use-repeat-interview"
-import { ApiError } from "@/lib/api"
-import type { Interview } from "@/lib/api"
+import type { Interview, Me } from "@/lib/api"
 
-function errorMessage(error: unknown): string {
-  if (error instanceof ApiError) return error.message
-  return error instanceof Error ? error.message : "Something went wrong."
+/** Nothing to report, the repeat's error, or why repeating is closed. */
+function RepeatNotice({
+  error,
+  blocked,
+  me,
+}: {
+  error: unknown
+  blocked: string | null
+  me: Me | undefined
+}) {
+  if (error) {
+    return (
+      <Alert variant="destructive" className="max-w-md">
+        <AlertCircleIcon />
+        <AlertDescription>{interviewErrorMessage(error, me)}</AlertDescription>
+      </Alert>
+    )
+  }
+  return blocked && <p className="text-sm text-muted-foreground">{blocked}</p>
 }
 
 /** A row whose planning failed. Nothing about it can run, so the one thing
  *  on offer is a fresh plan off the same resume and offer. */
 export function FailedPanel({ interview }: { interview: Interview }) {
   const repeat = useRepeatInterview(interview.id)
+  const me = useMe()
+  const blocked = quotaBlock(me.data)
   const [changes, setChanges] = React.useState(false)
   // A closing that could not be persisted also lands here; it ran, but its
   // transcript cannot be evaluated.
@@ -59,14 +77,14 @@ export function FailedPanel({ interview }: { interview: Interview }) {
             <Button
               variant="outline"
               onClick={() => setChanges(true)}
-              disabled={repeat.isPending}
+              disabled={repeat.isPending || blocked !== null}
             >
               <SlidersHorizontalIcon />
               Repeat with changes…
             </Button>
             <Button
               onClick={() => repeat.mutate(undefined)}
-              disabled={repeat.isPending}
+              disabled={repeat.isPending || blocked !== null}
             >
               <RotateCcwIcon />
               {repeat.isPending ? "Planning…" : "Repeat this interview"}
@@ -74,12 +92,7 @@ export function FailedPanel({ interview }: { interview: Interview }) {
           </>
         }
       >
-        {repeat.isError && (
-          <Alert variant="destructive" className="max-w-md">
-            <AlertCircleIcon />
-            <AlertDescription>{errorMessage(repeat.error)}</AlertDescription>
-          </Alert>
-        )}
+        <RepeatNotice error={repeat.error} blocked={blocked} me={me.data} />
       </EmptyState>
       <RepeatOptionsDialog
         open={changes}
@@ -99,6 +112,8 @@ export function FailedPanel({ interview }: { interview: Interview }) {
 export function InterruptedPanel({ interview }: { interview: Interview }) {
   const repeat = useRepeatInterview(interview.id)
   const evaluate = useEvaluationRequest(interview.id)
+  const me = useMe()
+  const blocked = quotaBlock(me.data)
   const [changes, setChanges] = React.useState(false)
   const busy = evaluate.isPending || repeat.isPending
 
@@ -117,8 +132,10 @@ export function InterruptedPanel({ interview }: { interview: Interview }) {
             <Button
               variant="outline"
               onClick={() => repeat.mutate(undefined)}
-              disabled={busy}
-              title="Plan a fresh interview for the same role and resume"
+              disabled={busy || blocked !== null}
+              title={
+                blocked ?? "Plan a fresh interview for the same role and resume"
+              }
             >
               <RotateCcwIcon />
               {repeat.isPending ? "Planning…" : "Repeat this interview"}
@@ -130,20 +147,20 @@ export function InterruptedPanel({ interview }: { interview: Interview }) {
           </>
         }
       >
-        {(evaluate.isError || repeat.isError) && (
+        {evaluate.isError ? (
           <Alert variant="destructive" className="max-w-md">
             <AlertCircleIcon />
-            <AlertDescription>
-              {errorMessage(evaluate.isError ? evaluate.error : repeat.error)}
-            </AlertDescription>
+            <AlertDescription>{evaluate.error.message}</AlertDescription>
           </Alert>
+        ) : (
+          <RepeatNotice error={repeat.error} blocked={blocked} me={me.data} />
         )}
       </EmptyState>
       <Button
         variant="ghost"
         size="sm"
         onClick={() => setChanges(true)}
-        disabled={busy}
+        disabled={busy || blocked !== null}
       >
         <SlidersHorizontalIcon />
         Repeat with changes…

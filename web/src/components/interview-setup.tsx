@@ -8,6 +8,7 @@ import {
   ArrowLeftIcon,
   CheckIcon,
   FileTextIcon,
+  TicketIcon,
   UploadIcon,
 } from "lucide-react"
 
@@ -21,8 +22,20 @@ import {
   getSettings,
   voiceLabel,
 } from "@/lib/api"
-import type { InterviewLength, InterviewerInput, Seniority } from "@/lib/api"
+import type {
+  InterviewLength,
+  InterviewerInput,
+  Me,
+  Seniority,
+} from "@/lib/api"
 import { interviewQueryOptions } from "@/lib/queries"
+import {
+  interviewErrorMessage,
+  quotaBlock,
+  quotaNotice,
+  refreshMeAfter,
+  useMe,
+} from "@/hooks/use-me"
 import { useResumePreview } from "@/hooks/use-resume-preview"
 import { log } from "@/lib/log"
 import { cn } from "@/lib/utils"
@@ -333,6 +346,33 @@ function FilledRow({
   )
 }
 
+/** The sample shipped with the app (public/sample-resume.pdf), as a File
+ *  the picker could have produced. */
+async function fetchSampleResume(): Promise<File> {
+  const res = await fetch("/sample-resume.pdf")
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const blob = await res.blob()
+  return new File([blob], "sample-resume.pdf", { type: "application/pdf" })
+}
+
+/** What is left of the user's interviews, under the page header. */
+function QuotaNotice({ me, blocked }: { me: Me; blocked: string | null }) {
+  if (blocked) {
+    return (
+      <Alert variant="warning">
+        <AlertCircleIcon />
+        <AlertDescription>{blocked}</AlertDescription>
+      </Alert>
+    )
+  }
+  return (
+    <p className="flex items-center gap-2 text-sm text-muted-foreground">
+      <TicketIcon aria-hidden className="size-4" />
+      {quotaNotice(me)}
+    </p>
+  )
+}
+
 export function UploadPage() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
@@ -340,6 +380,11 @@ export function UploadPage() {
   const resumePreview = useResumePreview()
   // Kept mounted so "Change" can reopen the picker from the collapsed row.
   const resumeInputRef = React.useRef<HTMLInputElement>(null)
+  const me = useMe()
+  // Out of interviews (or the demo is, this month): the wizard can still be
+  // filled in, but the final submit stays closed and says why.
+  const quotaBlocked = quotaBlock(me.data)
+  const [sampleError, setSampleError] = React.useState<string | null>(null)
 
   const mutation = useMutation({
     mutationFn: (formData: FormData) => createInterview(formData),
@@ -356,6 +401,7 @@ export function UploadPage() {
         interview
       )
       void queryClient.invalidateQueries({ queryKey: ["interviews"] })
+      refreshMeAfter(queryClient)
       navigate({
         to: "/interviews/$interviewId",
         params: { interviewId: interview.id },
@@ -363,6 +409,7 @@ export function UploadPage() {
     },
     onError: (error) => {
       console.error("[app] interview creation failed:", error)
+      refreshMeAfter(queryClient, error)
     },
   })
 
@@ -485,10 +532,13 @@ export function UploadPage() {
   return (
     <PageShell>
       <PageContainer variant="wide" className="flex flex-col gap-8">
-        <PageHeader
-          title="New interview"
-          description="Four short steps, planned from your resume and the job offer."
-        />
+        <div className="flex flex-col gap-4">
+          <PageHeader
+            title="New interview"
+            description="Four short steps, planned from your resume and the job offer."
+          />
+          {me.data && <QuotaNotice me={me.data} blocked={quotaBlocked} />}
+        </div>
         <div className="grid gap-8 @3xl/main:grid-cols-[14rem_minmax(0,1fr)] @3xl/main:gap-12">
           <Stepper
             current={step}
@@ -503,6 +553,7 @@ export function UploadPage() {
                 void goNext()
                 return
               }
+              if (quotaBlocked !== null) return
               form.handleSubmit()
             }}
             className="flex max-w-2xl min-w-0 flex-col gap-8"
@@ -525,6 +576,13 @@ export function UploadPage() {
                           field.state.meta.isTouched &&
                           !field.state.meta.isValid
                         const file = field.state.value
+                        // Picked or the sample, the same way in: text
+                        // extracted from the previous PDF no longer applies.
+                        const pickResume = (next: File | null) => {
+                          resumePreview.reset()
+                          form.setFieldValue("resume_text", "")
+                          field.handleChange(next)
+                        }
                         return (
                           <Field data-invalid={isInvalid}>
                             <FieldLabel htmlFor={field.name}>
@@ -574,15 +632,39 @@ export function UploadPage() {
                               accept="application/pdf,.pdf"
                               disabled={mutation.isPending}
                               onBlur={field.handleBlur}
-                              onChange={(event) => {
-                                resumePreview.reset()
-                                form.setFieldValue("resume_text", "")
-                                field.handleChange(
-                                  event.target.files?.[0] ?? null
-                                )
-                              }}
+                              onChange={(event) =>
+                                pickResume(event.target.files?.[0] ?? null)
+                              }
                               className="sr-only"
                             />
+                            <FieldDescription className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+                              Your resume is processed by OpenAI to plan the
+                              interview.
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="-mr-3"
+                                disabled={
+                                  mutation.isPending || resumePreview.pending
+                                }
+                                onClick={() => {
+                                  setSampleError(null)
+                                  void fetchSampleResume().then(
+                                    pickResume,
+                                    () =>
+                                      setSampleError(
+                                        "The sample resume could not be loaded."
+                                      )
+                                  )
+                                }}
+                              >
+                                Use sample resume
+                              </Button>
+                            </FieldDescription>
+                            {sampleError && (
+                              <FieldError>{sampleError}</FieldError>
+                            )}
                             {isInvalid && (
                               <FieldError errors={field.state.meta.errors} />
                             )}
@@ -1117,7 +1199,7 @@ export function UploadPage() {
                   <Alert variant="destructive">
                     <AlertCircleIcon />
                     <AlertDescription>
-                      {errorMessage(mutation.error)}
+                      {interviewErrorMessage(mutation.error, me.data)}
                     </AlertDescription>
                   </Alert>
                 )}
@@ -1158,7 +1240,8 @@ export function UploadPage() {
                 <Button
                   key="submit"
                   type="button"
-                  disabled={mutation.isPending}
+                  disabled={mutation.isPending || quotaBlocked !== null}
+                  title={quotaBlocked ?? undefined}
                   onClick={() => form.handleSubmit()}
                 >
                   {mutation.isPending ? "Planning…" : "Prepare interview"}

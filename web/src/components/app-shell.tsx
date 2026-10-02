@@ -1,14 +1,27 @@
 import * as React from "react"
-import { Link, useRouterState } from "@tanstack/react-router"
+import { Link, useRouter, useRouterState } from "@tanstack/react-router"
+import { useQueryClient } from "@tanstack/react-query"
 import {
   HistoryIcon,
   HomeIcon,
+  LogInIcon,
+  LogOutIcon,
   MenuIcon,
   PlusIcon,
   SettingsIcon,
 } from "lucide-react"
 
 import { BrandLink } from "@/components/brand"
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
+import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { IconButton, IconLink } from "@/components/ui/icon-button"
 import { LinkButton } from "@/components/ui/link-button"
 import {
@@ -17,6 +30,8 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
+import { authEnabled, safeRedirectPath, signOut, useAuth } from "@/lib/auth"
+import type { AuthUser } from "@/lib/auth"
 import { cn } from "@/lib/utils"
 
 // ---- Immersive mode ---------------------------------------------------------
@@ -201,7 +216,103 @@ function NavDrawer({
   )
 }
 
-/** Identity on the left; the create action and settings on the right. */
+// ---- Account ------------------------------------------------------------------
+
+function useMounted() {
+  const [mounted, setMounted] = React.useState(false)
+  React.useEffect(() => setMounted(true), [])
+  return mounted
+}
+
+function initials(user: AuthUser): string {
+  const source = user.name ?? user.email ?? ""
+  const words = source.split(/[\s@._-]+/).filter(Boolean)
+  return (
+    words
+      .slice(0, 2)
+      .map((word) => word[0].toUpperCase())
+      .join("") || "?"
+  )
+}
+
+/** Sign in, or the signed-in account with its sign-out. Nothing in local
+ *  mode, and nothing until mounted: the prerendered shell has no session. */
+function AccountControls() {
+  const mounted = useMounted()
+  const { user, isPending } = useAuth()
+  const href = useRouterState({ select: (s) => s.location.href })
+  const router = useRouter()
+  const queryClient = useQueryClient()
+
+  if (!authEnabled || !mounted || isPending) return null
+
+  if (!user) {
+    return (
+      <LinkButton
+        to="/auth/$pathname"
+        params={{ pathname: "sign-in" }}
+        search={{ redirectTo: safeRedirectPath(href) }}
+        variant="outline"
+      >
+        <LogInIcon />
+        Sign in
+      </LinkButton>
+    )
+  }
+
+  const leave = async () => {
+    // Off the private pages first, while the session still holds. From
+    // signOut() on the app reports signed out — before Better Auth's own
+    // session catches up — so the home page asks the API nothing; then
+    // drop everything cached for this account.
+    await router.navigate({ to: "/" })
+    await signOut(user.id)
+    queryClient.clear()
+  }
+
+  const label = user.name ?? user.email ?? "Your account"
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button variant="quiet" size="icon" aria-label={`Account: ${label}`}>
+            <Avatar>
+              {user.image && (
+                <AvatarImage
+                  src={user.image}
+                  alt=""
+                  referrerPolicy="no-referrer"
+                />
+              )}
+              <AvatarFallback>{initials(user)}</AvatarFallback>
+            </Avatar>
+          </Button>
+        }
+      />
+      <DropdownMenuContent align="end" className="max-w-72">
+        <DropdownMenuGroup>
+          <DropdownMenuLabel className="flex flex-col">
+            {user.name && (
+              <span className="truncate font-medium">{user.name}</span>
+            )}
+            {user.email && (
+              <span className="truncate text-xs text-muted-foreground">
+                {user.email}
+              </span>
+            )}
+          </DropdownMenuLabel>
+        </DropdownMenuGroup>
+        <DropdownMenuItem onClick={() => void leave()}>
+          <LogOutIcon />
+          Sign out
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+/** Identity on the left; the create action, settings and the account on
+ *  the right. */
 function TopBar({ onMenu }: { onMenu: () => void }) {
   return (
     <header className="flex h-16 shrink-0 items-center gap-2 px-2 md:px-4">
@@ -234,6 +345,7 @@ function TopBar({ onMenu }: { onMenu: () => void }) {
         <IconLink label="Settings" to="/settings">
           <SettingsIcon />
         </IconLink>
+        <AccountControls />
       </div>
     </header>
   )

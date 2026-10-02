@@ -32,8 +32,10 @@ import {
 import { Skeleton } from "@/components/ui/skeleton"
 import { Textarea } from "@/components/ui/textarea"
 import { pageHead } from "@/lib/head"
+import { requireSession } from "@/lib/route-guards"
 
 export const Route = createFileRoute("/settings")({
+  beforeLoad: ({ location }) => requireSession(location),
   head: () => pageHead("Settings"),
   component: SettingsPage,
 })

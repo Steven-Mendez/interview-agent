@@ -31,6 +31,18 @@ vi.mock("@/lib/api", async (original) => ({
   getInterview: vi.fn(),
   getEvaluationHistory: vi.fn(),
   getSealHistory: vi.fn(),
+  getMe: vi.fn(() =>
+    Promise.resolve({
+      id: "user",
+      email: null,
+      name: null,
+      is_admin: false,
+      interviews_used: 1,
+      interview_limit: 3,
+      interviews_remaining: 2,
+      demo_capacity_available: true,
+    })
+  ),
 }))
 afterEach(() => {
   cleanup()

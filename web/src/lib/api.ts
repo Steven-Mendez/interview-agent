@@ -1,9 +1,13 @@
 // Typed fetch wrappers for the backend contract (see
 // interview_agent/server/routes.py). Every endpoint lives under the `/api`
 // prefix — the dev proxy (vite.config.ts) and the prod SPA fallback both
-// key off that single prefix.
+// key off that single prefix. A build for an API on another origin names it
+// in VITE_API_BASE_URL (ending in that same `/api`).
 
-const API_BASE = "/api"
+import { authEnabled, getAccessToken } from "@/lib/auth"
+
+const API_BASE =
+  import.meta.env.VITE_API_BASE_URL?.replace(/\/+$/, "") || "/api"
 
 // ---- Shapes -----------------------------------------------------------------
 
@@ -334,9 +338,33 @@ async function toApiError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, detail, retryAfter)
 }
 
+/** What a 401 on a signed-in request does — the router sends the user to
+ *  sign in. Until one is registered, nothing: the error still throws. */
+let unauthorizedHandler: () => void = () => {}
+
+export function setUnauthorizedHandler(handler: () => void): void {
+  unauthorizedHandler = handler
+}
+
+/** The only fetch. Adds the user's JWT unless the caller brought its own
+ *  credential (the closing routes carry the LiveKit participant token). */
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, init)
-  if (!res.ok) throw await toApiError(res)
+  const headers = new Headers(init?.headers)
+  const ownCredential = headers.has("Authorization")
+  if (!ownCredential) {
+    const token = await getAccessToken()
+    if (token) headers.set("Authorization", `Bearer ${token}`)
+  }
+  const res = await fetch(`${API_BASE}${path}`, { ...init, headers })
+  if (!res.ok) {
+    // Our session was refused (expired, revoked, never there): sign in
+    // again. A refused participant token is the room's business, not the
+    // account's.
+    if (res.status === 401 && authEnabled && !ownCredential) {
+      unauthorizedHandler()
+    }
+    throw await toApiError(res)
+  }
   return (await res.json()) as T
 }
 
@@ -406,6 +434,77 @@ export function getClosingState(
     headers: { Authorization: `Bearer ${participantToken}` },
     signal,
   })
+}
+
+// ---- Account --------------------------------------------------------------------
+
+/** GET /me: who is signed in and what is left of their interviews. Admins
+ *  have no limit (null) and the monthly demo capacity never holds them back. */
+export interface Me {
+  id: string
+  email: string | null
+  name: string | null
+  is_admin: boolean
+  interviews_used: number
+  interview_limit: number | null
+  interviews_remaining: number | null
+  demo_capacity_available: boolean
+}
+
+export function getMe(): Promise<Me> {
+  return request<Me>("/me")
+}
+
+/** The two 429 details of POST /interviews and POST .../repeat. */
+export const LIFETIME_LIMIT_REACHED = "lifetime_interview_limit_reached"
+export const MONTHLY_CAPACITY_REACHED = "monthly_demo_capacity_reached"
+
+const DEFAULT_INTERVIEW_LIMIT = 3
+
+// The capacity resets at 00:00 UTC on the 1st: that is the day to name.
+const retryDateFormat = new Intl.DateTimeFormat("en", {
+  month: "long",
+  day: "numeric",
+  timeZone: "UTC",
+})
+
+export function lifetimeLimitMessage(limit?: number | null): string {
+  return `You've used your ${limit ?? DEFAULT_INTERVIEW_LIMIT} free interviews.`
+}
+
+const HALF_DAY_MS = 12 * 60 * 60 * 1000
+
+/** `retryAfter`: seconds until the capacity resets (the 429's Retry-After);
+ *  without it, the 1st of next month (UTC), when the server resets it.
+ *
+ * Retry-After counts to exactly 00:00 on the 1st by the database's clock,
+ * so added to this one it can land a few seconds either side of midnight:
+ * the reset is the next 1st after half a day before that instant. */
+export function monthlyCapacityMessage(retryAfter?: number | null): string {
+  const now = Date.now()
+  const around =
+    retryAfter === null || retryAfter === undefined
+      ? new Date(now)
+      : new Date(now + retryAfter * 1000 - HALF_DAY_MS)
+  const reset = new Date(
+    Date.UTC(around.getUTCFullYear(), around.getUTCMonth() + 1, 1)
+  )
+  return `The demo has reached its interview limit for this month. Try again on ${retryDateFormat.format(reset)}.`
+}
+
+/** A quota refusal in words, or null for any other error. */
+export function quotaErrorMessage(
+  error: unknown,
+  limit?: number | null
+): string | null {
+  if (!(error instanceof ApiError) || error.status !== 429) return null
+  if (error.message === LIFETIME_LIMIT_REACHED) {
+    return lifetimeLimitMessage(limit)
+  }
+  if (error.message === MONTHLY_CAPACITY_REACHED) {
+    return monthlyCapacityMessage(error.retryAfter)
+  }
+  return null
 }
 
 // ---- Settings -----------------------------------------------------------------

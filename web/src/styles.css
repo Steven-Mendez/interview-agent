@@ -1,4 +1,11 @@
+/* Neon Auth's stylesheet puts its own reset (borders, outlines, body text)
+   in a `neon-auth` layer, which would otherwise rank above the utilities —
+   every `border-*` and focus ring would lose to it. Below `base`, the app's
+   reset and every utility win. */
+@layer properties, theme, neon-auth, base, components, utilities;
+
 @import "tailwindcss";
+@import "@neondatabase/auth-ui/tailwind";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/google-sans-flex/wght.css";
@@ -257,6 +264,12 @@
 
 .dark {
   color-scheme: dark;
+}
+
+/* NeonAuthUIProvider mounts a second, unstyled toaster: every toast would
+   show twice. The app's own (components/ui/sonner) is the one that stays. */
+[data-sonner-toaster]:not(.toaster) {
+  display: none;
 }
 
 @layer base {

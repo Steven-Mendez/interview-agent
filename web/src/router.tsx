@@ -3,6 +3,8 @@ import { createRouter as createTanStackRouter } from "@tanstack/react-router"
 import { setupRouterSsrQueryIntegration } from "@tanstack/react-router-ssr-query"
 
 import { RouteError, RoutePending } from "@/components/route-states"
+import { setUnauthorizedHandler } from "@/lib/api"
+import { safeRedirectPath } from "@/lib/auth"
 import { captureRouteError, initErrorReporting } from "@/lib/error-reporting"
 import { routeTree } from "./routeTree.gen"
 
@@ -27,6 +29,18 @@ export function getRouter() {
   // `context.queryClient.ensureQueryData`) and wraps the app in
   // `QueryClientProvider` — the documented TanStack Start + Query convention.
   setupRouterSsrQueryIntegration({ router, queryClient })
+
+  // The API refused the session (expired, revoked): sign in again, then
+  // come back to the page that asked.
+  setUnauthorizedHandler(() => {
+    const { pathname, href } = router.state.location
+    if (pathname.startsWith("/auth/")) return
+    void router.navigate({
+      to: "/auth/$pathname",
+      params: { pathname: "sign-in" },
+      search: { redirectTo: safeRedirectPath(href) },
+    })
+  })
 
   return router
 }

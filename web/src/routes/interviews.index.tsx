@@ -57,7 +57,14 @@ import {
   interviewQueryOptions,
   interviewsQueryOptions,
 } from "@/lib/queries"
+import {
+  interviewErrorMessage,
+  quotaBlock,
+  refreshMeAfter,
+  useMe,
+} from "@/hooks/use-me"
 import { log } from "@/lib/log"
+import { requireSession } from "@/lib/route-guards"
 import { cn } from "@/lib/utils"
 import { pageHead } from "@/lib/head"
 
@@ -83,6 +90,7 @@ interface HistorySearch {
 }
 
 export const Route = createFileRoute("/interviews/")({
+  beforeLoad: ({ location }) => requireSession(location),
   head: () => pageHead("History"),
   validateSearch: (search: Record<string, unknown>): HistorySearch => {
     const offset = Number(search.offset)
@@ -112,6 +120,9 @@ function HistoryPage() {
   const { offset = 0, status } = Route.useSearch()
   const navigate = useNavigate({ from: Route.fullPath })
   const queryClient = useQueryClient()
+  const me = useMe()
+  // An exhausted guest cannot repeat: every row's action closes, with why.
+  const quotaBlocked = quotaBlock(me.data)
 
   const query = useQuery({
     ...interviewsQueryOptions({ offset, status }),
@@ -135,6 +146,7 @@ function HistoryPage() {
         interview
       )
       void queryClient.invalidateQueries({ queryKey: ["interviews"] })
+      refreshMeAfter(queryClient)
       void navigate({
         to: "/interviews/$interviewId",
         params: { interviewId: interview.id },
@@ -142,6 +154,7 @@ function HistoryPage() {
     },
     onError: (error) => {
       console.error("[app] repeat failed:", error)
+      refreshMeAfter(queryClient, error)
     },
   })
 
@@ -175,7 +188,8 @@ function HistoryPage() {
     item,
     onRepeat: () => repeat.mutate(item.id),
     repeating: repeat.isPending && repeat.variables === item.id,
-    disabled: repeat.isPending,
+    disabled: repeat.isPending || quotaBlocked !== null,
+    blockedReason: quotaBlocked,
   })
 
   return (
@@ -237,11 +251,17 @@ function HistoryPage() {
           )}
         </div>
 
-        {repeat.isError && (
+        {repeat.isError ? (
           <Alert variant="destructive">
             <AlertCircleIcon />
-            <AlertDescription>{errorMessage(repeat.error)}</AlertDescription>
+            <AlertDescription>
+              {interviewErrorMessage(repeat.error, me.data)}
+            </AlertDescription>
           </Alert>
+        ) : (
+          quotaBlocked && (
+            <p className="text-sm text-muted-foreground">{quotaBlocked}</p>
+          )
         )}
         {query.isError && (
           <Alert variant="destructive">
@@ -364,6 +384,8 @@ interface RowProps {
   onRepeat: () => void
   repeating: boolean
   disabled: boolean
+  /** Why repeating is closed (the quota), shown as the button's label. */
+  blockedReason: string | null
 }
 
 function TitleCell({ item }: { item: InterviewSummary }) {
@@ -400,13 +422,15 @@ function RepeatButton({
   onRepeat,
   repeating,
   disabled,
+  blockedReason,
 }: Omit<RowProps, "item">) {
   return (
     <IconButton
       label={
         repeating
           ? "Planning…"
-          : "Repeat — plan a fresh interview for the same role and resume"
+          : (blockedReason ??
+            "Repeat — plan a fresh interview for the same role and resume")
       }
       size="icon-sm"
       onClick={onRepeat}

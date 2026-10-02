@@ -9,8 +9,9 @@ plays a fixed answer, synthesized with the production TTS, once the first
 question is delivered.
 Requires --live; uses a fresh migrated interview_benchmark_*_test database and
 its own worker name, so the primary database and worker are never touched.
-Neither LangSmith traces nor OTLP metrics are exported, so synthetic interviews
-never reach the shared observability backends.
+OTLP metrics are never exported. LangSmith traces are exported only with
+--langsmith-project, to that separate project, so synthetic interviews never
+reach the shared observability backends.
 """
 
 from __future__ import annotations
@@ -358,6 +359,7 @@ async def journey(args):
         "physical_audio_verified": False,
         "primary_app_started": False,
         "provider_cost_usd": None,
+        "langsmith_project": args.langsmith_project,
         "events": [],
     }
 
@@ -376,8 +378,9 @@ async def journey(args):
     env = os.environ | {
         "DATABASE_URL": database,
         "LIVEKIT_AGENT_NAME": f"product-probe-{tag}",
-        "LANGSMITH_API_KEY": "",
-        "LANGSMITH_TRACING": "false",
+        "LANGSMITH_API_KEY": base.langsmith_api_key if args.langsmith_project else "",
+        "LANGSMITH_PROJECT": args.langsmith_project or base.langsmith_project,
+        "LANGSMITH_TRACING": "true" if args.langsmith_project else "false",
         "OTEL_EXPORTER_OTLP_ENDPOINT": "",
         "OTEL_EXPORTER_OTLP_HEADERS": "",
         "APP_BASE_URL": f"http://127.0.0.1:{API_PORT}",
@@ -495,7 +498,7 @@ async def journey(args):
                     await cdp.send("Runtime.enable")
                     await cdp.send("Page.addScriptToEvaluateOnNewDocument", source=PAGE_SCRIPT)
                     report["user_agent"] = (await cdp.send("Browser.getVersion")).get("product")
-                    await cdp.send("Page.navigate", url=f"http://127.0.0.1:{API_PORT}/")
+                    await cdp.send("Page.navigate", url=f"http://127.0.0.1:{API_PORT}/new")
 
                     async def has(selector):
                         return await cdp.js(f"!!document.querySelector({json.dumps(selector)})")
@@ -520,11 +523,11 @@ async def journey(args):
                     assert await cdp.js("__h.set('#followup_limit', '0')")
                     assert await cdp.js("__h.click('Continue')")
                     await until(
-                        lambda: cdp.js("__h.text().includes('Start interview')"),
+                        lambda: cdp.js("__h.text().includes('Prepare interview')"),
                         15,
                         what="interviewer step",
                     )
-                    assert await cdp.js("__h.click('Start interview')")
+                    assert await cdp.js("__h.click('Prepare interview')")
                     event("plan_requested")
 
                     async def interview_url():
@@ -543,7 +546,7 @@ async def journey(args):
                         followup_limit=planned["followup_limit"],
                     )
                     await until(
-                        lambda: cdp.js("__h.text().includes('Interview limits')"),
+                        lambda: cdp.js("__h.text().includes('Start interview')"),
                         30,
                         what="pre-join panel",
                     )
@@ -652,7 +655,12 @@ def main():
     parser.add_argument("--language", choices=("en", "es"), default="en")
     parser.add_argument("--questions", type=int, choices=(1, 2, 3), default=1)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--langsmith-project", help="trace to this LangSmith project (never the main one)"
+    )
     args = parser.parse_args()
+    if args.langsmith_project and args.langsmith_project == Settings().langsmith_project:
+        parser.error("--langsmith-project must not be the main LangSmith project")
     if not args.live:
         print(json.dumps({"mode": "dry_run", "provider_calls": False}))
         return

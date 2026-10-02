@@ -137,6 +137,13 @@ def recorded_metrics():
 
 
 @pytest.fixture(autouse=True)
+def metric_snapshots_stay_private(monkeypatch):
+    """Gauge values a test publishes (the API lifespan's account metrics
+    included) are gone for the next one."""
+    monkeypatch.setattr(otel_metrics, "_snapshots", {})
+
+
+@pytest.fixture(autouse=True)
 def tracing_stays_off():
     """No test leaves LangSmith tracing (or a client) behind for the next one."""
     yield

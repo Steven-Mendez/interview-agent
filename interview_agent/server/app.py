@@ -23,6 +23,11 @@ from interview_agent.interview.db import create_engine_and_sessionmaker
 from interview_agent.logging_config import setup_file_logging
 from interview_agent.runtime import process_manifest, record_manifest, validate_database_revision
 from interview_agent.server import auth_routes
+from interview_agent.server.account_metrics import (
+    account_metrics_loop,
+    account_snapshot,
+    publish_account_metrics,
+)
 from interview_agent.server.auth import warn_local_mode
 from interview_agent.server.evaluations import EvaluationRunner
 from interview_agent.server.reconciliation import LifecycleSweeper
@@ -97,7 +102,16 @@ async def lifespan(app: FastAPI):
 
     app.state.sessionmaker = sessionmaker
     app.state.runtime_manifest = await process_manifest(
-        settings, "api", functions=(lifespan.__wrapped__, _purge_loop, purge_expired)
+        settings,
+        "api",
+        functions=(
+            lifespan.__wrapped__,
+            _purge_loop,
+            purge_expired,
+            account_metrics_loop,
+            publish_account_metrics,
+            account_snapshot,
+        ),
     )
     app.state.runtime_manifest["database_revision"] = database_revision
     await record_manifest(sessionmaker, app.state.runtime_manifest)
@@ -106,6 +120,8 @@ async def lifespan(app: FastAPI):
     app.state.evaluations = EvaluationRunner(sessionmaker)
 
     purge_task = asyncio.create_task(_purge_loop(sessionmaker))
+    # User and quota counts for Grafana, recounted every minute.
+    account_metrics_task = asyncio.create_task(account_metrics_loop(sessionmaker, settings))
     sweep_task = asyncio.create_task(
         LifecycleSweeper(sessionmaker, settings, app.state.evaluations).run()
     )
@@ -118,6 +134,9 @@ async def lifespan(app: FastAPI):
         sweep_task.cancel()
         with suppress(asyncio.CancelledError):
             await sweep_task
+        account_metrics_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await account_metrics_task
         if purge_task is not None:
             purge_task.cancel()
             with suppress(asyncio.CancelledError):

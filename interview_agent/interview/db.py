@@ -29,6 +29,7 @@ from sqlalchemy import (
     delete,
     exists,
     func,
+    literal_column,
     select,
     text,
     update,
@@ -604,6 +605,24 @@ class GuestInterviewMonth(Base):
     interviews_started: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
+class UserProfile(Base):
+    """Who a user is, as their last sign-in said, and when they were last
+    seen. Outlives their interviews: the retention purge never touches it."""
+
+    __tablename__ = "user_profiles"
+    __table_args__ = (
+        CheckConstraint("auth_provider IN ('neon', 'local')", name="user_profile_provider"),
+        Index("user_profiles_last_seen_idx", "last_seen_at"),
+    )
+
+    owner_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    auth_provider: Mapped[str] = mapped_column(Text)
+    email: Mapped[str | None] = mapped_column(Text)
+    name: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+    last_seen_at: Mapped[datetime | None] = mapped_column()
+
+
 # --- Engine / session helpers -------------------------------------------------
 
 
@@ -1054,15 +1073,20 @@ async def interview_quota_status(
     used = await session.scalar(
         select(UserInterviewQuota.interviews_used).where(UserInterviewQuota.owner_id == owner_id)
     )
+    return QuotaStatus(
+        interviews_used=int(used or 0),
+        monthly_capacity_available=await guest_interviews_this_month(session) < monthly_limit,
+    )
+
+
+async def guest_interviews_this_month(session: AsyncSession) -> int:
+    """Interviews non-admin users started this calendar month (UTC)."""
     started = await session.scalar(
         select(GuestInterviewMonth.interviews_started).where(
             GuestInterviewMonth.month == _current_month()
         )
     )
-    return QuotaStatus(
-        interviews_used=int(used or 0),
-        monthly_capacity_available=int(started or 0) < monthly_limit,
-    )
+    return int(started or 0)
 
 
 async def seconds_until_next_month(session: AsyncSession) -> int:
@@ -1074,6 +1098,90 @@ async def seconds_until_next_month(session: AsyncSession) -> int:
         )
     )
     return max(1, math.ceil(seconds))
+
+
+# A profile is written at most this often while nothing in it changes: GET /me
+# runs on every page, and a write per page would be one per click.
+PROFILE_SEEN_INTERVAL = timedelta(minutes=5)
+
+
+async def touch_user_profile(
+    session: AsyncSession,
+    owner_id: str,
+    *,
+    auth_provider: str,
+    email: str | None,
+    name: str | None,
+) -> tuple[UserProfile, bool]:
+    """Record that the user was seen, with what their sign-in says about
+    them, and return their profile and whether it is new.
+
+    One conditional upsert: an existing row is rewritten only when its email
+    or name changed or it was last seen PROFILE_SEEN_INTERVAL ago or more; no
+    returned row means nothing was written. xmax is 0 only on a row this
+    statement inserted, so concurrent first visits count one new user."""
+    insert = pg_insert(UserProfile).values(
+        owner_id=owner_id,
+        auth_provider=auth_provider,
+        email=email,
+        name=name,
+        last_seen_at=func.now(),
+    )
+    inserted = await session.scalar(
+        insert.on_conflict_do_update(
+            index_elements=["owner_id"],
+            set_={
+                "email": insert.excluded.email,
+                "name": insert.excluded.name,
+                "last_seen_at": func.now(),
+            },
+            where=(
+                UserProfile.last_seen_at.is_(None)
+                | (UserProfile.last_seen_at < func.now() - PROFILE_SEEN_INTERVAL)
+                | UserProfile.email.is_distinct_from(insert.excluded.email)
+                | UserProfile.name.is_distinct_from(insert.excluded.name)
+            ),
+        ).returning(literal_column("xmax = 0").label("inserted"))
+    )
+    await session.commit()
+    profile = await session.get(UserProfile, owner_id, populate_existing=True)
+    return profile, bool(inserted)
+
+
+@dataclass(frozen=True)
+class UserSummary:
+    profile: UserProfile
+    interviews_used: int
+    interviews_stored: int
+    last_interview_at: datetime | None
+
+
+async def list_user_profiles(
+    session: AsyncSession, *, limit: int, offset: int
+) -> tuple[list[UserSummary], int]:
+    """One page of users, most recently seen first (never seen last), with
+    their quota and the interviews of theirs still stored, plus the total.
+
+    One query for the page: the quota is a join, and the interview count and
+    latest date are correlated subqueries on (owner_id, created_at)."""
+    owned = Conversation.owner_id == UserProfile.owner_id
+    total = await session.scalar(select(func.count()).select_from(UserProfile))
+    rows = await session.execute(
+        select(
+            UserProfile,
+            func.coalesce(UserInterviewQuota.interviews_used, 0),
+            select(func.count()).select_from(Conversation).where(owned).scalar_subquery(),
+            select(func.max(Conversation.created_at)).where(owned).scalar_subquery(),
+        )
+        .outerjoin(UserInterviewQuota, UserInterviewQuota.owner_id == UserProfile.owner_id)
+        .order_by(UserProfile.last_seen_at.desc().nulls_last(), UserProfile.owner_id)
+        .limit(limit)
+        .offset(offset)
+    )
+    return [
+        UserSummary(profile, int(used), int(stored), last_interview_at)
+        for profile, used, stored, last_interview_at in rows
+    ], int(total or 0)
 
 
 async def delete_conversations_older_than(session: AsyncSession, days: int) -> list[uuid.UUID]:

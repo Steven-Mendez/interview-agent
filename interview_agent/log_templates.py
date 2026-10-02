@@ -39,6 +39,7 @@ SAFE_LOG_TEMPLATES = frozenset(
         "Worker engine disposal did not complete",
         "Worker shutdown exceeded its total cleanup budget",
         "Worker shutdown failed",
+        "account metrics failed; retrying next cycle",
         "auto-evaluation triggered: HTTP %s",
         "capacity reached: %s active interviews, rejecting %s",
         "closing an orphaned interview for evaluation",

@@ -266,12 +266,13 @@ async def test_a_failed_refresh_for_an_unknown_key_is_503(neon_auth, client, mon
 
 
 @pytest.mark.parametrize(
-    "claims",
-    [{"iat": int(time.time()) + 20}, {"exp": int(time.time()) - 20}],
-    ids=["issued-ahead", "just-expired"],
+    ("claim", "offset"), [("iat", 20), ("exp", -20)], ids=["issued-ahead", "just-expired"]
 )
-async def test_clock_skew_within_the_leeway_is_accepted(neon_auth, client, claims):
-    assert (await client.get("/whoami", headers=bearer(token(**claims)))).status_code == 200
+async def test_clock_skew_within_the_leeway_is_accepted(neon_auth, client, claim, offset):
+    # The time is taken when the test runs, not at collection: a slow
+    # suite would otherwise push "just expired" past the leeway.
+    skewed = token(**{claim: int(time.time()) + offset})
+    assert (await client.get("/whoami", headers=bearer(skewed))).status_code == 200
 
 
 async def test_clock_skew_beyond_the_leeway_is_401(neon_auth, client):
@@ -562,6 +563,51 @@ async def test_the_auth_config_names_the_mode(client, monkeypatch, mode, account
     response = await client.get("/api/auth/config")
     assert response.status_code == 200
     assert response.json() == {"mode": expected}
+
+
+def counted(points) -> dict[tuple, int]:
+    """Samples per attribute set, the attributes as sorted (key, value) pairs."""
+    return {tuple(sorted(dict(point.attributes).items())): point.count for point in points}
+
+
+async def test_dev_sign_ins_and_rejections_are_counted_without_who(
+    local_accounts, client, recorded_metrics
+):
+    issued = (await sign_in(client, "admin", ADMIN_PASSWORD)).json()["token"]
+    for password in ("wrong-password", ""):
+        assert (await sign_in(client, "guest", password)).status_code == 401
+    assert counted(recorded_metrics("interview_agent.auth.sign_in")) == {
+        (("result", "ok"),): 1,
+        (("result", "failed"),): 2,
+    }
+    # A signed-in request is no rejection; a missing or bad token is one.
+    assert (await client.get("/whoami", headers=bearer(issued))).status_code == 200
+    assert (await client.get("/whoami")).status_code == 401
+    for value in (issued + "x", local_token(sub="local:nobody")):
+        assert (await client.get("/whoami", headers=bearer(value))).status_code == 401
+    assert counted(recorded_metrics("interview_agent.auth.rejected")) == {
+        (("reason", "missing_token"),): 1,
+        (("reason", "invalid_token"),): 2,
+    }
+
+
+async def test_neon_rejections_are_counted_by_reason(
+    neon_auth, client, monkeypatch, recorded_metrics
+):
+    unreachable_jwks(monkeypatch)
+    assert (await client.get("/whoami", headers=bearer(token()))).status_code == 503
+    assert (await client.get("/whoami", headers={"Authorization": "Bearer "})).status_code == 401
+    # Refused from its header alone, before any key is needed.
+    foreign = jwt.encode({"sub": "user-synthetic"}, "a-shared-secret-of-thirty-two-bytes!")
+    assert (await client.get("/whoami", headers=bearer(foreign))).status_code == 401
+    assert counted(recorded_metrics("interview_agent.auth.rejected")) == {
+        (("reason", "keys_unavailable"),): 1,
+        (("reason", "missing_token"),): 1,
+        (("reason", "invalid_token"),): 1,
+    }
+    # The internal token is not a user's: its refusals are not counted here.
+    assert (await client.post("/internal")).status_code == 401
+    assert sum(point.count for point in recorded_metrics("interview_agent.auth.rejected")) == 3
 
 
 async def test_the_token_lapses_after_its_expiry(local_accounts, client):

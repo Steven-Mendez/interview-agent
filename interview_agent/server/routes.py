@@ -10,6 +10,9 @@ Past interviews are browsable through GET /interviews (paginated history) and
 GET /interviews/{id}/transcript, and re-runnable through
 POST /interviews/{id}/repeat.
 
+GET /me records who signed in (the user's profile); admins list everyone
+through GET /admin/users.
+
 Every interview belongs to the user who created it (server.auth): anyone
 else, admins included, gets a 404. The closing routes are the exception: the
 browser authenticates them with its LiveKit participant token, after the
@@ -55,9 +58,11 @@ from interview_agent.observability import (
 from interview_agent.playback import PlaybackAck, acknowledge_playback, closing_state
 from interview_agent.prompts import DEFAULT_SENIORITY, fit_length, followup_budget, length_for
 from interview_agent.server import evaluations
+from interview_agent.server.account_metrics import publish_account_metrics
 from interview_agent.server.auth import (
     CurrentUser,
     User,
+    auth_provider,
     current_user,
     internal_caller,
     internal_caller_or_user,
@@ -1018,6 +1023,7 @@ async def _reserve_interview(session: AsyncSession, user: User) -> None:
     The reservation ends the session's transaction (commit or rollback), so
     nothing loaded before it may be read after it."""
     if is_admin(user):
+        otel_metrics.record("accounts", "interview_reserved", 1, {"role": "admin"})
         return
     outcome = await db.reserve_interview_slot(
         session,
@@ -1026,8 +1032,10 @@ async def _reserve_interview(session: AsyncSession, user: User) -> None:
         monthly_limit=settings.guest_interviews_per_month,
     )
     if outcome == "ok":
+        otel_metrics.record("accounts", "interview_reserved", 1, {"role": "guest"})
         return
     logger.info("interview quota reached", extra={"limit": outcome})
+    otel_metrics.record("accounts", "quota_rejected", 1, {"limit": outcome})
     if outcome == "lifetime":
         # Permanent: no retry time to offer.
         raise HTTPException(status_code=429, detail="lifetime_interview_limit_reached")
@@ -1038,26 +1046,74 @@ async def _reserve_interview(session: AsyncSession, user: User) -> None:
     )
 
 
+def _isoformat(moment: datetime | None) -> str | None:
+    return moment.isoformat() if moment is not None else None
+
+
 @router.get("/me")
 async def get_me(request: Request, user: CurrentUser):
     """The signed-in user and what is left of their interviews. Admins have no
-    limit (null) and are never held back by the monthly capacity."""
+    limit (null) and are never held back by the monthly capacity.
+
+    The one place profiles are written: the web asks on every page, so this
+    is when a user is seen (at most one write every few minutes)."""
     admin = is_admin(user)
+    provider = auth_provider(user)
     async with _sessionmaker(request)() as session:
+        profile, new = await db.touch_user_profile(
+            session, user.id, auth_provider=provider, email=user.email, name=user.name
+        )
         quota = await db.interview_quota_status(
             session, user.id, monthly_limit=settings.guest_interviews_per_month
         )
+    if new:
+        otel_metrics.record("accounts", "new_user", 1, {"auth_provider": provider})
     limit = None if admin else settings.lifetime_interviews_per_user
     return {
         "id": user.id,
         "email": user.email,
         "name": user.name,
         "is_admin": admin,
+        "auth_provider": profile.auth_provider,
+        "created_at": profile.created_at.isoformat(),
+        "last_seen_at": _isoformat(profile.last_seen_at),
         "interviews_used": quota.interviews_used,
         "interview_limit": limit,
         "interviews_remaining": None if limit is None else max(0, limit - quota.interviews_used),
         "demo_capacity_available": admin or quota.monthly_capacity_available,
     }
+
+
+@router.get("/admin/users", dependencies=[Depends(require_admin)])
+async def list_users(
+    request: Request,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """Everyone who signed in, most recently seen first: their profile, their
+    quota, and how many of their interviews the retention purge left."""
+    async with _sessionmaker(request)() as session:
+        users, total = await db.list_user_profiles(session, limit=limit, offset=offset)
+    items = []
+    for summary in users:
+        profile = summary.profile
+        admin = profile.owner_id in settings.admin_user_ids
+        items.append(
+            {
+                "id": profile.owner_id,
+                "name": profile.name,
+                "email": profile.email,
+                "auth_provider": profile.auth_provider,
+                "is_admin": admin,
+                "created_at": profile.created_at.isoformat(),
+                "last_seen_at": _isoformat(profile.last_seen_at),
+                "interviews_used": summary.interviews_used,
+                "interview_limit": None if admin else settings.lifetime_interviews_per_user,
+                "interviews_stored": summary.interviews_stored,
+                "last_interview_at": _isoformat(summary.last_interview_at),
+            }
+        )
+    return {"total": total, "items": items}
 
 
 @router.post("/internal/maintenance", dependencies=[Depends(internal_caller)])
@@ -1069,6 +1125,8 @@ async def run_maintenance(request: Request):
     reconciled, failures = await LifecycleSweeper(
         sessionmaker, settings, request.app.state.evaluations
     ).once()
+    # Fresh counts for Grafana before an idle API scales back to zero.
+    await publish_account_metrics(sessionmaker, settings)
     return {"deleted_interviews": deleted, "reconciled": reconciled, "failures": failures}
 
 

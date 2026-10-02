@@ -2463,11 +2463,15 @@ async def test_admins_are_unlimited(client_and_sessionmaker, monkeypatch):
     monkeypatch.setattr(settings, "guest_interviews_per_month", 0)
     for _ in range(settings.lifetime_interviews_per_user + 2):
         assert (await client.post("/api/interviews", **_upload())).status_code == 200
-    assert await _me(client) == {
+    me = await _me(client)
+    # First seen now: the profile was created by this very request.
+    assert me.pop("created_at") == me.pop("last_seen_at")
+    assert me == {
         "id": "local-dev",
         "email": None,
         "name": "Local developer",
         "is_admin": True,
+        "auth_provider": "local",
         "interviews_used": 0,
         "interview_limit": None,
         "interviews_remaining": None,
@@ -2480,11 +2484,16 @@ async def test_admins_are_unlimited(client_and_sessionmaker, monkeypatch):
 async def test_me_for_a_guest(client_and_sessionmaker, acting_user):
     client, _ = client_and_sessionmaker
     acting_user["user"] = GUEST
-    assert await _me(client) == {
+    me = await _me(client)
+    created_at = datetime.fromisoformat(me.pop("created_at"))
+    assert created_at.tzinfo is not None
+    assert datetime.fromisoformat(me.pop("last_seen_at")) == created_at
+    assert me == {
         "id": "user-guest",
         "email": "guest@example.com",
         "name": "Guest",
         "is_admin": False,
+        "auth_provider": "neon",
         "interviews_used": 0,
         "interview_limit": 3,
         "interviews_remaining": 3,
@@ -2493,6 +2502,197 @@ async def test_me_for_a_guest(client_and_sessionmaker, acting_user):
     await client.post("/api/interviews", **_upload())
     me = await _me(client)
     assert (me["interviews_used"], me["interviews_remaining"]) == (1, 2)
+
+
+async def _profile_version(sessionmaker, owner_id: str) -> str:
+    """The transaction that last wrote the profile: unchanged, nothing was written."""
+    async with sessionmaker() as session:
+        return await session.scalar(
+            text("SELECT xmin::text FROM user_profiles WHERE owner_id=:id"), {"id": owner_id}
+        )
+
+
+async def _last_seen(sessionmaker, owner_id: str, minutes_ago: int) -> None:
+    async with sessionmaker() as session:
+        await session.execute(
+            text(
+                "UPDATE user_profiles SET last_seen_at = now() - make_interval(mins => :minutes) "
+                "WHERE owner_id=:id"
+            ),
+            {"id": owner_id, "minutes": minutes_ago},
+        )
+        await session.commit()
+
+
+def _counted(points) -> dict[tuple, int]:
+    return {tuple(sorted(dict(point.attributes).items())): point.count for point in points}
+
+
+async def test_me_records_the_profile_without_a_write_per_page(
+    client_and_sessionmaker, acting_user, recorded_metrics
+):
+    client, sessionmaker = client_and_sessionmaker
+    acting_user["user"] = GUEST
+    first = await _me(client)
+    assert _counted(recorded_metrics("interview_agent.accounts.new_user")) == {
+        (("auth_provider", "neon"),): 1
+    }
+    async with sessionmaker() as session:
+        profile = await session.get(db.UserProfile, GUEST.id)
+        assert (profile.auth_provider, profile.email, profile.name) == (
+            "neon",
+            "guest@example.com",
+            "Guest",
+        )
+        assert profile.last_seen_at.isoformat() == first["last_seen_at"]
+
+    # The next pages within five minutes write nothing.
+    version = await _profile_version(sessionmaker, GUEST.id)
+    assert (await _me(client))["last_seen_at"] == first["last_seen_at"]
+    assert await _profile_version(sessionmaker, GUEST.id) == version
+    await _last_seen(sessionmaker, GUEST.id, 4)
+    version = await _profile_version(sessionmaker, GUEST.id)
+    four_minutes_ago = datetime.fromisoformat((await _me(client))["last_seen_at"])
+    assert four_minutes_ago < datetime.fromisoformat(first["last_seen_at"])
+    assert await _profile_version(sessionmaker, GUEST.id) == version
+
+    # Five minutes on, the visit is recorded again.
+    await _last_seen(sessionmaker, GUEST.id, 6)
+    version = await _profile_version(sessionmaker, GUEST.id)
+    seen_again = await _me(client)
+    assert await _profile_version(sessionmaker, GUEST.id) != version
+    assert datetime.fromisoformat(seen_again["last_seen_at"]) > four_minutes_ago
+    assert seen_again["created_at"] == first["created_at"]
+
+    # A new name or email from the sign-in is kept at once.
+    for renamed in (
+        User(GUEST.id, GUEST.email, "Guest Renamed"),
+        User(GUEST.id, "renamed@example.com", "Guest Renamed"),
+        User(GUEST.id, None, "Guest Renamed"),
+    ):
+        acting_user["user"] = renamed
+        version = await _profile_version(sessionmaker, GUEST.id)
+        await _me(client)
+        assert await _profile_version(sessionmaker, GUEST.id) != version
+        async with sessionmaker() as session:
+            profile = await session.get(db.UserProfile, GUEST.id)
+            assert (profile.email, profile.name) == (renamed.email, renamed.name)
+
+    # A new user once, however often they come back; local ids are local.
+    acting_user["user"] = User("local:guest", None, "guest")
+    assert (await _me(client))["auth_provider"] == "local"
+    assert _counted(recorded_metrics("interview_agent.accounts.new_user")) == {
+        (("auth_provider", "neon"),): 1,
+        (("auth_provider", "local"),): 1,
+    }
+
+
+async def test_only_me_writes_profiles(client_and_sessionmaker, acting_user):
+    client, sessionmaker = client_and_sessionmaker
+    acting_user["user"] = GUEST
+    assert (await client.post("/api/interviews", **_upload())).status_code == 200
+    assert (await client.get("/api/interviews")).status_code == 200
+    async with sessionmaker() as session:
+        assert await session.scalar(select(func.count()).select_from(db.UserProfile)) == 0
+
+
+async def test_admins_list_users_by_last_visit(client_and_sessionmaker, acting_user, monkeypatch):
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(settings, "guest_interviews_per_month", 100)
+    for user in (DEVELOPER, GUEST, OTHER):
+        acting_user["user"] = user
+        await _me(client)
+    acting_user["user"] = GUEST
+    kept, purged = [
+        (await client.post("/api/interviews", **_upload())).json()["id"] for _ in range(2)
+    ]
+    async with sessionmaker() as session:
+        # Profiles from the migration's backfill: never seen since.
+        session.add_all(
+            db.UserProfile(owner_id=owner_id, auth_provider="neon")
+            for owner_id in ("user-unseen-b", "user-unseen-a")
+        )
+        await session.execute(
+            update(db.Conversation)
+            .where(db.Conversation.id == uuid.UUID(kept))
+            .values(created_at=func.now() - timedelta(days=3))
+        )
+        await session.execute(
+            delete(db.Conversation).where(db.Conversation.id == uuid.UUID(purged))
+        )
+        await session.commit()
+        kept_at = await session.scalar(
+            select(db.Conversation.created_at).where(db.Conversation.id == uuid.UUID(kept))
+        )
+    for owner_id, minutes in (("local-dev", 3), ("user-guest", 1), ("user-other", 2)):
+        await _last_seen(sessionmaker, owner_id, minutes)
+
+    assert (await client.get("/api/admin/users")).status_code == 403
+    acting_user["user"] = DEVELOPER
+    body = (await client.get("/api/admin/users")).json()
+    assert body["total"] == 5
+    assert [item["id"] for item in body["items"]] == [
+        "user-guest",
+        "user-other",
+        "local-dev",
+        "user-unseen-a",
+        "user-unseen-b",
+    ]
+    guest, other, developer, unseen, _ = body["items"]
+    assert datetime.fromisoformat(guest.pop("last_seen_at")) > datetime.fromisoformat(
+        other["last_seen_at"]
+    )
+    assert datetime.fromisoformat(guest.pop("created_at")).tzinfo is not None
+    assert guest == {
+        "id": "user-guest",
+        "name": "Guest",
+        "email": "guest@example.com",
+        "auth_provider": "neon",
+        "is_admin": False,
+        # Both count against the quota; only one is still stored.
+        "interviews_used": 2,
+        "interview_limit": 3,
+        "interviews_stored": 1,
+        "last_interview_at": kept_at.isoformat(),
+    }
+    assert (other["interviews_used"], other["interviews_stored"]) == (0, 0)
+    assert other["last_interview_at"] is None
+    assert (developer["is_admin"], developer["interview_limit"]) == (True, None)
+    assert developer["auth_provider"] == "local"
+    assert unseen["last_seen_at"] is None and unseen["interview_limit"] == 3
+    assert (unseen["name"], unseen["email"], unseen["interviews_used"]) == (None, None, 0)
+
+    page = (await client.get("/api/admin/users", params={"limit": 2, "offset": 1})).json()
+    assert page["total"] == 5
+    assert [item["id"] for item in page["items"]] == ["user-other", "local-dev"]
+    beyond = (await client.get("/api/admin/users", params={"offset": 10})).json()
+    assert beyond == {"total": 5, "items": []}
+    assert (await client.get("/api/admin/users", params={"limit": 100})).status_code == 200
+    for params in ({"limit": 101}, {"limit": 0}, {"offset": -1}):
+        assert (await client.get("/api/admin/users", params=params)).status_code == 422
+
+
+async def test_reservations_and_quota_refusals_are_counted_by_category(
+    client_and_sessionmaker, acting_user, monkeypatch, recorded_metrics
+):
+    client, _ = client_and_sessionmaker
+    assert (await client.post("/api/interviews", **_upload())).status_code == 200
+    acting_user["user"] = GUEST
+    monkeypatch.setattr(settings, "guest_interviews_per_month", 100)
+    for _ in range(settings.lifetime_interviews_per_user):
+        assert (await client.post("/api/interviews", **_upload())).status_code == 200
+    assert (await client.post("/api/interviews", **_upload())).status_code == 429
+    acting_user["user"] = OTHER
+    monkeypatch.setattr(settings, "guest_interviews_per_month", 0)
+    assert (await client.post("/api/interviews", **_upload())).status_code == 429
+    assert _counted(recorded_metrics("interview_agent.accounts.interview_reserved")) == {
+        (("role", "admin"),): 1,
+        (("role", "guest"),): 3,
+    }
+    assert _counted(recorded_metrics("interview_agent.accounts.quota_rejected")) == {
+        (("limit", "lifetime"),): 1,
+        (("limit", "monthly"),): 1,
+    }
 
 
 async def test_neon_mode_requires_a_valid_jwt_and_ignores_its_role(
@@ -2525,7 +2725,9 @@ async def test_runtime_is_for_admins(client_and_sessionmaker, acting_user):
     assert (await client.get("/api/runtime")).status_code == 403
 
 
-async def test_maintenance_takes_only_the_internal_token(client_and_sessionmaker, monkeypatch):
+async def test_maintenance_takes_only_the_internal_token(
+    client_and_sessionmaker, monkeypatch, recorded_metrics
+):
     client, sessionmaker = client_and_sessionmaker
     old = await _seed_finished_interview(sessionmaker)
     async with sessionmaker() as session:
@@ -2548,6 +2750,34 @@ async def test_maintenance_takes_only_the_internal_token(client_and_sessionmaker
     assert response.json() == {"deleted_interviews": 1, "reconciled": 0, "failures": 0}
     async with sessionmaker() as session:
         assert await db.get_conversation(session, old) is None
+    # The user counts are fresh for Grafana too.
+    (limit,) = recorded_metrics("interview_agent.accounts.guest_interviews_monthly_limit")
+    assert limit.value == settings.guest_interviews_per_month
+
+
+async def test_maintenance_survives_a_failed_user_recount(
+    client_and_sessionmaker, monkeypatch, caplog
+):
+    from interview_agent.server import account_metrics
+
+    client, _ = client_and_sessionmaker
+
+    async def broken(sessionmaker, settings):
+        raise RuntimeError("SENSITIVE_DATABASE_ERROR")
+
+    # The purge and the sweep have committed by then: their counts still
+    # reach the scheduler, and the failure is logged by its template alone.
+    monkeypatch.setattr(account_metrics, "account_snapshot", broken)
+    monkeypatch.setattr(settings, "internal_api_token", "synthetic-internal-token")
+    with caplog.at_level("ERROR", logger="interview_agent"):
+        response = await client.post(
+            "/api/internal/maintenance", headers={"X-Internal-Token": "synthetic-internal-token"}
+        )
+    assert response.status_code == 200
+    assert response.json() == {"deleted_interviews": 0, "reconciled": 0, "failures": 0}
+    assert [record.msg for record in caplog.records] == [
+        "account metrics failed; retrying next cycle"
+    ]
 
 
 async def test_the_worker_evaluates_with_the_internal_token_alone(

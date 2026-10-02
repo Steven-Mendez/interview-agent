@@ -30,6 +30,7 @@ import jwt
 import sentry_sdk
 from fastapi import Depends, HTTPException, Request
 
+from interview_agent import otel_metrics
 from interview_agent.config import settings
 
 logger = logging.getLogger("interview_agent.server")
@@ -54,6 +55,14 @@ def is_admin(user: User) -> bool:
     return user.id in settings.admin_user_ids
 
 
+def auth_provider(user: User) -> Literal["neon", "local"]:
+    """Who vouched for the user: the API itself (the local developer and the
+    local accounts) or Neon Auth."""
+    if user.id == LOCAL_USER_ID or user.id.startswith(LOCAL_ACCOUNT_PREFIX):
+        return "local"
+    return "neon"
+
+
 def _unauthorized() -> HTTPException:
     # Generic on purpose: neither the token nor why it failed is echoed back.
     return HTTPException(
@@ -67,6 +76,14 @@ def _unavailable() -> HTTPException:
     # Neon Auth's keys could not be fetched: the token may well be valid, so
     # the browser must not take this for a sign-out.
     return HTTPException(status_code=503, detail="Authentication is temporarily unavailable")
+
+
+def _rejected(
+    reason: Literal["missing_token", "invalid_token", "keys_unavailable"],
+) -> HTTPException:
+    """The error for a user request that is refused, counted by reason."""
+    otel_metrics.record("auth", "rejected", 1, {"reason": reason})
+    return _unavailable() if reason == "keys_unavailable" else _unauthorized()
 
 
 class _KeysUnavailableError(Exception):
@@ -285,23 +302,23 @@ async def _authenticate(request: Request) -> User:
         return User(LOCAL_USER_ID, None, "Local developer")
     token = _bearer_token(request)
     if token is None:
-        raise _unauthorized()
+        raise _rejected("missing_token")
     if mode == "local":
         try:
             return _verify_local(token)
         except Exception:
-            raise _unauthorized() from None
+            raise _rejected("invalid_token") from None
     if not settings.neon_auth_url:
-        raise _unauthorized()
+        raise _rejected("invalid_token")
     try:
         claims = await asyncio.to_thread(_verify, token)
     except _KeysUnavailableError:
-        raise _unavailable() from None
+        raise _rejected("keys_unavailable") from None
     except Exception:
-        raise _unauthorized() from None
+        raise _rejected("invalid_token") from None
     subject = claims.get("sub")
     if not isinstance(subject, str) or not subject:
-        raise _unauthorized()
+        raise _rejected("invalid_token")
     email, name = claims.get("email"), claims.get("name")
     return User(
         subject,

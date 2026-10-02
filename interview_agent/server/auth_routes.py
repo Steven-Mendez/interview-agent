@@ -12,6 +12,7 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from interview_agent import otel_metrics
 from interview_agent.server import auth
 
 logger = logging.getLogger("interview_agent.server")
@@ -47,7 +48,9 @@ async def local_sign_in(request: Request):
     user = auth.verify_local_credentials(body.username, body.password)
     if user is None:
         logger.info("local sign-in rejected")
+        otel_metrics.record("auth", "sign_in", 1, {"result": "failed"})
         raise HTTPException(status_code=401, detail="Invalid username or password")
+    otel_metrics.record("auth", "sign_in", 1, {"result": "ok"})
     token, expires_at = auth.issue_local_token(user)
     return {
         "token": token,

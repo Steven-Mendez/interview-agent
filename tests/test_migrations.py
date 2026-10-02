@@ -233,6 +233,7 @@ async def test_v2_upgrade_preserves_legacy_data_and_blocks_destructive_downgrade
         await assert_seal_schema(engine, alembic)
         await assert_external_deletion_schema(engine, alembic)
         await assert_manifest_schema(engine, alembic)
+        await assert_profiles_schema(engine, alembic)
         await assert_accounts_schema(engine, alembic)
     finally:
         await engine.dispose()
@@ -572,6 +573,89 @@ async def assert_manifest_schema(engine, alembic):
         )
     code, output = await alembic("downgrade", "23c4d8e190af")
     assert code != 0 and "Downgrade would destroy execution manifests" in output
+
+
+async def profiles_schema(connection):
+    """Which of the profiles' table and index exist."""
+    return {
+        name: await connection.scalar(text("SELECT to_regclass(:name)"), {"name": name})
+        for name in ("user_profiles", "user_profiles_last_seen_idx")
+    }
+
+
+async def assert_profiles_schema(engine, alembic):
+    async with engine.connect() as connection:
+        assert None not in (await profiles_schema(connection)).values()
+        assert await connection.scalar(text("SELECT count(*) FROM user_profiles")) == 0
+    # Empty, the profiles go and come back with the accounts below them.
+    code, output = await alembic("downgrade", "6a1f0c3e9b27")
+    assert code == 0, output
+    async with engine.connect() as connection:
+        assert set((await profiles_schema(connection)).values()) == {None}
+    # Users the accounts tables know: through an interview (the oldest one
+    # dates them), a quota or settings. An interview from before accounts
+    # belongs to nobody and makes no profile.
+    first, later, nobodys = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    async with engine.begin() as connection:
+        for conversation, owner, days_ago in (
+            (first, "user-synthetic", 9),
+            (later, "user-synthetic", 2),
+            (nobodys, None, 30),
+        ):
+            await connection.execute(
+                text(
+                    "INSERT INTO conversations (id,status,job_offer,resume_markdown,owner_id,"
+                    "created_at) VALUES (:id,'planned','Synthetic','Synthetic',:owner,"
+                    "now() - make_interval(days => :days))"
+                ),
+                {"id": conversation, "owner": owner, "days": days_ago},
+            )
+        await connection.execute(
+            text(
+                "INSERT INTO user_interview_quotas (owner_id,interviews_used) "
+                "VALUES ('user-synthetic',2),('local:guest',1)"
+            )
+        )
+        await connection.execute(text("INSERT INTO user_settings (owner_id) VALUES ('local-dev')"))
+    code, output = await alembic("upgrade", "head")
+    assert code == 0, output
+    async with engine.begin() as connection:
+        rows = (
+            await connection.execute(
+                text(
+                    "SELECT owner_id,auth_provider,email,name,last_seen_at,"
+                    "created_at = (SELECT created_at FROM conversations WHERE id=:first) AS dated,"
+                    "created_at > now() - interval '1 minute' AS fresh "
+                    "FROM user_profiles ORDER BY owner_id"
+                ),
+                {"first": first},
+            )
+        ).all()
+        assert [tuple(row) for row in rows] == [
+            ("local-dev", "local", None, None, None, False, True),
+            ("local:guest", "local", None, None, None, False, True),
+            ("user-synthetic", "neon", None, None, None, True, False),
+        ]
+        with pytest.raises(DBAPIError, match="user_profile_provider"):
+            async with connection.begin_nested():
+                await connection.execute(
+                    text("INSERT INTO user_profiles (owner_id,auth_provider) VALUES ('x','google')")
+                )
+    code, output = await alembic("downgrade", "6a1f0c3e9b27")
+    assert code != 0 and "Downgrade would destroy user profiles" in output
+    async with engine.begin() as connection:
+        assert await connection.scalar(text("SELECT count(*) FROM user_profiles")) == 3
+        await connection.execute(text("DELETE FROM user_profiles"))
+        await connection.execute(text("DELETE FROM user_settings"))
+        await connection.execute(text("DELETE FROM user_interview_quotas"))
+        await connection.execute(
+            text("DELETE FROM conversations WHERE id IN (:first,:later,:nobodys)"),
+            {"first": first, "later": later, "nobodys": nobodys},
+        )
+    code, output = await alembic("downgrade", "6a1f0c3e9b27")
+    assert code == 0, output
+    code, output = await alembic("upgrade", "head")
+    assert code == 0, output
 
 
 async def accounts_schema(connection):

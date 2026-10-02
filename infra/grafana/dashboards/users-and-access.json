@@ -1,0 +1,958 @@
+{
+  "id": null,
+  "uid": "interview-agent-users",
+  "title": "Interview Agent users",
+  "description": "Users, their activity, interview quotas and sign-ins, from the interview agent's OpenTelemetry metrics: counts by fixed categories only, never who. Users and quotas are gauges the API recounts from the database every minute, each panel showing the most recent count any API instance reported. Events are cumulative series; each panel takes a series' last value in its window minus its last value before the window, and a series that is new in the window counts in full.",
+  "tags": [
+    "interview-agent"
+  ],
+  "editable": true,
+  "graphTooltip": 1,
+  "fiscalYearStartMonth": 0,
+  "liveNow": false,
+  "refresh": "",
+  "schemaVersion": 41,
+  "version": 1,
+  "time": {
+    "from": "now-7d",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "weekStart": "",
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "links": [
+    {
+      "type": "dashboards",
+      "title": "Interview Agent",
+      "tags": [
+        "interview-agent"
+      ],
+      "asDropdown": false,
+      "includeVars": true,
+      "keepTime": true,
+      "icon": "external link",
+      "targetBlank": false,
+      "tooltip": "",
+      "url": ""
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "regex": "",
+        "current": {},
+        "options": [],
+        "refresh": 1,
+        "multi": false,
+        "includeAll": false,
+        "hide": 0,
+        "skipUrlSync": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Users & activity",
+      "collapsed": false,
+      "panels": [],
+      "id": 1,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Users by role",
+      "description": "Users with a profile (everyone who opened the app signed in), admins being those listed in ADMIN_USER_IDS. The API recounts it from the database every minute; with several API instances, the most recent report in the range is shown, so an instance that has since stopped never outweighs a newer count.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value_and_name",
+        "orientation": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max by (role) (last_over_time(interview_agent_accounts_users[$__range]) and (last_over_time(timestamp(interview_agent_accounts_users)[$__range:]) == on (role) group_left max by (role) (last_over_time(timestamp(interview_agent_accounts_users)[$__range:]))))",
+          "legendFormat": "{{role}}",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 2,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Active users",
+      "description": "Users seen in the app within the last day, 7 days and 30 days. The API recounts it from the database every minute; with several API instances, the most recent report in the range is shown, so an instance that has since stopped never outweighs a newer count.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value_and_name",
+        "orientation": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max by (window) (last_over_time(interview_agent_accounts_active_users[$__range]) and (last_over_time(timestamp(interview_agent_accounts_active_users)[$__range:]) == on (window) group_left max by (window) (last_over_time(timestamp(interview_agent_accounts_active_users)[$__range:]))))",
+          "legendFormat": "{{window}}",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 3,
+      "gridPos": {
+        "h": 4,
+        "w": 10,
+        "x": 6,
+        "y": 1
+      }
+    },
+    {
+      "type": "stat",
+      "title": "New users",
+      "description": "Users seen for the first time in the selected range, by how they signed in (Neon Auth, or the API itself for local development).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value_and_name",
+        "orientation": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_count(sum by (auth_provider) ((last_over_time(interview_agent_accounts_new_user[$__range]) - last_over_time(interview_agent_accounts_new_user[$__range] offset $__range)) or last_over_time(interview_agent_accounts_new_user[$__range])))",
+          "legendFormat": "{{auth_provider}}",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 4,
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
+        "y": 1
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Active users over time",
+      "description": "Users seen within the last day, 7 days and 30 days, as the API last counted them in each interval.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "pointSize": 6,
+            "spanNulls": true,
+            "barAlignment": -1,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "axisSoftMin": 0,
+            "gradientMode": "none",
+            "lineInterpolation": "stepAfter",
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max by (window) (last_over_time(interview_agent_accounts_active_users[$__interval]))",
+          "legendFormat": "{{window}}",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "maxDataPoints": 500,
+      "id": 5,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "New users over time",
+      "description": "Users seen for the first time, by how they signed in.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "showPoints": "never",
+            "pointSize": 6,
+            "spanNulls": false,
+            "barAlignment": -1,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "axisSoftMin": 0,
+            "gradientMode": "none",
+            "lineInterpolation": "linear",
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_count(sum by (auth_provider) ((last_over_time(interview_agent_accounts_new_user[$__interval]) - last_over_time(interview_agent_accounts_new_user[$__range] offset $__interval)) or last_over_time(interview_agent_accounts_new_user[$__interval])))",
+          "legendFormat": "{{auth_provider}}",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "maxDataPoints": 500,
+      "id": 6,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 5
+      }
+    },
+    {
+      "type": "row",
+      "title": "Quotas",
+      "collapsed": false,
+      "panels": [],
+      "id": 7,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 13
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Guests out of interviews",
+      "description": "Non-admin users who have started all of their lifetime interviews (LIFETIME_INTERVIEWS_PER_USER). The API recounts it from the database every minute; with several API instances, the most recent report in the range is shown, so an instance that has since stopped never outweighs a newer count.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "text"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "value",
+        "orientation": "auto",
+        "wideLayout": true,
+        "showPercentChange": false,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max (last_over_time(interview_agent_accounts_guests_out_of_interviews[$__range]) and (last_over_time(timestamp(interview_agent_accounts_guests_out_of_interviews)[$__range:]) == on () group_left max (last_over_time(timestamp(interview_agent_accounts_guests_out_of_interviews)[$__range:]))))",
+          "legendFormat": "",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 8,
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 14
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Guest interviews this month",
+      "description": "Interviews non-admin users started this calendar month (UTC), against the monthly limit they share (GUEST_INTERVIEWS_PER_MONTH). The API recounts it from the database every minute; with several API instances, the most recent report in the range is shown, so an instance that has since stopped never outweighs a newer count.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "namePlacement": "top",
+        "showUnfilled": true,
+        "valueMode": "text",
+        "sizing": "auto",
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "maxVizHeight": 300,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max (last_over_time(interview_agent_accounts_guest_interviews_this_month[$__range]) and (last_over_time(timestamp(interview_agent_accounts_guest_interviews_this_month)[$__range:]) == on () group_left max (last_over_time(timestamp(interview_agent_accounts_guest_interviews_this_month)[$__range:]))))",
+          "legendFormat": "Started this month",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "max (last_over_time(interview_agent_accounts_guest_interviews_monthly_limit[$__range]) and (last_over_time(timestamp(interview_agent_accounts_guest_interviews_monthly_limit)[$__range:]) == on () group_left max (last_over_time(timestamp(interview_agent_accounts_guest_interviews_monthly_limit)[$__range:]))))",
+          "legendFormat": "Monthly limit",
+          "refId": "B",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 9,
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 6,
+        "y": 14
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Interviews reserved by role, selected range",
+      "description": "Interviews created or repeated: guests spend one of their own and one of the month's shared ones, admins neither.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "namePlacement": "top",
+        "showUnfilled": true,
+        "valueMode": "text",
+        "sizing": "auto",
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "maxVizHeight": 300,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_count(sum by (role) ((last_over_time(interview_agent_accounts_interview_reserved[$__range]) - last_over_time(interview_agent_accounts_interview_reserved[$__range] offset $__range)) or last_over_time(interview_agent_accounts_interview_reserved[$__range])))",
+          "legendFormat": "{{role}}",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 10,
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 14
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Quota rejections by limit, selected range",
+      "description": "Interviews refused because the user had started all of their lifetime interviews, or because guests had used up the month's shared ones.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "namePlacement": "top",
+        "showUnfilled": true,
+        "valueMode": "text",
+        "sizing": "auto",
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "maxVizHeight": 300,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_count(sum by (limit) ((last_over_time(interview_agent_accounts_quota_rejected[$__range]) - last_over_time(interview_agent_accounts_quota_rejected[$__range] offset $__range)) or last_over_time(interview_agent_accounts_quota_rejected[$__range])))",
+          "legendFormat": "{{limit}}",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 11,
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 14
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Interviews reserved and quota rejections",
+      "description": "Interviews reserved, by role, and refused, by the limit reached.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "showPoints": "never",
+            "pointSize": 6,
+            "spanNulls": false,
+            "barAlignment": -1,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "axisSoftMin": 0,
+            "gradientMode": "none",
+            "lineInterpolation": "linear",
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_count(sum by (role) ((last_over_time(interview_agent_accounts_interview_reserved[$__interval]) - last_over_time(interview_agent_accounts_interview_reserved[$__range] offset $__interval)) or last_over_time(interview_agent_accounts_interview_reserved[$__interval])))",
+          "legendFormat": "reserved · {{role}}",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_count(sum by (limit) ((last_over_time(interview_agent_accounts_quota_rejected[$__interval]) - last_over_time(interview_agent_accounts_quota_rejected[$__range] offset $__interval)) or last_over_time(interview_agent_accounts_quota_rejected[$__interval])))",
+          "legendFormat": "rejected · {{limit}}",
+          "refId": "B",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "maxDataPoints": 500,
+      "id": 12,
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 22
+      }
+    },
+    {
+      "type": "row",
+      "title": "Authentication",
+      "collapsed": false,
+      "panels": [],
+      "id": 13,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 30
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Dev sign-ins, selected range",
+      "description": "Only the local development login; Neon Auth sign-ins never reach the API.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "namePlacement": "top",
+        "showUnfilled": true,
+        "valueMode": "text",
+        "sizing": "auto",
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "maxVizHeight": 300,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_count(sum by (result) ((last_over_time(interview_agent_auth_sign_in[$__range]) - last_over_time(interview_agent_auth_sign_in[$__range] offset $__range)) or last_over_time(interview_agent_auth_sign_in[$__range])))",
+          "legendFormat": "{{result}}",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 14,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 31
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Auth rejections by reason, selected range",
+      "description": "User requests the API refused: without a token, with a token that failed verification (expired, foreign or tampered), or while Neon Auth's keys could not be fetched (answered 503, so the browser keeps its session).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "blue"
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "namePlacement": "top",
+        "showUnfilled": true,
+        "valueMode": "text",
+        "sizing": "auto",
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "maxVizHeight": 300,
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_count(sum by (reason) ((last_over_time(interview_agent_auth_rejected[$__range]) - last_over_time(interview_agent_auth_rejected[$__range] offset $__range)) or last_over_time(interview_agent_auth_rejected[$__range])))",
+          "legendFormat": "{{reason}}",
+          "refId": "A",
+          "instant": true,
+          "range": false
+        }
+      ],
+      "id": 15,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 31
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Auth rejections",
+      "description": "User requests the API refused, by reason.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "palette-classic-by-name"
+          },
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "showPoints": "never",
+            "pointSize": 6,
+            "spanNulls": false,
+            "barAlignment": -1,
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            },
+            "axisSoftMin": 0,
+            "gradientMode": "none",
+            "lineInterpolation": "linear",
+            "axisPlacement": "auto",
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_count(sum by (reason) ((last_over_time(interview_agent_auth_rejected[$__interval]) - last_over_time(interview_agent_auth_rejected[$__range] offset $__interval)) or last_over_time(interview_agent_auth_rejected[$__interval])))",
+          "legendFormat": "{{reason}}",
+          "refId": "A",
+          "instant": false,
+          "range": true
+        }
+      ],
+      "maxDataPoints": 500,
+      "id": 16,
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 31
+      }
+    }
+  ]
+}

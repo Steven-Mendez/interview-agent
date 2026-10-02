@@ -65,8 +65,10 @@ function AuthPage() {
   const mode = useAuthMode()
   const leaving = pathname === "sign-out"
   return (
-    // Waving goodbye on the way out.
-    <SignInPage resting={leaving ? "greeting" : "idle"}>
+    // Waving goodbye on the way out. Keyed by the view: sign-out and sign-in
+    // are one route, and a fresh page per view greets again and settles on
+    // the right pose.
+    <SignInPage key={pathname} resting={leaving ? "greeting" : "idle"}>
       {mode === "neon" && neonAuthConfigured ? (
         <NeonAuthViews pathname={pathname} redirectTo={redirectTo} />
       ) : mode === "neon" ? (

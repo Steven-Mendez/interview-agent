@@ -62,6 +62,7 @@ SAFE_LOG_TEMPLATES = frozenset(
         "healthz failed: %s",
         "idle timeout for %s",
         "interview planned",
+        "interview quota reached",
         "invalid interview source context for %s",
         "job for room %r carries no conversation id; skipping",
         (

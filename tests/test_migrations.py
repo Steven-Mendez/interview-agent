@@ -233,6 +233,7 @@ async def test_v2_upgrade_preserves_legacy_data_and_blocks_destructive_downgrade
         await assert_seal_schema(engine, alembic)
         await assert_external_deletion_schema(engine, alembic)
         await assert_manifest_schema(engine, alembic)
+        await assert_accounts_schema(engine, alembic)
     finally:
         await engine.dispose()
 
@@ -571,3 +572,86 @@ async def assert_manifest_schema(engine, alembic):
         )
     code, output = await alembic("downgrade", "23c4d8e190af")
     assert code != 0 and "Downgrade would destroy execution manifests" in output
+
+
+async def accounts_schema(connection):
+    """Which of the accounts' column, index and tables exist."""
+    return {
+        "owner_id": await connection.scalar(
+            text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name='conversations' AND column_name='owner_id'"
+            )
+        ),
+        "index": await connection.scalar(
+            text("SELECT to_regclass('conversations_owner_created_idx')")
+        ),
+        **{
+            table: await connection.scalar(text("SELECT to_regclass(:name)"), {"name": table})
+            for table in ("user_settings", "user_interview_quotas", "guest_interview_months")
+        },
+    }
+
+
+async def assert_accounts_schema(engine, alembic):
+    async with engine.connect() as connection:
+        assert None not in (await accounts_schema(connection)).values()
+    conversation = uuid.uuid4()
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO conversations (id,status,job_offer,resume_markdown) "
+                "VALUES (:id,'planned','Synthetic','Synthetic')"
+            ),
+            {"id": conversation},
+        )
+    # An owner, a user's settings, a quota or a month's count: each is data
+    # the downgrade would destroy.
+    for insert, undo in (
+        (
+            f"UPDATE conversations SET owner_id='user-synthetic' WHERE id='{conversation}'",
+            "UPDATE conversations SET owner_id=NULL",
+        ),
+        (
+            "INSERT INTO user_settings (owner_id) VALUES ('user-synthetic')",
+            "DELETE FROM user_settings",
+        ),
+        (
+            "INSERT INTO user_interview_quotas (owner_id,interviews_used) "
+            "VALUES ('user-synthetic',3)",
+            "DELETE FROM user_interview_quotas",
+        ),
+        (
+            "INSERT INTO guest_interview_months (month,interviews_started) "
+            "VALUES (date_trunc('month', now())::date,2)",
+            "DELETE FROM guest_interview_months",
+        ),
+    ):
+        async with engine.begin() as connection:
+            await connection.execute(text(insert))
+        code, output = await alembic("downgrade", "2d4e8adaf02e")
+        assert code != 0 and "Downgrade would destroy interview owners" in output
+        async with engine.begin() as connection:
+            assert None not in (await accounts_schema(connection)).values()
+            await connection.execute(text(undo))
+    async with engine.connect() as connection:
+        # Defaults match app_settings, and a new quota starts at zero.
+        assert (
+            await connection.scalar(
+                text(
+                    "SELECT column_default FROM information_schema.columns "
+                    "WHERE table_name='user_interview_quotas' AND column_name='interviews_used'"
+                )
+            )
+            == "0"
+        )
+    code, output = await alembic("downgrade", "2d4e8adaf02e")
+    assert code == 0, output
+    async with engine.connect() as connection:
+        assert set((await accounts_schema(connection)).values()) == {None}
+        # The interview itself survives, nobody's again.
+        assert await connection.scalar(
+            text("SELECT count(*) FROM conversations WHERE id=:id"), {"id": conversation}
+        )
+    code, output = await alembic("upgrade", "head")
+    assert code == 0, output

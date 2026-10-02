@@ -458,11 +458,16 @@ async def _trigger_evaluation(
     too. Only a connect failure is safe to retry, so that is the whole list.
 
     `transport` and `sleep` exist for the tests.
+
+    The API takes the call as the worker's, not a user's, by its internal token.
     """
+    headers = (
+        {"X-Internal-Token": settings.internal_api_token} if settings.internal_api_token else {}
+    )
     for attempt, backoff in enumerate(_TRIGGER_BACKOFF_SECONDS, start=1):
         try:
             async with httpx.AsyncClient(transport=transport, timeout=_TRIGGER_TIMEOUT) as client:
-                response = await client.post(url)
+                response = await client.post(url, headers=headers)
             logger.info("auto-evaluation triggered: HTTP %s", response.status_code)
             break
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:

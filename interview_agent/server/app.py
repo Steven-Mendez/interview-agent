@@ -14,16 +14,17 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 
 from interview_agent import otel_metrics
 from interview_agent.config import settings
-from interview_agent.interview import db
 from interview_agent.interview.db import create_engine_and_sessionmaker
 from interview_agent.logging_config import setup_file_logging
 from interview_agent.runtime import process_manifest, record_manifest, validate_database_revision
 from interview_agent.server.evaluations import EvaluationRunner
 from interview_agent.server.reconciliation import LifecycleSweeper
+from interview_agent.server.retention import purge_expired
 from interview_agent.server.routes import router
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -56,22 +57,11 @@ logger = logging.getLogger("interview_agent.server")
 
 
 async def _purge_loop(sessionmaker) -> None:
-    """Retention, once at startup and then daily: process manifests older than
-    METRICS_DETAIL_DAYS, then (PII) interviews older than RETENTION_DAYS.
-    Postgres CASCADE removes milestones, messages and evaluations."""
+    """Retention (retention.purge_expired), once at startup and then daily.
+    POST /api/internal/maintenance runs the same purge on demand."""
     while True:
         try:
-            async with sessionmaker() as session:
-                await db.expire_manifests(session, settings.metrics_detail_days)
-                deleted = (
-                    await db.delete_conversations_older_than(session, settings.retention_days)
-                    if settings.retention_days > 0
-                    else []
-                )
-            logger.info(
-                "retention purge done",
-                extra={"deleted": len(deleted), "days": settings.retention_days},
-            )
+            await purge_expired(sessionmaker, settings)
         except Exception:
             # Keep the loop alive: a transient DB outage should not
             # end retention for the rest of the process lifetime.
@@ -104,7 +94,7 @@ async def lifespan(app: FastAPI):
 
     app.state.sessionmaker = sessionmaker
     app.state.runtime_manifest = await process_manifest(
-        settings, "api", functions=(lifespan.__wrapped__, _purge_loop)
+        settings, "api", functions=(lifespan.__wrapped__, _purge_loop, purge_expired)
     )
     app.state.runtime_manifest["database_revision"] = database_revision
     await record_manifest(sessionmaker, app.state.runtime_manifest)
@@ -138,7 +128,27 @@ async def lifespan(app: FastAPI):
         await engine.dispose()
 
 
+def add_cors(application: FastAPI, origins: list[str]) -> None:
+    """Let the listed browser origins call the API; none adds no middleware.
+
+    Bearer tokens, not cookies: credentials stay off, and the origins are an
+    explicit list, never "*". Retry-After is exposed so the browser can read
+    when a 429 lifts."""
+    if not origins:
+        return
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(origins),
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+        expose_headers=["Retry-After"],
+        allow_credentials=False,
+    )
+
+
 app = FastAPI(title="interview-agent", lifespan=lifespan)
+# At creation: Starlette refuses new middleware once the app has started.
+add_cors(app, settings.cors_allowed_origins)
 app.include_router(router, prefix="/api")
 # Mounted last so /api/* wins over static files. SpaStaticFiles falls back to
 # the shell for client-side routes so refreshes/deep links keep working.

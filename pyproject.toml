@@ -28,6 +28,7 @@ dependencies = [
     # Anonymous metrics over OTLP
     "opentelemetry-sdk>=1.39.1",
     "opentelemetry-exporter-otlp-proto-http>=1.39.1",
+    "pyjwt[crypto]>=2.13.0",
 ]
 
 [project.scripts]

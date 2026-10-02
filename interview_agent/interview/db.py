@@ -7,14 +7,17 @@ never through create_all.
 
 from __future__ import annotations
 
+import math
 import uuid
-from datetime import UTC, datetime, timedelta
-from typing import Any, ClassVar
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from typing import Any, ClassVar, Literal
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -27,6 +30,7 @@ from sqlalchemy import (
     exists,
     func,
     select,
+    text,
     update,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -51,9 +55,15 @@ class Base(DeclarativeBase):
 class Conversation(Base):
     __tablename__ = "conversations"
 
-    __table_args__ = (Index("conversations_created_at_idx", "created_at"),)
+    __table_args__ = (
+        Index("conversations_created_at_idx", "created_at"),
+        Index("conversations_owner_created_idx", "owner_id", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    # The JWT `sub` of whoever created it; NULL (nobody's) for rows from before
+    # accounts, until scripts/claim_interviews.py assigns them.
+    owner_id: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
     # Bumped on every UPDATE (status changes included); the capacity check
     # uses it to ignore orphaned "interviewing" rows from crashed workers.
@@ -556,6 +566,44 @@ class AppSettings(Base):
     updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
 
 
+class UserSettings(Base):
+    """One user's agent configuration: the same columns as AppSettings, whose
+    values a user without a row of their own reads."""
+
+    __tablename__ = "user_settings"
+
+    owner_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    agent_name: Mapped[str] = mapped_column(
+        Text, default=DEFAULT_AGENT_NAME, server_default=DEFAULT_AGENT_NAME
+    )
+    language: Mapped[str] = mapped_column(
+        Text, default=DEFAULT_LANGUAGE, server_default=DEFAULT_LANGUAGE
+    )
+    voice: Mapped[str] = mapped_column(Text, default=DEFAULT_VOICE, server_default=DEFAULT_VOICE)
+    persona: Mapped[str | None] = mapped_column(Text)
+    custom_instructions: Mapped[str | None] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(server_default=func.now(), onupdate=func.now())
+
+
+class UserInterviewQuota(Base):
+    """Interviews a user ever started. Deliberately not tied to conversations:
+    the retention purge deletes interviews, never the count of them."""
+
+    __tablename__ = "user_interview_quotas"
+
+    owner_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    interviews_used: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+
+class GuestInterviewMonth(Base):
+    """Interviews all non-admin users started in one calendar month (UTC)."""
+
+    __tablename__ = "guest_interview_months"
+
+    month: Mapped[date] = mapped_column(Date, primary_key=True)
+    interviews_started: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+
 # --- Engine / session helpers -------------------------------------------------
 
 
@@ -582,13 +630,17 @@ async def list_conversations(
     limit: int,
     offset: int,
     status: str | None = None,
+    owner_id: str | None = None,
 ) -> tuple[list[Conversation], int]:
     """One page of the history, newest first, plus the unpaginated total.
+    `owner_id` narrows it to one user's interviews.
 
     Both relationships are lazy="selectin", so the milestones and the
     evaluation of the whole page load in two extra queries — not one per row.
     """
     filters = [Conversation.status == status] if status else []
+    if owner_id is not None:
+        filters.append(Conversation.owner_id == owner_id)
     total = await session.scalar(select(func.count()).select_from(Conversation).where(*filters))
     rows = await session.scalars(
         select(Conversation)
@@ -904,6 +956,122 @@ async def upsert_app_settings(session: AsyncSession, values: dict[str, Any]) -> 
     )
     await session.commit()
     return await get_app_settings(session)
+
+
+async def get_user_settings(session: AsyncSession, owner_id: str) -> UserSettings | AppSettings:
+    """The user's own settings row, or the app-wide settings until they save one."""
+    settings_row = await session.get(UserSettings, owner_id)
+    if settings_row is not None:
+        return settings_row
+    return await get_app_settings(session)
+
+
+async def upsert_user_settings(
+    session: AsyncSession, owner_id: str, values: dict[str, Any]
+) -> UserSettings:
+    """Write one user's settings row (insert-or-update, race-safe)."""
+    await session.execute(
+        pg_insert(UserSettings)
+        .values(owner_id=owner_id, **values)
+        .on_conflict_do_update(
+            index_elements=["owner_id"], set_={**values, "updated_at": func.now()}
+        )
+    )
+    await session.commit()
+    return await session.get(UserSettings, owner_id, populate_existing=True)
+
+
+QuotaOutcome = Literal["ok", "lifetime", "monthly"]
+
+
+def _current_month():
+    """This calendar month in UTC, on the database clock."""
+    return func.date_trunc("month", func.timezone("UTC", func.now())).cast(Date)
+
+
+async def reserve_interview_slot(
+    session: AsyncSession, owner_id: str, *, lifetime_limit: int, monthly_limit: int
+) -> QuotaOutcome:
+    """Count one more interview against the user's lifetime quota and this
+    month's shared capacity, both or neither, in one transaction.
+
+    Each counter moves with a conditional UPDATE: its row lock serializes
+    concurrent reservations, and READ COMMITTED re-checks the WHERE against the
+    row the lock holder committed, so neither limit can be exceeded. Running
+    out of monthly capacity rolls the lifetime increment back with it.
+    """
+    await session.execute(
+        pg_insert(UserInterviewQuota)
+        .values(owner_id=owner_id)
+        .on_conflict_do_nothing(index_elements=["owner_id"])
+    )
+    reserved = await session.scalar(
+        update(UserInterviewQuota)
+        .where(
+            UserInterviewQuota.owner_id == owner_id,
+            UserInterviewQuota.interviews_used < lifetime_limit,
+        )
+        .values(interviews_used=UserInterviewQuota.interviews_used + 1)
+        .returning(UserInterviewQuota.owner_id)
+    )
+    if reserved is None:
+        await session.rollback()
+        return "lifetime"
+    await session.execute(
+        pg_insert(GuestInterviewMonth)
+        .values(month=_current_month())
+        .on_conflict_do_nothing(index_elements=["month"])
+    )
+    reserved = await session.scalar(
+        update(GuestInterviewMonth)
+        .where(
+            GuestInterviewMonth.month == _current_month(),
+            GuestInterviewMonth.interviews_started < monthly_limit,
+        )
+        .values(interviews_started=GuestInterviewMonth.interviews_started + 1)
+        .returning(GuestInterviewMonth.month)
+    )
+    if reserved is None:
+        await session.rollback()
+        return "monthly"
+    await session.commit()
+    return "ok"
+
+
+@dataclass(frozen=True)
+class QuotaStatus:
+    interviews_used: int
+    monthly_capacity_available: bool
+
+
+async def interview_quota_status(
+    session: AsyncSession, owner_id: str, *, monthly_limit: int
+) -> QuotaStatus:
+    """How many interviews the user started, and whether this month's shared
+    capacity has room for one more."""
+    used = await session.scalar(
+        select(UserInterviewQuota.interviews_used).where(UserInterviewQuota.owner_id == owner_id)
+    )
+    started = await session.scalar(
+        select(GuestInterviewMonth.interviews_started).where(
+            GuestInterviewMonth.month == _current_month()
+        )
+    )
+    return QuotaStatus(
+        interviews_used=int(used or 0),
+        monthly_capacity_available=int(started or 0) < monthly_limit,
+    )
+
+
+async def seconds_until_next_month(session: AsyncSession) -> int:
+    """Whole seconds until 00:00 UTC on the 1st of next month, on the database clock."""
+    seconds = await session.scalar(
+        text(
+            "SELECT EXTRACT(EPOCH FROM date_trunc('month', timezone('UTC', now())) "
+            "+ interval '1 month' - timezone('UTC', now()))"
+        )
+    )
+    return max(1, math.ceil(seconds))
 
 
 async def delete_conversations_older_than(session: AsyncSession, days: int) -> list[uuid.UUID]:

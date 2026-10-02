@@ -17,6 +17,15 @@ os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
 # in-memory reader (the recorded_metrics fixture).
 os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = ""
 os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = ""
+# Nor on the developer's accounts setup: no JWKS fetch, no admins, no shared
+# secret and no CORS unless a test configures them itself.
+os.environ["AUTH_MODE"] = "local"
+os.environ["NEON_AUTH_URL"] = ""
+os.environ["INTERNAL_API_TOKEN"] = ""
+os.environ["ADMIN_USER_IDS"] = ""
+os.environ["CORS_ALLOWED_ORIGINS"] = ""
+os.environ["LIFETIME_INTERVIEWS_PER_USER"] = "3"
+os.environ["GUEST_INTERVIEWS_PER_MONTH"] = "2"
 
 from unittest.mock import Mock
 

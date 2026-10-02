@@ -17,10 +17,11 @@ from hashlib import sha256
 
 import jwt
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import create_async_engine
+from test_auth import bearer, token, use_neon_auth
 
 from interview_agent.config import settings
 from interview_agent.interview import db
@@ -41,7 +42,13 @@ from interview_agent.interview.models import (
 from interview_agent.interview.seals import ensure_seal
 from interview_agent.prompts import length_for
 from interview_agent.server import evaluations, routes
+from interview_agent.server.auth import User, current_user
 from interview_agent.voices import VOICES
+
+# The route tests' default caller: the local developer, listed as an admin (as
+# in .env.example) so that tests about something else are never held back by
+# a quota. Tests about accounts switch to other users through `acting_user`.
+DEVELOPER = User("local-dev", None, "Local developer")
 
 
 def _plan(detected: Seniority | None = Seniority.MID) -> InterviewPlan:
@@ -92,7 +99,14 @@ async def _ensure_test_database(url) -> None:
 
 
 @pytest.fixture
-async def client_and_sessionmaker(monkeypatch, integration_database_url):
+def acting_user():
+    """Who the route tests call as: set acting_user["user"] to switch, or to
+    None to authenticate the request itself."""
+    return {"user": DEVELOPER}
+
+
+@pytest.fixture
+async def client_and_sessionmaker(monkeypatch, integration_database_url, acting_user):
     await _ensure_test_database(integration_database_url)
     engine, sessionmaker = db.create_engine_and_sessionmaker(
         integration_database_url.render_as_string(hide_password=False)
@@ -109,9 +123,17 @@ async def client_and_sessionmaker(monkeypatch, integration_database_url):
         resume_ingestion, "pdf_to_markdown", lambda data, filename: "# Resume\nPython dev."
     )
     monkeypatch.setattr(routes, "run_planner", _fake_planner)
+    monkeypatch.setattr(settings, "admin_user_ids", [DEVELOPER.id])
+
+    async def acting(request: Request) -> User:
+        # None: authenticate for real (the Authorization header, AUTH_MODE).
+        if acting_user["user"] is None:
+            return await current_user(request)
+        return acting_user["user"]
 
     app = FastAPI()
     app.include_router(routes.router, prefix="/api")
+    app.dependency_overrides[current_user] = acting
     app.state.sessionmaker = sessionmaker
     app.state.evaluations = evaluations.EvaluationRunner(sessionmaker)
 
@@ -459,6 +481,7 @@ async def test_rejects_oversized_source_on_token_and_repeat(client_and_sessionma
         session.add(
             db.Conversation(
                 id=conversation_id,
+                owner_id=DEVELOPER.id,
                 status="planned",
                 job_offer="offer",
                 resume_markdown="r" * (MAX_RESUME_CHARS + 1),
@@ -482,6 +505,7 @@ async def _seed_finished_interview(sessionmaker, *, integrity="complete") -> uui
         session.add(
             db.Conversation(
                 id=conversation_id,
+                owner_id=DEVELOPER.id,
                 status="completed",
                 ended_reason="plan_complete",
                 job_offer="offer",
@@ -881,6 +905,7 @@ async def test_evaluate_without_transcript_is_insufficient(client_and_sessionmak
         session.add(
             db.Conversation(
                 id=conversation_id,
+                owner_id=DEVELOPER.id,
                 status="completed",
                 job_offer="o",
                 resume_markdown="r",
@@ -909,6 +934,7 @@ async def test_interview_without_stt_confirmation_is_insufficient_without_model(
         session.add(
             db.Conversation(
                 id=conversation_id,
+                owner_id=DEVELOPER.id,
                 status="completed",
                 job_offer="offer",
                 resume_markdown="# Resume",
@@ -941,6 +967,7 @@ async def test_evaluate_refuses_a_live_interview(client_and_sessionmaker, monkey
         session.add(
             db.Conversation(
                 id=conversation_id,
+                owner_id=DEVELOPER.id,
                 status="interviewing",
                 job_offer="o",
                 resume_markdown="r",
@@ -969,6 +996,7 @@ async def test_an_interrupted_interview_is_evaluable_once_its_window_closes(
         session.add(
             db.Conversation(
                 id=conversation_id,
+                owner_id=DEVELOPER.id,
                 status="interviewing",
                 job_offer="o",
                 resume_markdown="r",
@@ -1023,7 +1051,13 @@ async def test_lifecycle_fields_follow_the_status(client_and_sessionmaker):
         for status in ("planned", "completed", "evaluating", "evaluated"):
             ids[status] = uuid.uuid4()
             session.add(
-                db.Conversation(id=ids[status], status=status, job_offer="o", resume_markdown="r")
+                db.Conversation(
+                    id=ids[status],
+                    owner_id=DEVELOPER.id,
+                    status=status,
+                    job_offer="o",
+                    resume_markdown="r",
+                )
             )
         await session.commit()
 
@@ -1103,7 +1137,11 @@ async def test_add_token_usage_merges_components(client_and_sessionmaker):
     async with sessionmaker() as session:
         session.add(
             db.Conversation(
-                id=conversation_id, status="created", job_offer="o", resume_markdown="r"
+                id=conversation_id,
+                owner_id=DEVELOPER.id,
+                status="created",
+                job_offer="o",
+                resume_markdown="r",
             )
         )
         await session.commit()
@@ -1147,6 +1185,7 @@ async def test_token_allows_a_fresh_reconnect(client_and_sessionmaker, monkeypat
         session.add(
             db.Conversation(
                 id=conversation_id,
+                owner_id=DEVELOPER.id,
                 status="interviewing",
                 job_offer="o",
                 resume_markdown="r",
@@ -1197,6 +1236,7 @@ async def test_token_refuses_a_stale_reconnect(client_and_sessionmaker):
         session.add(
             db.Conversation(
                 id=conversation_id,
+                owner_id=DEVELOPER.id,
                 status="interviewing",
                 job_offer="o",
                 resume_markdown="r",
@@ -1221,7 +1261,11 @@ async def test_get_messages_orders_by_seq_not_id(client_and_sessionmaker):
     async with sessionmaker() as session:
         session.add(
             db.Conversation(
-                id=conversation_id, status="created", job_offer="o", resume_markdown="r"
+                id=conversation_id,
+                owner_id=DEVELOPER.id,
+                status="created",
+                job_offer="o",
+                resume_markdown="r",
             )
         )
         await session.commit()
@@ -1243,6 +1287,7 @@ async def test_resumed_job_appends_instead_of_interleaving(client_and_sessionmak
         session.add(
             db.Conversation(
                 id=conversation_id,
+                owner_id=DEVELOPER.id,
                 status="interviewing",
                 job_offer="o",
                 resume_markdown="r",
@@ -1922,7 +1967,13 @@ async def test_evaluation_requires_a_seal(client_and_sessionmaker):
     interview_id = uuid.uuid4()
     async with sessions() as transaction:
         transaction.add(
-            db.Conversation(id=interview_id, status="completed", job_offer="o", resume_markdown="r")
+            db.Conversation(
+                id=interview_id,
+                owner_id=DEVELOPER.id,
+                status="completed",
+                job_offer="o",
+                resume_markdown="r",
+            )
         )
         await transaction.commit()
     result = await client.post(f"/api/interviews/{interview_id}/evaluate")
@@ -1983,6 +2034,7 @@ async def test_join_dispatches_the_configured_worker_with_only_the_interview_id(
             [
                 db.Conversation(
                     id=ready,
+                    owner_id=DEVELOPER.id,
                     status="planned",
                     job_offer="Synthetic",
                     resume_markdown="Synthetic",
@@ -1994,6 +2046,7 @@ async def test_join_dispatches_the_configured_worker_with_only_the_interview_id(
                 ),
                 db.Conversation(
                     id=unconfigured,
+                    owner_id=DEVELOPER.id,
                     status="planned",
                     job_offer="Synthetic",
                     resume_markdown="Synthetic",
@@ -2028,6 +2081,7 @@ async def test_live_elapsed_uses_database_time_and_preserves_start_on_refresh(
         session.add(
             db.Conversation(
                 id=cid,
+                owner_id=DEVELOPER.id,
                 status="interviewing",
                 job_offer="Synthetic offer",
                 resume_markdown="Synthetic resume",
@@ -2067,6 +2121,7 @@ async def test_detail_exposes_written_farewell_and_closing_bound_from_database_c
             [
                 db.Conversation(
                     id=lost,
+                    owner_id=DEVELOPER.id,
                     status="completed",
                     job_offer="Synthetic offer",
                     resume_markdown="Synthetic resume",
@@ -2078,6 +2133,7 @@ async def test_detail_exposes_written_farewell_and_closing_bound_from_database_c
                 ),
                 db.Conversation(
                     id=closing,
+                    owner_id=DEVELOPER.id,
                     status="closing",
                     job_offer="Synthetic offer",
                     resume_markdown="Synthetic resume",
@@ -2164,3 +2220,417 @@ async def test_question_limit_above_eight_is_reachable_and_effective_limit_is_ho
     # One primary question per planned topic: never display an unreachable 12.
     assert fewer["question_limit"] == 9
     assert fewer["run_config"]["requested_question_limit"] == 12
+
+
+# ---- accounts: ownership, quotas, internal calls ------------------------------
+
+GUEST = User("user-guest", "guest@example.com", "Guest")
+OTHER = User("user-other", "other@example.com", "Other")
+
+
+async def _me(client: AsyncClient) -> dict:
+    response = await client.get("/api/me")
+    assert response.status_code == 200
+    return response.json()
+
+
+async def test_another_users_interview_is_a_404_everywhere(client_and_sessionmaker, acting_user):
+    client, sessionmaker = client_and_sessionmaker
+    mine = (await client.post("/api/interviews", **_upload())).json()["id"]
+    finished = await _seed_finished_interview(sessionmaker)
+    nobodys = uuid.uuid4()
+    async with sessionmaker() as session:
+        # From before accounts: nobody's until claimed, so nobody sees it.
+        session.add(
+            db.Conversation(id=nobodys, status="planned", job_offer="o", resume_markdown="r")
+        )
+        await session.commit()
+    assert (await client.get(f"/api/interviews/{nobodys}")).status_code == 404
+    assert (await client.get("/api/interviews")).json()["total"] == 2
+
+    acting_user["user"] = OTHER
+    review = {"rationale": "r", "reviewer": "someone else"}
+    for interview_id in (mine, finished, nobodys):
+        for method, path, body in (
+            ("GET", "", None),
+            ("GET", "/transcript", None),
+            ("GET", "/evaluations", None),
+            ("GET", "/seals", None),
+            ("GET", "/question", None),
+            ("GET", "/token", None),
+            ("POST", "/repeat", None),
+            ("POST", "/evaluate", None),
+            (
+                "POST",
+                "/question/replay",
+                {"question_id": str(uuid.uuid4()), "request_id": str(uuid.uuid4())},
+            ),
+            (
+                "POST",
+                f"/incidents/{uuid.uuid4()}/review",
+                {"review_id": str(uuid.uuid4()), "decision": "duplicate", **review},
+            ),
+            (
+                "POST",
+                "/seals",
+                {
+                    "seal_id": str(uuid.uuid4()),
+                    "parent_id": str(uuid.uuid4()),
+                    "incident_ids": [str(uuid.uuid4())],
+                    **review,
+                },
+            ),
+        ):
+            response = await client.request(
+                method, f"/api/interviews/{interview_id}{path}", json=body
+            )
+            assert response.status_code == 404, (method, path)
+            assert response.json()["detail"] == "Interview not found"
+    listing = (await client.get("/api/interviews")).json()
+    assert listing["items"] == [] and listing["total"] == 0
+    # Nothing was planned or spent on someone else's interview.
+    assert (await _me(client))["interviews_used"] == 0
+
+    # Admins get no cross-user access either.
+    theirs = (await client.post("/api/interviews", **_upload())).json()["id"]
+    acting_user["user"] = DEVELOPER
+    assert (await client.get(f"/api/interviews/{theirs}")).status_code == 404
+    assert (await client.get(f"/api/interviews/{mine}")).status_code == 200
+
+
+async def test_the_lifetime_quota_survives_deletion_and_time(
+    client_and_sessionmaker, acting_user, monkeypatch
+):
+    client, sessionmaker = client_and_sessionmaker
+    # This month's shared capacity runs out with the user's lifetime quota.
+    monkeypatch.setattr(
+        settings, "guest_interviews_per_month", settings.lifetime_interviews_per_user
+    )
+    acting_user["user"] = GUEST
+    for _ in range(settings.lifetime_interviews_per_user):
+        assert (await client.post("/api/interviews", **_upload())).status_code == 200
+    fourth = await client.post("/api/interviews", **_upload())
+    assert fourth.status_code == 429
+    assert fourth.json()["detail"] == "lifetime_interview_limit_reached"
+    assert "retry-after" not in fourth.headers
+
+    # The retention purge deletes the interviews, never the count of them.
+    async with sessionmaker() as session:
+        await session.execute(
+            update(db.Conversation).values(created_at=func.now() - timedelta(days=60))
+        )
+        await session.commit()
+    monkeypatch.setattr(settings, "retention_days", 30)
+    from interview_agent.server.retention import purge_expired
+
+    assert await purge_expired(sessionmaker, settings) == 3
+    assert (await client.get("/api/interviews")).json()["total"] == 0
+    assert (await client.post("/api/interviews", **_upload())).status_code == 429
+
+    assert (await _me(client))["demo_capacity_available"] is False
+
+    # Months later, as the quota logic reads the clock: the shared monthly
+    # capacity is fresh, the lifetime is not.
+    later_month = db._current_month()
+    monkeypatch.setattr(
+        db,
+        "_current_month",
+        lambda: func.date_trunc(
+            "month", func.timezone("UTC", func.now()) + timedelta(days=400)
+        ).cast(later_month.type),
+    )
+    assert (await _me(client))["demo_capacity_available"] is True
+    later = await client.post("/api/interviews", **_upload())
+    assert later.status_code == 429
+    assert later.json()["detail"] == "lifetime_interview_limit_reached"
+    me = await _me(client)
+    assert (me["interviews_used"], me["interviews_remaining"]) == (3, 0)
+    assert me["demo_capacity_available"] is True
+
+
+async def test_repeat_and_failed_planning_spend_the_quota(
+    client_and_sessionmaker, acting_user, monkeypatch
+):
+    client, _ = client_and_sessionmaker
+    monkeypatch.setattr(settings, "guest_interviews_per_month", 100)
+    acting_user["user"] = GUEST
+    source = (await client.post("/api/interviews", **_upload())).json()
+    assert (await client.post(f"/api/interviews/{source['id']}/repeat")).status_code == 200
+    assert (await _me(client))["interviews_used"] == 2
+
+    # The planner ran (and was paid for) before it failed: it counts.
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("LLM down")
+
+    monkeypatch.setattr(routes, "run_planner", _boom)
+    assert (await client.post(f"/api/interviews/{source['id']}/repeat")).status_code == 500
+    assert (await _me(client))["interviews_used"] == 3
+    monkeypatch.setattr(routes, "run_planner", _fake_planner)
+    response = await client.post(f"/api/interviews/{source['id']}/repeat")
+    assert response.status_code == 429
+    assert response.json()["detail"] == "lifetime_interview_limit_reached"
+
+
+async def test_rejected_requests_spend_no_quota(client_and_sessionmaker, acting_user, monkeypatch):
+    client, sessionmaker = client_and_sessionmaker
+    acting_user["user"] = GUEST
+
+    async def unexpected_planner(*args, **kwargs):
+        pytest.fail("A rejected request must not reach the planner")
+
+    monkeypatch.setattr(routes, "run_planner", unexpected_planner)
+    review = json.dumps({"pdf_sha256": sha256(b"another PDF").hexdigest(), "text": "CV"})
+    for payload, status in (
+        (_upload(interviewer=_interviewer(language="en", voice="es_male")), 400),
+        (_upload(seniority="archmage"), 400),
+        (_upload("o" * (MAX_JOB_OFFER_CHARS + 1)), 413),
+        (_upload(resume_review=review), 409),
+    ):
+        assert (await client.post("/api/interviews", **payload)).status_code == status
+    assert (await _me(client))["interviews_used"] == 0
+    async with sessionmaker() as session:
+        assert (await db.list_conversations(session, limit=20, offset=0))[1] == 0
+
+
+async def test_concurrent_creates_never_exceed_either_limit(
+    client_and_sessionmaker, acting_user, monkeypatch
+):
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(settings, "guest_interviews_per_month", 100)
+    planned = 0
+
+    async def planner(*args, **kwargs):
+        nonlocal planned
+        planned += 1
+        await asyncio.sleep(0.05)  # keep the requests overlapping
+        return _plan()
+
+    monkeypatch.setattr(routes, "run_planner", planner)
+    acting_user["user"] = GUEST
+    responses = await asyncio.gather(
+        *(client.post("/api/interviews", **_upload()) for _ in range(6))
+    )
+    statuses = sorted(response.status_code for response in responses)
+    assert statuses == [200] * 3 + [429] * 3
+    assert planned == 3
+
+    # The month's shared capacity, raced by different users.
+    monkeypatch.setattr(settings, "guest_interviews_per_month", 5)
+    users = [User(f"user-{index}", None, None) for index in range(5)]
+
+    async def create_as(user: User):
+        async with sessionmaker() as session:
+            return await db.reserve_interview_slot(
+                session, user.id, lifetime_limit=3, monthly_limit=5
+            )
+
+    outcomes = await asyncio.gather(*(create_as(user) for user in users))
+    assert sorted(outcomes) == ["monthly"] * 3 + ["ok"] * 2
+    async with sessionmaker() as session:
+        assert await session.scalar(select(db.GuestInterviewMonth.interviews_started)) == 5
+        # A monthly refusal took nothing from the user's own quota.
+        assert await session.scalar(select(func.sum(db.UserInterviewQuota.interviews_used))) == 5
+
+
+async def test_the_monthly_capacity_answers_when_it_comes_back(
+    client_and_sessionmaker, acting_user
+):
+    client, sessionmaker = client_and_sessionmaker
+    for user in (GUEST, OTHER):
+        acting_user["user"] = user
+        assert (await client.post("/api/interviews", **_upload())).status_code == 200
+    acting_user["user"] = User("user-third", None, None)
+    assert (await _me(client))["demo_capacity_available"] is False
+    response = await client.post("/api/interviews", **_upload())
+    assert response.status_code == 429
+    assert response.json()["detail"] == "monthly_demo_capacity_reached"
+    retry_after = response.headers["retry-after"]
+    assert retry_after.isdigit() and 0 < int(retry_after) <= 31 * 24 * 60 * 60
+    async with sessionmaker() as session:
+        # 00:00 UTC on the 1st of next month, on the database clock.
+        now = await session.scalar(select(func.timezone("UTC", func.now())))
+    next_month = (now.replace(day=28) + timedelta(days=4)).replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    assert abs(int(retry_after) - (next_month - now).total_seconds()) <= 5
+    # The lifetime quota is untouched.
+    me = await _me(client)
+    assert (me["interviews_used"], me["interviews_remaining"]) == (0, 3)
+
+
+async def test_admins_are_unlimited(client_and_sessionmaker, monkeypatch):
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(settings, "guest_interviews_per_month", 0)
+    for _ in range(settings.lifetime_interviews_per_user + 2):
+        assert (await client.post("/api/interviews", **_upload())).status_code == 200
+    assert await _me(client) == {
+        "id": "local-dev",
+        "email": None,
+        "name": "Local developer",
+        "is_admin": True,
+        "interviews_used": 0,
+        "interview_limit": None,
+        "interviews_remaining": None,
+        "demo_capacity_available": True,
+    }
+    async with sessionmaker() as session:
+        assert await session.scalar(select(func.count()).select_from(db.UserInterviewQuota)) == 0
+
+
+async def test_me_for_a_guest(client_and_sessionmaker, acting_user):
+    client, _ = client_and_sessionmaker
+    acting_user["user"] = GUEST
+    assert await _me(client) == {
+        "id": "user-guest",
+        "email": "guest@example.com",
+        "name": "Guest",
+        "is_admin": False,
+        "interviews_used": 0,
+        "interview_limit": 3,
+        "interviews_remaining": 3,
+        "demo_capacity_available": True,
+    }
+    await client.post("/api/interviews", **_upload())
+    me = await _me(client)
+    assert (me["interviews_used"], me["interviews_remaining"]) == (1, 2)
+
+
+async def test_neon_mode_requires_a_valid_jwt_and_ignores_its_role(
+    client_and_sessionmaker, acting_user, monkeypatch
+):
+    use_neon_auth(monkeypatch)
+    client, _ = client_and_sessionmaker
+    acting_user["user"] = None
+    files = _upload()["files"]
+    response = await client.post("/api/resumes/preview", files=files)
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert (await client.get("/api/me")).status_code == 401
+    assert (await client.get("/api/healthz")).status_code == 200
+
+    elevated = bearer(token(sub="user-guest", role="admin"))
+    assert (
+        await client.post("/api/resumes/preview", files=files, headers=elevated)
+    ).status_code == 200
+    me = (await client.get("/api/me", headers=elevated)).json()
+    assert me["id"] == "user-guest" and me["is_admin"] is False
+    assert (await client.get("/api/runtime", headers=elevated)).status_code == 403
+
+
+async def test_runtime_is_for_admins(client_and_sessionmaker, acting_user):
+    client, _ = client_and_sessionmaker
+    # Listed admin: past the gate (no manifest recorded in this bare app).
+    assert (await client.get("/api/runtime")).status_code == 503
+    acting_user["user"] = GUEST
+    assert (await client.get("/api/runtime")).status_code == 403
+
+
+async def test_maintenance_takes_only_the_internal_token(client_and_sessionmaker, monkeypatch):
+    client, sessionmaker = client_and_sessionmaker
+    old = await _seed_finished_interview(sessionmaker)
+    async with sessionmaker() as session:
+        await session.execute(
+            update(db.Conversation)
+            .where(db.Conversation.id == old)
+            .values(created_at=func.now() - timedelta(days=60))
+        )
+        await session.commit()
+    monkeypatch.setattr(settings, "retention_days", 30)
+    assert (await client.post("/api/internal/maintenance")).status_code == 401
+    monkeypatch.setattr(settings, "internal_api_token", "synthetic-internal-token")
+    for headers in ({}, {"X-Internal-Token": "wrong"}):
+        response = await client.post("/api/internal/maintenance", headers=headers)
+        assert response.status_code == 401
+    response = await client.post(
+        "/api/internal/maintenance", headers={"X-Internal-Token": "synthetic-internal-token"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"deleted_interviews": 1, "reconciled": 0, "failures": 0}
+    async with sessionmaker() as session:
+        assert await db.get_conversation(session, old) is None
+
+
+async def test_the_worker_evaluates_with_the_internal_token_alone(
+    client_and_sessionmaker, acting_user, monkeypatch
+):
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
+    monkeypatch.setattr(settings, "internal_api_token", "synthetic-internal-token")
+    interview_id = await _seed_finished_interview(sessionmaker)
+    url = f"/api/interviews/{interview_id}/evaluate?automatic=true"
+    # A wrong token falls back to the signed-in user, who must own it.
+    acting_user["user"] = OTHER
+    assert (await client.post(url, headers={"X-Internal-Token": "wrong"})).status_code == 404
+    acting_user["user"] = None
+    use_neon_auth(monkeypatch)
+    assert (await client.post(url, headers={"X-Internal-Token": "wrong"})).status_code == 401
+    # The worker: no user at all.
+    response = await client.post(url, headers={"X-Internal-Token": "synthetic-internal-token"})
+    assert response.status_code == 202
+    acting_user["user"] = DEVELOPER
+    assert (await _settled(client, interview_id))["status"] == "evaluated"
+
+
+async def test_settings_belong_to_each_user(client_and_sessionmaker, acting_user):
+    client, sessionmaker = client_and_sessionmaker
+    mine = {"agent_name": "Sam", "language": "es", "voice": "es_male"}
+    assert (await client.put("/api/settings", json=mine)).status_code == 200
+
+    acting_user["user"] = GUEST
+    # A user who never saved any reads the app-wide defaults.
+    assert (await client.get("/api/settings")).json()["language"] == "en"
+    theirs = {"agent_name": "Nova", "language": "en", "voice": "en_male", "persona": "calm"}
+    assert (await client.put("/api/settings", json=theirs)).json()["agent_name"] == "Nova"
+    planned = (await client.post("/api/interviews", **_upload())).json()
+    assert planned["interviewer"] == {"agent_name": "Nova", "language": "en", "voice": "en_male"}
+
+    acting_user["user"] = DEVELOPER
+    body = (await client.get("/api/settings")).json()
+    assert (body["agent_name"], body["language"], body["persona"]) == ("Sam", "es", None)
+    async with sessionmaker() as session:
+        assert await session.get(db.AppSettings, 1) is None
+
+
+@pytest.mark.parametrize(
+    ("origin", "allowed"),
+    [("https://app.example.com", True), ("https://attacker.example", False)],
+)
+async def test_cors_preflight_allows_only_the_listed_origins(origin, allowed):
+    from interview_agent.server import app as server_app
+
+    app = FastAPI()
+    server_app.add_cors(app, ["https://app.example.com"])
+    app.include_router(routes.router, prefix="/api")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.options(
+            "/api/interviews",
+            headers={
+                "Origin": origin,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Authorization, Content-Type",
+            },
+        )
+    if allowed:
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == origin
+        assert "authorization" in response.headers["access-control-allow-headers"].lower()
+        assert "access-control-allow-credentials" not in response.headers
+    else:
+        assert response.status_code == 400
+        assert "access-control-allow-origin" not in response.headers
+
+    bare = FastAPI()
+    server_app.add_cors(bare, [])
+    assert bare.user_middleware == []
+
+
+@pytest.mark.parametrize("origins", ["*", "https://app.example.com, *"])
+def test_cors_origins_never_include_the_wildcard(origins):
+    from pydantic import ValidationError
+
+    from interview_agent.config import Settings
+
+    with pytest.raises(ValidationError, match="never \\*"):
+        Settings(_env_file=None, CORS_ALLOWED_ORIGINS=origins)
+    configured = Settings(_env_file=None, CORS_ALLOWED_ORIGINS=" https://app.example.com, ")
+    assert configured.cors_allowed_origins == ["https://app.example.com"]

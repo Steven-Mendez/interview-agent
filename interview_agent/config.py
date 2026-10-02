@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import os
+from typing import Annotated, Literal
 
 import langsmith
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 VERIFIED_STT_MODELS = frozenset({"assemblyai/universal-3-6-pro"})
 
@@ -99,6 +100,26 @@ class Settings(BaseSettings):
     livekit_api_key: str = Field(default="", alias="LIVEKIT_API_KEY")
     livekit_api_secret: str = Field(default="", alias="LIVEKIT_API_SECRET")
 
+    # Accounts. "neon" (the default, so production never runs open by accident)
+    # verifies Neon Auth JWTs against NEON_AUTH_URL's JWKS; "local" makes every
+    # request the fixed user "local-dev", for development without a login.
+    auth_mode: Literal["local", "neon"] = Field(default="neon", alias="AUTH_MODE")
+    neon_auth_url: str = Field(default="", alias="NEON_AUTH_URL")
+    # Shared secret of server-to-server calls (the worker's evaluation trigger,
+    # the scheduled maintenance); empty rejects every such call.
+    internal_api_token: str = Field(default="", alias="INTERNAL_API_TOKEN", repr=False)
+    # JWT `sub` values with unlimited interviews and the runtime manifest. The
+    # token's own `role` claim never grants anything.
+    admin_user_ids: Annotated[list[str], NoDecode] = Field(default=[], alias="ADMIN_USER_IDS")
+    # Interviews a non-admin account can ever start (deleting them gives
+    # nothing back), and all non-admin accounts together per calendar month.
+    lifetime_interviews_per_user: int = Field(default=3, alias="LIFETIME_INTERVIEWS_PER_USER", ge=0)
+    guest_interviews_per_month: int = Field(default=2, alias="GUEST_INTERVIEWS_PER_MONTH", ge=0)
+    # Browser origins allowed to call the API cross-origin; empty adds no CORS.
+    cors_allowed_origins: Annotated[list[str], NoDecode] = Field(
+        default=[], alias="CORS_ALLOWED_ORIGINS"
+    )
+
     def require_keys(self) -> Settings:
         """Fail fast with a clear message if any required API key is missing."""
         missing = [
@@ -109,6 +130,14 @@ class Settings(BaseSettings):
                 ("LIVEKIT_API_SECRET", self.livekit_api_secret),
                 ("LIVEKIT_URL", self.livekit_url),
                 ("DATABASE_URL", self.database_url),
+                *(
+                    (
+                        ("NEON_AUTH_URL", self.neon_auth_url),
+                        ("INTERNAL_API_TOKEN", self.internal_api_token),
+                    )
+                    if self.auth_mode == "neon"
+                    else ()
+                ),
             )
             if not value
         ]
@@ -129,6 +158,26 @@ class Settings(BaseSettings):
                 "other models have no verified transcript drain contract"
             )
         return value
+
+    @field_validator("admin_user_ids", "cors_allowed_origins", mode="before")
+    @classmethod
+    def _comma_separated(cls, value):
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("cors_allowed_origins")
+    @classmethod
+    def _explicit_origins(cls, value: list[str]) -> list[str]:
+        # Starlette reads "*" as every origin: the list must name each one.
+        if "*" in value:
+            raise ValueError("CORS_ALLOWED_ORIGINS must list explicit origins, never *")
+        return value
+
+    @field_validator("neon_auth_url")
+    @classmethod
+    def _without_trailing_slash(cls, value: str) -> str:
+        return value.strip().rstrip("/")
 
     @model_validator(mode="after")
     def _check_bounds(self) -> Settings:

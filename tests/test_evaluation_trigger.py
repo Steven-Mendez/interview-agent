@@ -25,9 +25,11 @@ class _Server:
     def __init__(self, *script: int | Exception):
         self.script = list(script)
         self.posts = 0
+        self.requests: list[httpx.Request] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         self.posts += 1
+        self.requests.append(request)
         outcome = self.script.pop(0) if self.script else 200
         if isinstance(outcome, Exception):
             outcome.request = request  # httpx attaches the request lazily
@@ -98,3 +100,20 @@ def test_connect_side_of_the_timeout_fails_fast():
     assert agent._TRIGGER_TIMEOUT.connect == 5.0
     # The endpoint answers 202 as soon as it has claimed the row.
     assert agent._TRIGGER_TIMEOUT.read == 30.0
+
+
+async def test_the_internal_token_rides_along_when_configured(slept, monkeypatch):
+    # The API takes the trigger as the worker's, with no user signed in.
+    monkeypatch.setattr(agent.settings, "internal_api_token", "synthetic-internal-token")
+    server = _Server(httpx.ConnectError("refused"), 202)
+    await _trigger(server, slept)
+    assert [r.headers["x-internal-token"] for r in server.requests] == [
+        "synthetic-internal-token"
+    ] * 2
+
+
+async def test_no_internal_token_header_without_one(slept, monkeypatch):
+    monkeypatch.setattr(agent.settings, "internal_api_token", "")
+    server = _Server(202)
+    await _trigger(server, slept)
+    assert "x-internal-token" not in server.requests[0].headers

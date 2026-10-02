@@ -384,6 +384,9 @@ async def journey(args):
         "OTEL_EXPORTER_OTLP_ENDPOINT": "",
         "OTEL_EXPORTER_OTLP_HEADERS": "",
         "APP_BASE_URL": f"http://127.0.0.1:{API_PORT}",
+        # The browser drives the app without a login: the local user, unlimited.
+        "AUTH_MODE": "local",
+        "ADMIN_USER_IDS": "local-dev",
         "WORKER_DRAIN_MINUTES": "1",
         "INTERVIEW_RECONNECT_SECONDS": "10",
     }

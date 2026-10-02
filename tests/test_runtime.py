@@ -183,6 +183,12 @@ async def test_api_lifespan_records_effective_manifest_and_shutdowns_without_pro
     monkeypatch.setattr(server_app.settings, "livekit_api_secret", "synthetic-test-secret")
     monkeypatch.setattr(server_app.settings, "livekit_url", "wss://synthetic.example")
     monkeypatch.setattr(server_app.settings, "langsmith_api_key", "")
+    # Production's accounts setup: startup needs both, and fetches no keys.
+    monkeypatch.setattr(server_app.settings, "auth_mode", "neon")
+    monkeypatch.setattr(
+        server_app.settings, "neon_auth_url", "https://ep-synthetic.neonauth.example/neondb/auth"
+    )
+    monkeypatch.setattr(server_app.settings, "internal_api_token", "synthetic-internal-token")
     reader, services, configure = InMemoryMetricReader(), [], otel_metrics.configure
 
     def in_memory(settings, service_name):

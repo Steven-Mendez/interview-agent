@@ -220,7 +220,6 @@ class EvaluationRunner:
             custom = conversation.custom_instructions
             seniority = conversation.seniority
             thread_root = conversation.repeat_of_id
-            automatic = request.automatic
             transcript_complete = (
                 seal.integrity not in ("partial", "failed")
                 and not conversation.capture_integrity_pending
@@ -264,27 +263,7 @@ class EvaluationRunner:
             await session.commit()
 
         await record_manifest(self._sessionmaker, manifest, conversation_id=interview_id)
-        telemetry = Telemetry(
-            self._sessionmaker,
-            interview_id,
-            effective,
-            config,
-            process="evaluator",
-            thread_of=thread_root,
-            closes_trace=True,
-            inputs={
-                "transcript": records,
-                "transcript_complete": transcript_complete,
-                "ended_reason": reason,
-                "plan": plan,
-                "milestones": criteria,
-                "seniority": seniority,
-                "language": language,
-                "custom_instructions": custom,
-                "automatic": automatic,
-            },
-        )
-        telemetry.annotate(automatic=automatic, outcome="failed")
+        telemetry = Telemetry(interview_id, config, process="evaluator", thread_of=thread_root)
         observer = LLMObserver(
             telemetry, "evaluator", effective.evaluator_model, effective.evaluator_reasoning_effort
         )
@@ -305,6 +284,7 @@ class EvaluationRunner:
                     usage_callback=usage,
                     telemetry_callback=observer,
                     transcript_complete=transcript_complete,
+                    langsmith_extra={"metadata": telemetry.trace_metadata()},
                 )
             # Also validates mocked/custom evaluator integrations at the write boundary.
             result = validate_evaluation(
@@ -366,25 +346,10 @@ class EvaluationRunner:
                     )
                     conversation.status = "evaluated"
                 await session.commit()
-            # The evaluator's result is also the interview's (root) output.
-            telemetry.set_outputs({**result.model_dump(mode="json"), "published": owns})
             telemetry.emit("evaluation", "coverage", result.coverage)
             telemetry.emit("evaluation", "complete", int(result.evaluation_status == "complete"))
-            telemetry.annotate(
-                outcome="published" if owns else "superseded",
-                evaluation_status=result.evaluation_status,
-                coverage=result.coverage,
-                **({"score": result.score} if result.score is not None else {}),
-                **({"hired": result.hired} if result.hired is not None else {}),
-            )
-            if owns:
-                telemetry.feedback("evaluation_coverage", result.coverage)
-                telemetry.feedback("evaluation_complete", result.evaluation_status == "complete")
-                telemetry.feedback("evaluation_score", result.score)
-                telemetry.feedback("hired", result.hired)
-        except Exception as exc:
+        except Exception:
             logger.exception("Evaluation failed for %s", interview_id)
-            telemetry.set_outputs({"error": type(exc).__name__, "detail": str(exc)})
             await self._fail(interview_id, claim_id, usage)
         finally:
             await telemetry.drain()

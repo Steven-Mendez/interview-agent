@@ -161,10 +161,6 @@ export interface Interview {
   farewell_status: string | null
   /** Localized written farewell when the audio was not (provably) heard. */
   farewell_text?: string | null
-  /** The interview's LangSmith trace, only while it is exported. */
-  langsmith_url?: string | null
-  /** Its voice session traces (audio, turns), one per worker run. */
-  langsmith_voice_urls?: string[]
   /** Server-clock bound for a closing observed after a reload; else null. */
   closing_remaining_seconds?: number | null
   transcript_sealed?: boolean

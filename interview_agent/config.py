@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 
+import langsmith
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -74,12 +75,15 @@ class Settings(BaseSettings):
     # and voice come from the same screen (see interview_agent/voices.py).
     stt_model: str = Field(default="assemblyai/universal-3-6-pro", alias="STT_MODEL")
 
-    # Content stays in Postgres. External traces contain metadata only.
+    # LangSmith: the key is the consent to send each interview's content (CV,
+    # offer, plan, turns, prompts, answers, evaluation and audio); without one
+    # nothing is traced. The app never deletes what LangSmith keeps.
     langsmith_api_key: str = Field(default="", alias="LANGSMITH_API_KEY", repr=False)
     langsmith_project: str = Field(default="interview-agent", alias="LANGSMITH_PROJECT")
     langsmith_endpoint: str = Field(
         default="https://api.smith.langchain.com", alias="LANGSMITH_ENDPOINT"
     )
+    # How long process manifests (each process's effective configuration) are kept.
     metrics_detail_days: int = Field(default=30, alias="METRICS_DETAIL_DAYS", ge=1)
     # Anonymous metrics over OTLP/HTTP (see otel_metrics); empty: none leave the
     # process. Read here: pydantic-settings never exports .env to os.environ.
@@ -139,10 +143,22 @@ settings = Settings()
 
 # pydantic-settings does NOT export .env values to the process environment,
 # but LiveKit reads its credentials from os.environ — mirror them back here.
-for _name, _value in {
+# LangChain's tracer takes its project from there too, not from configure().
+_mirrored = {
     "LIVEKIT_URL": settings.livekit_url,
     "LIVEKIT_API_KEY": settings.livekit_api_key,
     "LIVEKIT_API_SECRET": settings.livekit_api_secret,
-}.items():
+}
+if settings.langsmith_api_key:
+    _mirrored |= {
+        "LANGSMITH_API_KEY": settings.langsmith_api_key,
+        "LANGSMITH_PROJECT": settings.langsmith_project,
+        "LANGSMITH_ENDPOINT": settings.langsmith_endpoint,
+    }
+for _name, _value in _mirrored.items():
     if _value and not os.environ.get(_name):
         os.environ[_name] = _value
+
+# The only tracing switch: it overrides LANGSMITH_TRACING, so without a key
+# nothing is traced even if the environment asks for it.
+langsmith.configure(enabled=bool(settings.langsmith_api_key))

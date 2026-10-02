@@ -7,10 +7,9 @@ import os
 # calibration suite keeps the real key from .env.
 if os.environ.get("RUN_LIVE_LLM_TESTS") != "1":
     os.environ["OPENAI_API_KEY"] = "synthetic-offline-test-key"
-# No suite exports to the developer's LangSmith (a real key would send synthetic
-# interviews there); export tests pass their own key. The project is pinned to
-# the default the tests' fake LangSmith responses name.
-# scripts/verify_langsmith.py is the live check.
+# No suite traces to the developer's LangSmith (a real key would send synthetic
+# interviews there): without a key config turns tracing off. Tracing tests turn
+# it on with a mock client (the langsmith_runs fixture).
 os.environ["LANGSMITH_API_KEY"] = ""
 os.environ["LANGSMITH_PROJECT"] = "interview-agent"
 os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
@@ -19,7 +18,11 @@ os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
 os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = ""
 os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = ""
 
+from unittest.mock import Mock
+
+import langsmith
 import pytest
+from langchain_core.tracers.langchain import wait_for_all_tracers
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
@@ -112,3 +115,25 @@ def recorded_metrics():
         yield points
     finally:
         otel_metrics.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def tracing_stays_off():
+    """No test leaves LangSmith tracing (or a client) behind for the next one."""
+    yield
+    langsmith.configure(enabled=False, client=None)
+
+
+@pytest.fixture
+def langsmith_runs():
+    """Tracing on, as a LangSmith key turns it on, with a mock client: nothing
+    leaves the process. Calling the helper returns the runs created so far."""
+    client = Mock()
+    langsmith.configure(enabled=True, client=client)
+
+    def runs() -> list[dict]:
+        wait_for_all_tracers()
+        return [call.kwargs for call in client.create_run.call_args_list]
+
+    runs.client = client
+    return runs

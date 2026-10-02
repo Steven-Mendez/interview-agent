@@ -103,7 +103,7 @@ def coordinator(sessionmaker, conversation_id, *, timeout=1, writer=None, seal=N
         session=session,
         sessionmaker=sessionmaker,
         conversation_id=conversation_id,
-        telemetry=SimpleNamespace(emit=Mock(), feedback=Mock()),
+        telemetry=SimpleNamespace(emit=Mock()),
         language="es",
         timeout_seconds=timeout,
         drain_transcript=AsyncMock(),

@@ -1,15 +1,18 @@
-"""Anonymous OTLP metrics, plus the LangSmith export and LLM measurements around them."""
+"""Anonymous OTLP metrics and the LLM measurements around them, plus what may
+turn LangSmith tracing on and what its runs may carry."""
 
 import asyncio
 import gzip
+import inspect
+import json
 import math
+import os
 import socket
 import subprocess
 import sys
 import threading
 import time
 import uuid
-from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock
 
@@ -25,8 +28,8 @@ from opentelemetry.sdk.trace import TracerProvider
 
 from interview_agent import otel_metrics
 from interview_agent.config import Settings
-from interview_agent.interview import db
-from interview_agent.observability import LLMObserver, Telemetry
+from interview_agent.interview import evaluator, planner
+from interview_agent.observability import LLMObserver, Telemetry, traced_inputs
 from interview_agent.voice_metrics import record_voice_metrics
 
 IDENTITY = {
@@ -74,10 +77,10 @@ async def test_samples_never_carry_the_current_span_as_an_exemplar(recorded_metr
     # The SDK default would attach the sampled span's trace and span IDs.
     with TracerProvider().get_tracer("test").start_as_current_span("voice turn"):
         otel_metrics.record("voice", "ttfb_seconds", 0.3)
-        otel_metrics.count("privacy", "external_deletions_completed")
+        otel_metrics.record("voice", "ttfb_seconds", None)
     (sample,) = recorded_metrics("interview_agent.voice.ttfb_seconds")
-    (deletion,) = recorded_metrics("interview_agent.privacy.external_deletions_completed")
-    assert not sample.exemplars and not deletion.exemplars
+    (unknown,) = recorded_metrics("interview_agent.voice.ttfb_seconds.unknown")
+    assert not sample.exemplars and not unknown.exemplars
 
 
 def test_without_an_endpoint_nothing_is_built_and_recording_is_a_no_op(monkeypatch):
@@ -89,7 +92,6 @@ def test_without_an_endpoint_nothing_is_built_and_recording_is_a_no_op(monkeypat
     assert not otel_metrics.configure(Settings(_env_file=None), "interview-agent-test")
     otel_metrics.record("graph", "decision_seconds", 1.0)
     otel_metrics.record("graph", "decision_seconds", None)
-    otel_metrics.count("privacy", "external_deletions_completed")
     assert otel_metrics.force_flush() is True
     otel_metrics.shutdown()
     data = reader.get_metrics_data()
@@ -140,9 +142,7 @@ def test_otlp_export_reaches_the_configured_endpoint_with_its_headers():
     try:
         assert otel_metrics.configure(settings, "interview-agent-api")
         otel_metrics.record("browser", "response_onset_seconds", 1.25, {"language": "es"})
-        otel_metrics.count(
-            "privacy", "external_deletions_failed", dimensions={"error_type": "submission_limit"}
-        )
+        otel_metrics.record("evaluator", "coverage", None, {"model": "gpt-6-astra"})
         assert otel_metrics.force_flush()
     finally:
         otel_metrics.shutdown()
@@ -164,13 +164,12 @@ def test_otlp_export_reaches_the_configured_endpoint_with_its_headers():
     (point,) = onset.exponential_histogram.data_points
     assert point.count == 1 and point.sum == 1.25
     assert {a.key: a.value.string_value for a in point.attributes} == {"language": "es"}
-    failed = metrics["interview_agent.privacy.external_deletions_failed"]
-    assert failed.sum.is_monotonic and failed.sum.aggregation_temporality == cumulative
-    (point,) = failed.sum.data_points
+    # A missing value is counted, as a cumulative monotonic sum.
+    unknown = metrics["interview_agent.evaluator.coverage.unknown"]
+    assert unknown.sum.is_monotonic and unknown.sum.aggregation_temporality == cumulative
+    (point,) = unknown.sum.data_points
     assert point.as_int == 1
-    assert {a.key: a.value.string_value for a in point.attributes} == {
-        "error_type": "submission_limit"
-    }
+    assert {a.key: a.value.string_value for a in point.attributes} == {"model": "gpt-6-astra"}
 
 
 _SILENT_COLLECTOR_PROCESS = """
@@ -226,9 +225,7 @@ async def test_telemetry_waits_for_deferred_dimensions_and_adds_the_configured_m
     recorded_metrics,
 ):
     telemetry = Telemetry(
-        None,
         uuid.uuid4(),
-        Settings(_env_file=None),
         {
             "graph_version": "interview-v1",
             "config_version": "synthetic-config",
@@ -271,7 +268,7 @@ async def test_telemetry_waits_for_deferred_dimensions_and_adds_the_configured_m
 async def test_streaming_stt_latency_is_the_transcript_delay_labelled_with_the_stt_model(
     recorded_metrics,
 ):
-    telemetry = Telemetry(None, uuid.uuid4(), Settings(_env_file=None), {})
+    telemetry = Telemetry(uuid.uuid4(), {})
     models = {"stt_model": "assemblyai/test", "tts_model": "cartesia/test"}
     record_voice_metrics(
         telemetry,
@@ -296,33 +293,6 @@ async def test_streaming_stt_latency_is_the_transcript_delay_labelled_with_the_s
     assert dict(end_of_turn.attributes)["model"] == "assemblyai/test"
 
 
-async def test_slow_langsmith_export_is_not_on_llm_response_path(monkeypatch):
-    async def register(*args):
-        return "created", datetime.now(UTC)
-
-    async def export(sessionmaker, trace_id, operation):
-        await asyncio.to_thread(operation)
-
-    monkeypatch.setattr("interview_agent.observability.register_trace", register)
-    monkeypatch.setattr("interview_agent.observability.guarded_export", export)
-    gate = threading.Event()
-    client = Mock()
-    client.create_run.side_effect = lambda **kwargs: gate.wait(0.2)
-    monkeypatch.setattr("interview_agent.observability.Client", lambda **kwargs: client)
-    telemetry = Telemetry(None, uuid.uuid4(), Settings(_env_file=None, LANGSMITH_API_KEY="test"))
-    started = time.monotonic()
-    await telemetry.export_span(
-        uuid.uuid4(), "interviewer", datetime.now(UTC), datetime.now(UTC), {}
-    )
-    assert time.monotonic() - started < 0.05
-    gate.set()
-    await telemetry.drain()
-    # Root, process span and the finished leaf (one request); closing patches
-    # only the process span: the evaluator alone ends the root.
-    assert client.create_run.call_count == 3
-    assert client.update_run.call_count == 1
-
-
 async def test_http_retry_measurement_counts_sdk_attempts_without_reading_bodies():
     telemetry = Mock()
     observer = LLMObserver(telemetry, "planner", "gpt-6-astra", "high")
@@ -342,72 +312,134 @@ async def test_http_retry_measurement_counts_sdk_attempts_without_reading_bodies
     assert "Private prompt" not in str(calls)
 
 
-async def test_langsmith_orders_root_and_nested_node_before_child(monkeypatch):
-    async def register(*args):
-        return "created", datetime.now(UTC)
+_CONSENT_PROCESS = """
+import json
+from unittest.mock import Mock
 
-    async def export(sessionmaker, trace_id, operation):
-        await asyncio.to_thread(operation)
+from langchain_core.callbacks import CallbackManager
+from langchain_core.tracers.langchain import LangChainTracer
+from langsmith.utils import tracing_is_enabled
 
-    monkeypatch.setattr("interview_agent.observability.register_trace", register)
-    monkeypatch.setattr("interview_agent.observability.guarded_export", export)
-    order = []
-    client = Mock()
-    created = {}
+import interview_agent.config  # noqa: F401  (the consent switch)
 
-    def create(**kwargs):
-        time.sleep(0.01)
-        parent = kwargs.get("parent_run_id")
-        assert parent is None or parent in created
-        created[kwargs["id"]] = kwargs
-        order.append(("create", kwargs["id"]))
+enabled = tracing_is_enabled()
+print(json.dumps({
+    "enabled": enabled,
+    # Only asked while off: with tracing on, LangChain would attach a tracer
+    # with a real LangSmith client.
+    "tracer_attached": None if enabled else any(
+        isinstance(handler, LangChainTracer) for handler in CallbackManager.configure().handlers
+    ),
+    # Where LangChain's tracer would send runs (its mock client sends nothing).
+    "tracer_project": LangChainTracer(client=Mock()).project_name,
+}))
+"""
 
-    def update(identifier, **kwargs):
-        assert identifier in created
-        order.append(("update", identifier))
 
-    client.create_run.side_effect = create
-    client.update_run.side_effect = update
-    monkeypatch.setattr("interview_agent.observability.Client", lambda **kwargs: client)
-    telemetry = Telemetry(
-        None,
-        uuid.uuid4(),
-        Settings(_env_file=None, LANGSMITH_API_KEY="test"),
-        process="evaluator",
-        closes_trace=True,
+def consent(tmp_path, key):
+    """A fresh process whose environment asks for tracing; its directory has
+    no .env, so the key (or its absence) is the only LangSmith setting."""
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("LANGSMITH_", "LANGCHAIN_"))
+    }
+    environment |= {
+        "LANGSMITH_TRACING": "true",
+        "LANGCHAIN_TRACING_V2": "true",
+        "LANGSMITH_API_KEY": key,
+    }
+    process = subprocess.run(
+        [sys.executable, "-c", _CONSENT_PROCESS],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=60,
     )
-    async with telemetry.span("graph.decide") as node_id:
-        await telemetry.export_span(
-            uuid.uuid4(), "interviewer", datetime.now(UTC), datetime.now(UTC), {}, parent=node_id
-        )
-    await telemetry.drain()
-    assert len(created) == 4
-    assert order[0] == ("create", telemetry.trace_id)
-    assert order[1] == ("create", telemetry.process_id)
-    assert order[-1] == ("update", telemetry.trace_id)
-    # LangSmith rejects a run with trace_id but no dotted_order. The root starts
-    # at registration, after this process began, so children are clamped to it.
-    for run_id, run in created.items():
-        assert run["trace_id"] == telemetry.trace_id
-        assert run["dotted_order"].endswith(f"{run['start_time']:%Y%m%dT%H%M%S%fZ}{run_id}")
-        parent = run.get("parent_run_id")
-        if parent is None:
-            assert "." not in run["dotted_order"]
-        else:
-            assert run["dotted_order"].startswith(created[parent]["dotted_order"] + ".")
-            assert run["start_time"] >= created[parent]["start_time"]
+    assert process.returncode == 0, process.stderr
+    return json.loads(process.stdout.splitlines()[-1])
 
 
-def test_environment_tracing_cannot_start_unlinked_traces(monkeypatch):
-    # Automatic LangChain tracing would duplicate every call in separate traces
-    # that the interview's deletion never reaches; our explicit export covers it.
-    from langsmith.utils import tracing_is_enabled
+def test_without_a_key_environment_tracing_stays_off(tmp_path):
+    # The key is the consent: LANGSMITH_TRACING alone sends nothing.
+    result = consent(tmp_path, "")
+    assert result["enabled"] is False and result["tracer_attached"] is False
 
-    import interview_agent.observability  # noqa: F401  (installs the global guard)
 
-    monkeypatch.setenv("LANGSMITH_TRACING", "true")
-    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "true")
-    assert tracing_is_enabled() is False
+def test_a_key_turns_tracing_on_into_the_configured_project(tmp_path):
+    # LangChain's tracer reads its project from the environment, not configure():
+    # without the mirror its runs would land in LangSmith's "default" project.
+    assert consent(tmp_path, "synthetic-key") == {
+        "enabled": True,
+        "tracer_attached": None,
+        "tracer_project": "interview-agent",
+    }
+
+
+def test_trace_metadata_groups_an_interview_and_its_repeats_in_one_thread():
+    original, repeat = uuid.uuid4(), uuid.uuid4()
+    config = {
+        "graph_version": "interview-v1",
+        "config_version": "synthetic-config",
+        "language": "es",
+        "seniority": "junior",
+        "interview_length": "short",
+        "models": {"interviewer": {"model": "gpt-6-astra"}},
+    }
+    planned = Telemetry(original, config, process="planner")
+    repeated = Telemetry(repeat, config, process="worker", thread_of=original)
+    assert planned.trace_metadata()["thread_id"] == str(original)
+    assert repeated.trace_metadata(turn_id="turn-1") == {
+        "thread_id": str(original),
+        "interview_id": str(repeat),
+        "process": "worker",
+        "graph_version": "interview-v1",
+        "config_version": "synthetic-config",
+        "language": "es",
+        "seniority": "junior",
+        "length": "short",
+        "turn_id": "turn-1",
+    }
+
+
+@pytest.mark.parametrize("function", [planner.run_planner, evaluator.run_evaluator])
+def test_traced_inputs_never_carry_settings_or_callbacks(function):
+    # LangSmith hands process_inputs the bound arguments, defaults applied.
+    # Settings carries the API keys; the callbacks are our own plumbing.
+    signature = inspect.signature(inspect.unwrap(function))
+    bound = signature.bind(**{name: f"synthetic {name}" for name in signature.parameters})
+    bound.apply_defaults()
+    traced = traced_inputs(dict(bound.arguments))
+    assert traced.keys() == signature.parameters.keys() - {
+        "settings",
+        "usage_callback",
+        "telemetry_callback",
+    }
+    assert traced["resume_markdown"] == "synthetic resume_markdown"
+
+
+async def test_the_evaluator_run_carries_the_interview_but_never_the_settings(langsmith_runs):
+    settings = Settings(_env_file=None, OPENAI_API_KEY="CANARY_OPENAI_KEY")
+    # No candidate answers: an insufficient evaluation, without a model call.
+    await evaluator.run_evaluator(
+        settings,
+        resume_markdown="Synthetic CV",
+        job_offer="Synthetic role",
+        plan={"language": "en"},
+        milestones=[],
+        transcript=[],
+        ended_reason="candidate_left",
+        usage_callback=Mock(),
+        telemetry_callback=Mock(),
+        langsmith_extra={"metadata": {"thread_id": "synthetic-thread"}},
+    )
+    (run,) = langsmith_runs()
+    assert run["name"] == "evaluator" and run.get("parent_run_id") is None
+    assert run["inputs"]["resume_markdown"] == "Synthetic CV"
+    assert not {"settings", "usage_callback", "telemetry_callback"} & run["inputs"].keys()
+    assert run["extra"]["metadata"]["thread_id"] == "synthetic-thread"
+    assert "CANARY_OPENAI_KEY" not in str(langsmith_runs.client.mock_calls)
 
 
 async def test_recovered_sdk_connect_error_is_recorded_per_attempt():
@@ -453,13 +485,10 @@ async def test_recovered_sdk_connect_error_is_recorded_per_attempt():
 
 
 async def test_provider_identity_stays_unknown_when_response_does_not_report_it():
-    from unittest.mock import AsyncMock
-
     from langchain_core.messages import AIMessage
     from langchain_core.outputs import ChatGeneration, LLMResult
 
     telemetry = Mock()
-    telemetry.export_span = AsyncMock()
     observer = LLMObserver(telemetry, "planner", "requested-alias", "high")
     await observer.on_llm_end(
         LLMResult(
@@ -486,191 +515,21 @@ async def test_provider_identity_stays_unknown_when_response_does_not_report_it(
     )
 
 
-def exporting_telemetry(monkeypatch, **kwargs):
-    async def register(*args):
-        return "created", datetime.now(UTC)
-
-    async def export(sessionmaker, trace_id, operation):
-        await asyncio.to_thread(operation)
-
-    monkeypatch.setattr("interview_agent.observability.register_trace", register)
-    monkeypatch.setattr("interview_agent.observability.guarded_export", export)
-    client = Mock()
-    monkeypatch.setattr("interview_agent.observability.Client", lambda **_: client)
-    settings = Settings(_env_file=None, LANGSMITH_API_KEY="test")
-    return Telemetry(None, uuid.uuid4(), settings, **kwargs), client
-
-
-async def test_llm_span_carries_native_tokens_cost_prompt_and_answer(monkeypatch):
-    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+async def test_every_llm_call_reports_its_duration_ended_or_failed():
+    # Feeds Grafana's "LLM call duration" panels, with or without LangSmith.
+    from langchain_core.messages import AIMessage
     from langchain_core.outputs import ChatGeneration, LLMResult
 
-    telemetry, client = exporting_telemetry(monkeypatch)
-    telemetry.emit = Mock()
-    observer = LLMObserver(telemetry, "interviewer", "gpt-6-astra", "low")
-    run_id = uuid.uuid4()
-    await observer.on_chat_model_start(
-        {}, [[SystemMessage("Interview rules"), HumanMessage("Candidate said hi")]], run_id=run_id
-    )
-    message = AIMessage(
-        content="Spoken answer",
-        usage_metadata={
-            "input_tokens": 1000,
-            "output_tokens": 100,
-            "total_tokens": 1100,
-            "input_token_details": {"cache_read": 400},
-            "output_token_details": {"reasoning": 60},
-        },
-        response_metadata={"model_name": "gpt-6-astra-2026-09-01"},
-    )
+    telemetry = Mock()
+    observer = LLMObserver(telemetry, "interviewer", "gpt-6-astra", "low", "turn-1")
+    ended, failed = uuid.uuid4(), uuid.uuid4()
+    for run_id in (ended, failed):
+        await observer.on_chat_model_start({}, [[]], run_id=run_id)
     await observer.on_llm_end(
-        LLMResult(generations=[[ChatGeneration(message=message)]]), run_id=run_id
+        LLMResult(generations=[[ChatGeneration(message=AIMessage(content="Answer"))]]),
+        run_id=ended,
     )
-    await telemetry.drain()
-    span = next(c.kwargs for c in client.create_run.call_args_list if c.kwargs["id"] == run_id)
-    metadata = span["extra"]["metadata"]
-    assert metadata["ls_provider"] == "openai"
-    assert metadata["ls_model_name"] == "gpt-6-astra-2026-09-01"
-    usage = metadata["usage_metadata"]
-    assert usage["input_tokens"] == 1000 and usage["output_tokens"] == 100
-    assert usage["input_token_details"] == {"cache_read": 400}
-    assert usage["output_token_details"] == {"reasoning": 60}
-    assert usage["total_cost"] == pytest.approx((600 * 10 + 400 * 1 + 100 * 50) / 1_000_000)
-    assert span["inputs"]["messages"] == [
-        {"role": "system", "content": "Interview rules"},
-        {"role": "user", "content": "Candidate said hi"},
-    ]
-    assert span["outputs"]["messages"][0]["content"] == "Spoken answer"
-
-
-async def test_feedback_never_extends_retention_and_ignores_unknown_keys(monkeypatch):
-    telemetry, client = exporting_telemetry(monkeypatch)
-    telemetry.feedback("evaluation_score", 88)
-    telemetry.feedback("hired", True)
-    telemetry.feedback("free_text", 1)
-    telemetry.feedback("evaluation_coverage", None)
-    await telemetry.drain()
-    calls = [c.kwargs for c in client.create_feedback.call_args_list]
-    assert [(c["key"], c["score"]) for c in calls] == [("evaluation_score", 88.0), ("hired", 1.0)]
-    assert all(c["trace_id"] == telemetry.trace_id for c in calls)
-    assert all(c["extend_trace_retention"] is False for c in calls)
-    assert all(c["stop_after_attempt"] == 1 for c in calls)
-
-
-async def test_metadata_keeps_only_whitelisted_facts_and_content_goes_in_outputs(monkeypatch):
-    from interview_agent.interview.dialogue import _node_facts
-
-    root = uuid.uuid4()
-    telemetry, client = exporting_telemetry(monkeypatch, process="worker", thread_of=root)
-    result = {
-        "decision": {
-            "action": "close",
-            "close_reason": "Reason the model invented",
-            "spoken_text": "Spoken question",
-        },
-        "error": "Validation detail",
-        "attempts": 2,
-    }
-    facts = _node_facts({"attempts": 1}, result)
-    assert facts == {"action": "close", "validation_failed": True, "attempts": 2}
-    async with telemetry.span("graph.decide", {"turn_id": "t1"}) as span_id:
-        telemetry.annotate_span(span_id, **facts, transcript="Metadata text")
-        telemetry.span_outputs(span_id, result)
-    telemetry.annotate(ended_reason="question_limit", quote="Metadata quote")
-    telemetry.set_outputs({"transcript": [{"role": "user", "content": "Candidate words"}]})
-    await telemetry.drain()
-    updates = {c.args[0]: c.kwargs for c in client.update_run.call_args_list}
-    creates = {c.kwargs["id"]: c.kwargs for c in client.create_run.call_args_list}
-    assert creates[span_id]["inputs"] == {"turn_id": "t1"}
-    assert updates[span_id]["outputs"]["decision"]["spoken_text"] == "Spoken question"
-    assert updates[span_id]["extra"]["metadata"]["action"] == "close"
-    process = updates[telemetry.process_id]
-    assert process["extra"]["metadata"]["ended_reason"] == "question_limit"
-    assert process["extra"]["metadata"]["process"] == "worker"
-    assert process["outputs"]["transcript"][0]["content"] == "Candidate words"
-    root_run = next(
-        c.kwargs for c in client.create_run.call_args_list if c.kwargs["name"] == "interview"
-    )
-    # Repeats of one interview share an opaque thread, never the raw ID.
-    assert root_run["extra"]["metadata"]["thread_id"] == telemetry.thread_id
-    assert str(root) not in str(client.mock_calls)
-    assert "Metadata" not in str(client.mock_calls)
-
-
-async def test_api_feedback_is_sent_only_for_a_registered_trace(postgres_sessionmaker, monkeypatch):
-    from interview_agent.observability import (
-        _feedback_tasks,
-        interview_trace_id,
-        send_trace_feedback,
-    )
-    from interview_agent.privacy import register_trace
-
-    client = Mock()
-    monkeypatch.setattr("interview_agent.observability.Client", lambda **_: client)
-    settings = Settings(_env_file=None, LANGSMITH_API_KEY="test")
-    conversation_id = uuid.uuid4()
-    async with postgres_sessionmaker() as session:
-        session.add(db.Conversation(id=conversation_id, job_offer="Role", resume_markdown="CV"))
-        await session.commit()
-    send_trace_feedback(
-        postgres_sessionmaker, settings, conversation_id, "response_onset_seconds", 2
-    )
-    await asyncio.gather(*list(_feedback_tasks))
-    assert not client.create_feedback.called  # LangSmith never saw this interview
-    await register_trace(
-        postgres_sessionmaker, interview_trace_id(conversation_id), conversation_id, settings
-    )
-    send_trace_feedback(
-        postgres_sessionmaker, settings, conversation_id, "response_onset_seconds", 2.5
-    )
-    await asyncio.gather(*list(_feedback_tasks))
-    assert client.create_feedback.call_args.kwargs["score"] == 2.5
-    assert client.create_feedback.call_args.kwargs["extend_trace_retention"] is False
-
-
-async def test_feedback_names_its_project_once_and_survives_one_not_indexed_yet(monkeypatch):
-    from langsmith.utils import LangSmithNotFoundError
-
-    from interview_agent import observability
-
-    monkeypatch.setattr(observability, "_project_ids", {})
-    telemetry, client = exporting_telemetry(monkeypatch)
-    telemetry.emit = Mock()
-    client.read_project.side_effect = LangSmithNotFoundError("first trace still ingesting")
-    telemetry.feedback("evaluation_score", 80)
-    await telemetry.drain()
-    assert "session_id" not in client.create_feedback.call_args.kwargs  # sent, not lost
-    project = uuid.uuid4()
-    client.read_project.side_effect = None
-    client.read_project.return_value = Mock(id=project)
-    telemetry.feedback("evaluation_score", 85)
-    telemetry.feedback("evaluation_score", 90)
-    await telemetry.drain()
-    feedback = client.create_feedback.call_args.kwargs
-    assert feedback["session_id"] == project
-    assert feedback["start_time"] == telemetry._placement[telemetry.trace_id][1]
-    assert client.read_project.call_count == 2  # cached after the first success
-
-
-async def test_only_the_closing_stage_ends_the_root_and_a_repeat_is_not_an_error(monkeypatch):
-    from langsmith.utils import LangSmithConflictError
-
-    # LangSmith accepts one update per run: planner and worker never touch the
-    # root, and a re-evaluation's duplicate update is expected, not a failure.
-    worker, client = exporting_telemetry(monkeypatch, process="worker")
-    worker.emit = Mock()
-    await worker.drain()
-    assert [call.args[0] for call in client.update_run.call_args_list] == [worker.process_id]
-    evaluator, client = exporting_telemetry(monkeypatch, process="evaluator", closes_trace=True)
-    evaluator.emit = Mock()
-    client.update_run.side_effect = lambda run_id, **_: (
-        (_ for _ in ()).throw(LangSmithConflictError("already ended"))
-        if run_id == evaluator.trace_id
-        else None
-    )
-    await evaluator.drain()
-    assert [call.args[0] for call in client.update_run.call_args_list] == [
-        evaluator.process_id,
-        evaluator.trace_id,
-    ]
-    assert evaluator.failures == 0
+    await observer.on_llm_error(TimeoutError(), run_id=failed)
+    durations = [c for c in telemetry.emit.call_args_list if c.args[1] == "duration_seconds"]
+    assert len(durations) == 2 and all(c.args[2] >= 0 for c in durations)
+    assert not observer.starts

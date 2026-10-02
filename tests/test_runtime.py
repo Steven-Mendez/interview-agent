@@ -1,16 +1,16 @@
 """Startup evidence and schema guard without provider requests."""
 
+import asyncio
 import json
 import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from interview_agent.config import Settings
 from interview_agent.interview import db
-from interview_agent.privacy import expire_detail
 from interview_agent.runtime import EXPECTED_REVISION, process_manifest, record_manifest
 
 
@@ -71,8 +71,85 @@ async def test_manifest_retention_and_conversation_cascade(postgres_sessionmaker
         assert row.snapshot["id"] == str(row.id)
         row.created_at = datetime.now(UTC) - timedelta(days=31)
         await session.commit()
-        await expire_detail(session, 30)
+        await db.expire_manifests(session, 30)
         assert list(await session.scalars(select(db.ProcessManifest))) == []
+
+
+async def manifest(sessionmaker, days_old):
+    identifier = uuid.uuid4()
+    async with sessionmaker() as session:
+        session.add(
+            db.ProcessManifest(
+                id=identifier,
+                role="api",
+                snapshot={"id": str(identifier)},
+                created_at=datetime.now(UTC) - timedelta(days=days_old),
+            )
+        )
+        await session.commit()
+    return identifier
+
+
+async def conversation(sessionmaker, days_old=0):
+    identifier = uuid.uuid4()
+    async with sessionmaker() as session:
+        session.add(
+            db.Conversation(
+                id=identifier,
+                job_offer="Synthetic",
+                resume_markdown="Synthetic",
+                status="completed",
+            )
+        )
+        await session.commit()
+        if days_old:
+            await session.execute(
+                update(db.Conversation)
+                .where(db.Conversation.id == identifier)
+                .values(created_at=datetime.now(UTC) - timedelta(days=days_old))
+            )
+            await session.commit()
+    return identifier
+
+
+async def test_manifest_expiry_drops_old_manifests_only(postgres_sessionmaker):
+    cid = await conversation(postgres_sessionmaker)
+    await manifest(postgres_sessionmaker, days_old=31)
+    recent = await manifest(postgres_sessionmaker, days_old=29)
+    async with postgres_sessionmaker() as session:
+        await db.expire_manifests(session, 30)
+    async with postgres_sessionmaker() as session:
+        assert set(await session.scalars(select(db.ProcessManifest.id))) == {recent}
+        # The interview itself follows RETENTION_DAYS.
+        assert await session.get(db.Conversation, cid)
+
+
+async def test_purge_loop_expires_manifests_before_the_retention_purge(
+    postgres_sessionmaker, monkeypatch
+):
+    from interview_agent.server import app as server_app
+
+    kept = await conversation(postgres_sessionmaker)
+    old = await conversation(postgres_sessionmaker, days_old=8)
+    await manifest(postgres_sessionmaker, days_old=31)
+    recent = await manifest(postgres_sessionmaker, days_old=29)
+    monkeypatch.setattr(server_app.settings, "metrics_detail_days", 30)
+    monkeypatch.setattr(server_app.settings, "retention_days", 7)
+    sleep = asyncio.sleep
+
+    async def one_cycle(seconds, *args, **kwargs):
+        if seconds == server_app._PURGE_INTERVAL_SECONDS:
+            raise asyncio.CancelledError
+        return await sleep(seconds, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", one_cycle)
+    with pytest.raises(asyncio.CancelledError):
+        await server_app._purge_loop(postgres_sessionmaker)
+    async with postgres_sessionmaker() as session:
+        assert set(await session.scalars(select(db.ProcessManifest.id))) == {recent}
+        assert await session.get(db.Conversation, kept)
+        # RETENTION_DAYS still deletes old interviews.
+        assert await session.get(db.Conversation, old) is None
 
 
 async def test_schema_guard_rejects_stale_revision_before_any_session_starts(postgres_sessionmaker):

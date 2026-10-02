@@ -4,8 +4,6 @@ import asyncio
 import json
 import time
 import uuid
-from contextlib import asynccontextmanager
-from contextvars import ContextVar
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -20,6 +18,7 @@ from interview_agent import llm as llm_plumbing
 from interview_agent.config import Settings
 from interview_agent.interview import db, dialogue, turns
 from interview_agent.interview.models import TurnDecision
+from interview_agent.observability import Telemetry
 from interview_agent.server.reconciliation import reconcile_interview
 
 
@@ -273,22 +272,12 @@ async def test_first_reservation_preserves_the_claim_deadline(postgres_sessionma
     await graph.turns.release(lease)
 
 
-class GraphTelemetry:
-    emit = Mock()
+class GraphTelemetry(Telemetry):
+    """The worker's real trace metadata; metric samples go to a Mock."""
 
-    def __init__(self):
+    def __init__(self, conversation_id):
+        super().__init__(conversation_id, process="worker")
         self.emit = Mock()
-        self.parent_span = ContextVar("test_parent_span", default=None)
-        self.export_span = AsyncMock()
-        self.annotate_span = Mock()
-        self.span_outputs = Mock()
-
-    def current_parent(self):
-        return self.parent_span.get()
-
-    @asynccontextmanager
-    async def span(self, name, inputs=None):
-        yield
 
 
 async def setup_graph(sessionmaker, monkeypatch, answer):
@@ -333,7 +322,7 @@ async def setup_graph(sessionmaker, monkeypatch, answer):
             return await answer(context, len(calls))
 
     monkeypatch.setattr(dialogue, "build_chat_model", Mock(return_value=ControlledModel()))
-    telemetry = GraphTelemetry()
+    telemetry = GraphTelemetry(conversation_id)
     controller = dialogue.DialogueController(
         Settings(_env_file=None),
         conversation_id,
@@ -1221,6 +1210,120 @@ async def test_real_structured_langchain_path_does_not_retry_beyond_two_http_att
         execution = await session.scalar(select(db.TurnExecution))
         assert execution.invocations_reserved == 1
         assert await session.scalar(select(func.count()).select_from(db.TurnRun)) == 0
+
+
+async def test_each_turn_is_a_named_root_in_the_interview_thread(
+    postgres_sessionmaker, monkeypatch
+):
+    async def answer(context, call):
+        return question(context["milestones"][0]["id"])
+
+    graph, _, _ = await setup_graph(postgres_sessionmaker, monkeypatch, answer)
+    configs = []
+    ainvoke = graph.graph.ainvoke
+
+    async def spy(state, config):
+        configs.append(config)
+        return await ainvoke(state, config)
+
+    monkeypatch.setattr(graph.graph, "ainvoke", spy)
+    await graph.run_turn("named-turn")
+    (config,) = configs
+    assert config["run_name"] == "dialogue_turn" and config["recursion_limit"] == 64
+    metadata = config["metadata"]
+    assert metadata["thread_id"] == metadata["interview_id"] == str(graph.conversation_id)
+    assert metadata["turn_id"] == "named-turn" and metadata["process"] == "worker"
+
+
+def streamed_decision(decision):
+    """The Responses API stream of a structured answer, as the SDK reads it."""
+    text = decision.model_dump_json()
+    item = {
+        "type": "message",
+        "id": "msg_test",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    }
+    response = {
+        "id": "resp_test",
+        "object": "response",
+        "created_at": 1,
+        "status": "in_progress",
+        "model": "gpt-6-astra",
+        "output": [],
+    }
+    completed = response | {
+        "status": "completed",
+        "output": [item],
+        # LangChain parses the text into the schema only for a json_schema format.
+        "text": {"format": {"type": "json_schema", "name": "TurnDecision", "schema": {}}},
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 10,
+            "total_tokens": 110,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
+    }
+    part = {"item_id": "msg_test", "output_index": 0, "content_index": 0}
+    events = [
+        {"type": "response.created", "response": response},
+        {"type": "response.output_item.added", "output_index": 0, "item": item | {"content": []}},
+        {"type": "response.output_text.delta", **part, "delta": text},
+        {"type": "response.output_text.done", **part, "text": text},
+        {"type": "response.output_item.done", "output_index": 0, "item": item},
+        {"type": "response.completed", "response": completed},
+    ]
+    body = "".join(
+        f"event: {event['type']}\ndata: {json.dumps(event | {'sequence_number': number})}\n\n"
+        for number, event in enumerate(events)
+    )
+
+    async def respond(request):
+        return httpx.Response(
+            200, content=body.encode(), headers={"content-type": "text/event-stream"}
+        )
+
+    return respond
+
+
+async def test_traced_turn_nests_the_decide_model_call_under_its_root(
+    postgres_sessionmaker, monkeypatch, langsmith_runs
+):
+    async def answer(context, call):
+        pytest.fail("The real LangChain structured path should be invoked")
+
+    graph, milestones, _ = await setup_graph(postgres_sessionmaker, monkeypatch, answer)
+    graph.settings = graph.settings.model_copy(update={"openai_api_key": "CANARY_OPENAI_KEY"})
+    decision = question(milestones[0])
+    monkeypatch.setattr(
+        llm_plumbing.httpx,
+        "AsyncHTTPTransport",
+        lambda: httpx.MockTransport(streamed_decision(decision)),
+    )
+    monkeypatch.setattr(dialogue, "build_chat_model", llm_plumbing.build_chat_model)
+    result = await graph.run_turn("traced-turn")
+    assert result["decision"]["spoken_text"] == decision.spoken_text
+    runs = {run["id"]: run for run in langsmith_runs()}
+    (root,) = [run for run in runs.values() if run.get("parent_run_id") is None]
+    assert root["name"] == "dialogue_turn"
+    assert {run["trace_id"] for run in runs.values()} == {root["id"]}
+    (model_run,) = [run for run in runs.values() if run["name"] == "ChatOpenAI"]
+    ancestors, run = [], model_run
+    while run.get("parent_run_id"):
+        run = runs[run["parent_run_id"]]
+        ancestors.append(run["name"])
+    assert ancestors[-2:] == ["decide", "dialogue_turn"]
+    metadata = model_run["extra"]["metadata"]
+    assert metadata["thread_id"] == str(graph.conversation_id)
+    assert metadata["turn_id"] == "traced-turn"
+    # The node's own callbacks (metrics, usage) still run beside the tracer.
+    assert any(
+        c.args[:2] == ("interviewer", "llm_invocations")
+        for c in graph.telemetry.emit.call_args_list
+    )
+    assert "CANARY_OPENAI_KEY" not in str(langsmith_runs.client.mock_calls)
 
 
 @pytest.mark.parametrize("blocked_stage", ["repair", "persist"])

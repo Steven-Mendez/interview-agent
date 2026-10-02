@@ -1,8 +1,8 @@
 {
   "id": null,
   "uid": "interview-agent-closings",
-  "title": "Interview Agent closings and deletions",
-  "description": "Interview closings, farewell playback and LangSmith trace deletions, from the interview agent's OpenTelemetry metrics. Every process exports cumulative series; each panel takes a series' last value in its window minus its last value before the window, and a series that is new in the window counts in full. Sparse interviews are counted exactly instead of being extrapolated or dropped, as rate() and increase() would do.",
+  "title": "Interview Agent closings",
+  "description": "Interview closings and farewell playback, from the interview agent's OpenTelemetry metrics. Every process exports cumulative series; each panel takes a series' last value in its window minus its last value before the window, and a series that is new in the window counts in full. Sparse interviews are counted exactly instead of being extrapolated or dropped, as rate() and increase() would do.",
   "tags": [
     "interview-agent"
   ],
@@ -296,7 +296,7 @@
       "id": 2,
       "gridPos": {
         "h": 4,
-        "w": 4,
+        "w": 6,
         "x": 0,
         "y": 1
       }
@@ -353,8 +353,8 @@
       "id": 3,
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 4,
+        "w": 6,
+        "x": 6,
         "y": 1
       }
     },
@@ -410,8 +410,8 @@
       "id": 4,
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 8,
+        "w": 6,
+        "x": 12,
         "y": 1
       }
     },
@@ -466,122 +466,8 @@
       "id": 5,
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 12,
-        "y": 1
-      }
-    },
-    {
-      "type": "stat",
-      "title": "Deletions completed",
-      "description": "LangSmith traces verified as deleted. Deletions are not tied to one interview, so the dashboard filters do not apply.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "fixed",
-            "fixedColor": "text"
-          },
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "textMode": "value",
-        "orientation": "auto",
-        "wideLayout": true,
-        "showPercentChange": false,
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum ((last_over_time(interview_agent_privacy_external_deletions_completed_total[$__range]) - last_over_time(interview_agent_privacy_external_deletions_completed_total[$__range] offset $__range)) or last_over_time(interview_agent_privacy_external_deletions_completed_total[$__range])) or vector(0)",
-          "legendFormat": "",
-          "refId": "A",
-          "instant": true,
-          "range": false
-        }
-      ],
-      "id": 6,
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 16,
-        "y": 1
-      }
-    },
-    {
-      "type": "stat",
-      "title": "Deletions failed",
-      "description": "LangSmith trace deletions given up after their last error. Deletions are not tied to one interview, so the dashboard filters do not apply.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "fixed",
-            "fixedColor": "text"
-          },
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "justifyMode": "center",
-        "textMode": "value",
-        "orientation": "auto",
-        "wideLayout": true,
-        "showPercentChange": false,
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum ((last_over_time(interview_agent_privacy_external_deletions_failed_total[$__range]) - last_over_time(interview_agent_privacy_external_deletions_failed_total[$__range] offset $__range)) or last_over_time(interview_agent_privacy_external_deletions_failed_total[$__range])) or vector(0)",
-          "legendFormat": "",
-          "refId": "A",
-          "instant": true,
-          "range": false
-        }
-      ],
-      "id": 7,
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 20,
+        "w": 6,
+        "x": 18,
         "y": 1
       }
     },
@@ -1439,328 +1325,6 @@
         "w": 8,
         "x": 16,
         "y": 22
-      }
-    },
-    {
-      "type": "row",
-      "title": "External deletions (LangSmith)",
-      "collapsed": false,
-      "id": 16,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 30
-      },
-      "panels": []
-    },
-    {
-      "type": "timeseries",
-      "title": "External deletions",
-      "description": "Interview traces deleted from LangSmith once local detail expires: verified absent (completed) or given up (failed, by the last error). Deletions are not tied to one interview, so the dashboard filters do not apply.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "color": {
-            "mode": "palette-classic-by-name"
-          },
-          "custom": {
-            "drawStyle": "bars",
-            "lineWidth": 1,
-            "fillOpacity": 70,
-            "showPoints": "never",
-            "pointSize": 6,
-            "spanNulls": false,
-            "barAlignment": -1,
-            "stacking": {
-              "group": "A",
-              "mode": "normal"
-            },
-            "axisSoftMin": 0,
-            "gradientMode": "none",
-            "lineInterpolation": "linear",
-            "axisPlacement": "auto",
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "decimals": 0
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "played.*"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "green"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "timeout.*"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "orange"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "failed.*"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "red"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "not_possible.*"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#8e8e8e"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "completed.*"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "green"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": []
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum ((last_over_time(interview_agent_privacy_external_deletions_completed_total[$__interval]) - last_over_time(interview_agent_privacy_external_deletions_completed_total[$__range] offset $__interval)) or last_over_time(interview_agent_privacy_external_deletions_completed_total[$__interval]))",
-          "legendFormat": "completed",
-          "refId": "A",
-          "instant": false,
-          "range": true
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (error_type) ((last_over_time(interview_agent_privacy_external_deletions_failed_total[$__interval]) - last_over_time(interview_agent_privacy_external_deletions_failed_total[$__range] offset $__interval)) or last_over_time(interview_agent_privacy_external_deletions_failed_total[$__interval]))",
-          "legendFormat": "failed · {{error_type}}",
-          "refId": "B",
-          "instant": false,
-          "range": true
-        }
-      ],
-      "maxDataPoints": 500,
-      "id": 17,
-      "gridPos": {
-        "h": 8,
-        "w": 16,
-        "x": 0,
-        "y": 31
-      }
-    },
-    {
-      "type": "bargauge",
-      "title": "External deletions, selected range",
-      "description": "Interview traces deleted from LangSmith once local detail expires: verified absent (completed) or given up (failed, by the last error). Deletions are not tied to one interview, so the dashboard filters do not apply.",
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "min": 0,
-          "color": {
-            "mode": "fixed",
-            "fixedColor": "blue"
-          },
-          "decimals": 0
-        },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "played.*"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "green"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "timeout.*"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "orange"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "failed.*"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "red"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "not_possible.*"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "#8e8e8e"
-                }
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byRegexp",
-              "options": "completed.*"
-            },
-            "properties": [
-              {
-                "id": "color",
-                "value": {
-                  "mode": "fixed",
-                  "fixedColor": "green"
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "displayMode": "basic",
-        "orientation": "horizontal",
-        "namePlacement": "top",
-        "showUnfilled": true,
-        "valueMode": "text",
-        "sizing": "auto",
-        "minVizHeight": 16,
-        "minVizWidth": 8,
-        "maxVizHeight": 300,
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum ((last_over_time(interview_agent_privacy_external_deletions_completed_total[$__range]) - last_over_time(interview_agent_privacy_external_deletions_completed_total[$__range] offset $__range)) or last_over_time(interview_agent_privacy_external_deletions_completed_total[$__range]))",
-          "legendFormat": "completed",
-          "refId": "A",
-          "instant": true,
-          "range": false
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "editorMode": "code",
-          "expr": "sum by (error_type) ((last_over_time(interview_agent_privacy_external_deletions_failed_total[$__range]) - last_over_time(interview_agent_privacy_external_deletions_failed_total[$__range] offset $__range)) or last_over_time(interview_agent_privacy_external_deletions_failed_total[$__range]))",
-          "legendFormat": "failed · {{error_type}}",
-          "refId": "B",
-          "instant": true,
-          "range": false
-        }
-      ],
-      "id": 18,
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 31
       }
     }
   ]

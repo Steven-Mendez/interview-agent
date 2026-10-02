@@ -21,8 +21,6 @@ from interview_agent.config import settings
 from interview_agent.interview import db
 from interview_agent.interview.db import create_engine_and_sessionmaker
 from interview_agent.logging_config import setup_file_logging
-from interview_agent.observability import TraceLinks
-from interview_agent.privacy import ExternalDeletionWorker, expire_detail
 from interview_agent.runtime import process_manifest, record_manifest, validate_database_revision
 from interview_agent.server.evaluations import EvaluationRunner
 from interview_agent.server.reconciliation import LifecycleSweeper
@@ -58,13 +56,13 @@ logger = logging.getLogger("interview_agent.server")
 
 
 async def _purge_loop(sessionmaker) -> None:
-    """Retention, once at startup and then daily: technical detail older than
+    """Retention, once at startup and then daily: process manifests older than
     METRICS_DETAIL_DAYS, then (PII) interviews older than RETENTION_DAYS.
     Postgres CASCADE removes milestones, messages and evaluations."""
     while True:
         try:
             async with sessionmaker() as session:
-                await expire_detail(session, settings.metrics_detail_days)
+                await db.expire_manifests(session, settings.metrics_detail_days)
                 deleted = (
                     await db.delete_conversations_older_than(session, settings.retention_days)
                     if settings.retention_days > 0
@@ -115,9 +113,6 @@ async def lifespan(app: FastAPI):
     app.state.evaluations = EvaluationRunner(sessionmaker)
 
     purge_task = asyncio.create_task(_purge_loop(sessionmaker))
-    deletion_task = asyncio.create_task(ExternalDeletionWorker(sessionmaker, settings).run())
-    app.state.trace_links = TraceLinks(settings) if settings.langsmith_api_key else None
-    links_task = asyncio.create_task(app.state.trace_links.run()) if app.state.trace_links else None
     sweep_task = asyncio.create_task(
         LifecycleSweeper(sessionmaker, settings, app.state.evaluations).run()
     )
@@ -127,13 +122,6 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        deletion_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await deletion_task
-        if links_task is not None:
-            links_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await links_task
         sweep_task.cancel()
         with suppress(asyncio.CancelledError):
             await sweep_task

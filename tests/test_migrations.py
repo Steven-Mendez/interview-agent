@@ -494,7 +494,29 @@ async def assert_seal_schema(engine, alembic):
             assert await connection.scalar(text(f"SELECT count(*) FROM {table}")) == 0
 
 
+async def external_deletion_schema(connection):
+    """Which of the LangSmith deletion jobs' table, trigger function and trigger exist."""
+    return {
+        "table": await connection.scalar(text("SELECT to_regclass('external_traces')")),
+        "function": await connection.scalar(
+            text("SELECT to_regprocedure('tombstone_conversation_traces()')")
+        ),
+        "trigger": await connection.scalar(
+            text("SELECT 1 FROM pg_trigger WHERE tgname='conversations_trace_tombstones'")
+        ),
+    }
+
+
 async def assert_external_deletion_schema(engine, alembic):
+    # The app no longer deletes LangSmith traces: head has no deletion jobs.
+    async with engine.connect() as connection:
+        assert set((await external_deletion_schema(connection)).values()) == {None}
+    # Below head they come back, empty, and still behave as they did there.
+    code, output = await alembic("downgrade", "dad9ce0068bd")
+    assert code == 0, output
+    async with engine.connect() as connection:
+        assert None not in (await external_deletion_schema(connection)).values()
+        assert await connection.scalar(text("SELECT count(*) FROM external_traces")) == 0
     conversation, trace = uuid.uuid4(), uuid.uuid4()
     async with engine.begin() as connection:
         await connection.execute(
@@ -530,6 +552,11 @@ async def assert_external_deletion_schema(engine, alembic):
         assert row.deletion_requested_at is not None and row.next_attempt_at is not None
     code, output = await alembic("downgrade", "1b4f70c9d821")
     assert code != 0 and "Downgrade would destroy external deletion jobs" in output
+    # Upgrading drops them again, pending jobs included: nothing deletes them now.
+    code, output = await alembic("upgrade", "head")
+    assert code == 0, output
+    async with engine.connect() as connection:
+        assert set((await external_deletion_schema(connection)).values()) == {None}
 
 
 async def assert_manifest_schema(engine, alembic):

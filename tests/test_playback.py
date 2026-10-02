@@ -3,7 +3,6 @@
 import asyncio
 import uuid
 from datetime import UTC, datetime, timedelta
-from unittest.mock import Mock
 
 import pytest
 from fastapi import FastAPI
@@ -254,8 +253,6 @@ async def test_browser_response_onset_is_authenticated_bounded_and_capped(
 ):
     monkeypatch.setattr(settings, "livekit_api_key", "playback-test-key")
     monkeypatch.setattr(settings, "livekit_api_secret", "playback-test-secret-at-least-32-bytes")
-    feedback = Mock()
-    monkeypatch.setattr("interview_agent.server.routes.send_trace_feedback", feedback)
     conversation_id, _owner, _ack = await attempt(postgres_sessionmaker)
     async with postgres_sessionmaker() as session:
         await session.execute(
@@ -322,6 +319,3 @@ async def test_browser_response_onset_is_authenticated_bounded_and_capped(
         "length": "short",
         "model": "gpt-6-astra",
     }
-    # Still also on the interview's LangSmith trace, for accepted samples only.
-    assert feedback.call_count == 3
-    assert feedback.call_args.args[2:] == (conversation_id, "response_onset_seconds", 1.5)

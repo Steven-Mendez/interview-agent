@@ -24,7 +24,6 @@ import { isSettled } from "@/components/interview-progress"
 import { InterviewStatusChip } from "@/components/interview-status"
 import { RepeatOptionsDialog } from "@/components/repeat-options"
 import { TranscriptView } from "@/components/results/transcript-view"
-import { TraceLink } from "@/components/trace-link"
 import { TranscriptReview } from "@/components/transcript-review"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
@@ -396,7 +395,7 @@ function Records({
   return (
     <Section
       title="Records"
-      description="Earlier assessments, saved answer versions and traces."
+      description="Earlier assessments and saved answer versions."
     >
       <div className="flex flex-col gap-3">
         {children}
@@ -406,10 +405,6 @@ function Records({
           duration={duration}
         />
         <TranscriptReview interviewId={interview.id} />
-        <TraceLink
-          url={interview.langsmith_url}
-          voiceUrls={interview.langsmith_voice_urls}
-        />
       </div>
     </Section>
   )

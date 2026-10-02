@@ -13,7 +13,7 @@ dependencies = [
     "langgraph>=1.2.7",
     "langchain-openai>=1.3.3",
     "openai>=2.44.0",
-    "langsmith[livekit]>=0.12.4",
+    "langsmith[livekit]>=0.14.1,<0.15",
     # Config
     "pydantic-settings>=2.0",
     "fastapi>=0.139.0",

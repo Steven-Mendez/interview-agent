@@ -531,31 +531,6 @@ class ProcessManifest(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.clock_timestamp(), index=True)
 
 
-class ExternalTrace(Base):
-    """Durable external deletion job; tombstones survive local content deletion."""
-
-    __tablename__ = "external_traces"
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("conversations.id", ondelete="SET NULL"), index=True
-    )
-    endpoint: Mapped[str] = mapped_column(Text)
-    project_name: Mapped[str] = mapped_column(Text)
-    project_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
-    created_at: Mapped[datetime] = mapped_column(server_default=func.clock_timestamp())
-    expires_at: Mapped[datetime] = mapped_column(index=True)
-    state: Mapped[str] = mapped_column(Text, default="active", server_default="active")
-    deletion_requested_at: Mapped[datetime | None]
-    deletion_submitted_at: Mapped[datetime | None]
-    deleted_at: Mapped[datetime | None]
-    next_attempt_at: Mapped[datetime | None] = mapped_column(index=True)
-    lease_owner: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
-    lease_until: Mapped[datetime | None]
-    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
-    failures: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
-    last_error: Mapped[str | None] = mapped_column(Text)
-
-
 class AppSettings(Base):
     """Global agent configuration edited from the Settings screen.
 
@@ -939,13 +914,17 @@ async def delete_conversations_older_than(session: AsyncSession, days: int) -> l
         await session.scalars(select(Conversation.id).where(Conversation.created_at < cutoff))
     )
     if ids:
-        from interview_agent.privacy import retire_traces
-
-        for identifier in ids:
-            await session.scalar(
-                select(Conversation.id).where(Conversation.id == identifier).with_for_update()
-            )
-            await retire_traces(session, conversation_id=identifier)
         await session.execute(delete(Conversation).where(Conversation.id.in_(ids)))
         await session.commit()
     return ids
+
+
+async def expire_manifests(session: AsyncSession, detail_days: int) -> None:
+    """Startup manifests are technical detail: dropped after METRICS_DETAIL_DAYS."""
+    now = await session.scalar(select(func.clock_timestamp()))
+    await session.execute(
+        delete(ProcessManifest).where(
+            ProcessManifest.created_at < now - timedelta(days=detail_days)
+        )
+    )
+    await session.commit()

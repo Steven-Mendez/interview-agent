@@ -2,6 +2,7 @@
 
 Run: uv run python scripts/verify_providers.py --text --voice --output /tmp/smoke/report.json
 These checks prove API/voice compatibility, not superiority or human-rated quality.
+Nothing is traced to LangSmith, even with a key in .env.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import aiohttp
+import langsmith
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from livekit import rtc
 from livekit.agents import inference, stt
@@ -31,9 +33,7 @@ from interview_agent.voices import VOICES
 
 class ArtifactTelemetry(Telemetry):
     def __init__(self, configuration):
-        super().__init__(
-            None, uuid.uuid4(), settings.model_copy(update={"langsmith_api_key": ""}), configuration
-        )
+        super().__init__(uuid.uuid4(), configuration)
         self.records = []
 
     async def record(self, component, name, value, *, turn_id=None, dimensions=None):
@@ -248,6 +248,9 @@ async def stt_checks(output):
 
 
 async def main(args):
+    # Importing config enabled tracing if .env has a key: synthetic runs stay
+    # out of the interviews' LangSmith project.
+    langsmith.configure(enabled=False)
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     report = {

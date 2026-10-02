@@ -59,14 +59,12 @@ DIMENSIONS = frozenset(
 )
 
 
-def safe_dimensions(dimensions: dict, *, detail=False) -> dict:
-    """Short categorical values only. `detail` also keeps the trace ID, for
-    LangSmith trace metadata; exported metrics never carry it."""
-    allowed = DIMENSIONS | ({"trace_id"} if detail else set())
+def safe_dimensions(dimensions: dict) -> dict:
+    """Short categorical values only."""
     return {
         key: value
         for key, value in dimensions.items()
-        if key in allowed and isinstance(value, (str, int, bool)) and len(str(value)) <= 128
+        if key in DIMENSIONS and isinstance(value, (str, int, bool)) and len(str(value)) <= 128
     }
 
 
@@ -135,19 +133,6 @@ def record(component: str, name: str, value: float | None, dimensions: dict | No
             process.counter(metric + ".unknown").add(1, attributes)
         else:
             process.histogram(metric).record(value, attributes)
-    except Exception as exc:
-        logger.warning("Metric not recorded: %s", type(exc).__name__)
-
-
-def count(component: str, name: str, amount: int = 1, dimensions: dict | None = None) -> None:
-    """Adds to the counter `interview_agent.<component>.<name>`; never raises."""
-    process = _process
-    if process is None:
-        return
-    try:
-        process.counter(f"interview_agent.{component}.{name}").add(
-            amount, safe_dimensions(dimensions or {})
-        )
     except Exception as exc:
         logger.warning("Metric not recorded: %s", type(exc).__name__)
 

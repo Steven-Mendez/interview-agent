@@ -567,7 +567,6 @@ class ClosingCoordinator:
             dimensions={"farewell_status": self.playback_status},
         )
         self.telemetry.emit("closing", "playback_confirmed", int(self.playback_status == "played"))
-        self.telemetry.feedback("farewell_played", self.playback_status == "played")
         self._finished = True
         try:
             await self._bounded(

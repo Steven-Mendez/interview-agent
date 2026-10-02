@@ -18,6 +18,7 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 import unicodedata
 import uuid
@@ -26,6 +27,8 @@ from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
 from contextlib import suppress
 
 import httpx
+from langchain_core.tracers.langchain import wait_for_all_tracers
+from langsmith.integrations.livekit import LiveKitLangSmithSpanProcessor, set_thread_id
 from livekit import api, rtc
 from livekit.agents import (
     Agent,
@@ -41,10 +44,12 @@ from livekit.agents import (
     inference,
     stt,
 )
+from livekit.agents import telemetry as livekit_telemetry
 from livekit.agents.cli import cli as sdk_cli
 from livekit.agents.llm import ChatContext, ChatMessage
 from livekit.agents.voice import room_io
 from livekit.plugins import silero
+from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
 from sqlalchemy import func, select
 
 from interview_agent import otel_metrics
@@ -58,12 +63,10 @@ from interview_agent.interview.transcription import OrderedCaptureWriter
 from interview_agent.interview.workers import WorkerCoordinator, WorkerOwnershipError
 from interview_agent.logging_config import protect_log_handlers
 from interview_agent.observability import TURN_HANDLING, Telemetry
-from interview_agent.privacy import register_trace
 from interview_agent.runtime import process_manifest, record_manifest, validate_database_revision
 from interview_agent.stt_drain import DrainableInferenceSTT, SessionSTTBoundary
 from interview_agent.user_transcript import UserTranscriptForwarder
 from interview_agent.voice_metrics import record_voice_metrics
-from interview_agent.voice_tracing import RECORD_AUDIO, configure_voice_tracing
 
 logger = logging.getLogger("interview_agent")
 
@@ -90,13 +93,55 @@ _NON_WORD = re.compile(r"[^\w\s]", re.UNICODE)
 # doubling the interview and quadrupling LLM input.
 _RESUME_MAX_MESSAGES = 160
 
+# What the session start records with LangSmith: LiveKit's recorder writes the
+# session audio (candidate and interviewer) and LangSmith's processor attaches
+# it to the voice session's root ("session_report" mode). Traces, logs and
+# transcript uploads to LiveKit Cloud stay off. A LiveKit Cloud project with
+# agent observability enabled also receives this audio, under its retention.
+RECORD_AUDIO = {"audio": True, "traces": False, "logs": False, "transcript": False}
+
+
+class _FlushOnRootEnd(SpanProcessor):
+    """Runs after LangSmith's processor. LiveKit ends the job's root span
+    after the shutdown callbacks, as the process is about to exit: send it
+    (with the recording) now rather than on the batch exporter's timer."""
+
+    def __init__(self, processor: SpanProcessor) -> None:
+        self.processor = processor
+
+    def on_end(self, span: ReadableSpan) -> None:
+        if span.parent is None:
+            self.processor.force_flush(10_000)
+
+
+def langsmith_voice_processor(settings) -> LiveKitLangSmithSpanProcessor | None:
+    """LangSmith's LiveKit integration, only with a key: one trace per voice
+    session, its turns (STT, reply, TTS) below a root with the recording.
+    Without a key LiveKit's spans have no exporter and nothing leaves."""
+    if not settings.langsmith_api_key:
+        return None
+    processor = LiveKitLangSmithSpanProcessor(
+        api_key=settings.langsmith_api_key,
+        project=settings.langsmith_project,
+        # The SDK's own default: self-hosted endpoints keep their /api/v1.
+        endpoint=settings.langsmith_endpoint.rstrip("/") + "/otel/v1/traces",
+        recording_mode="session_report",
+    )
+    provider = TracerProvider()
+    provider.add_span_processor(processor)
+    provider.add_span_processor(_FlushOnRootEnd(processor))
+    # LiveKit's own hook; the OTel global stays untouched so no other library
+    # starts exporting through this provider.
+    livekit_telemetry.set_tracer_provider(provider)
+    return processor
+
 
 def prewarm(proc: JobProcess) -> None:
     """Load the Silero VAD once per worker process so every job reuses it,
     bind LiveKit's spans to LangSmith before the first job starts any, and give
     the process its own metrics provider (the parent running run() has none)."""
     proc.userdata["vad"] = silero.VAD.load()
-    proc.userdata["voice_tracing"] = configure_voice_tracing(settings)
+    proc.userdata["langsmith_processor"] = langsmith_voice_processor(settings)
     otel_metrics.configure(settings, "interview-agent-worker")
 
 
@@ -462,6 +507,30 @@ async def _flush_metrics(telemetry: Telemetry) -> None:
         logger.warning("Metrics flush did not complete")
 
 
+_TRACES_FLUSH_SECONDS = 5
+
+
+def _wait_for_tracers() -> None:
+    try:
+        wait_for_all_tracers()
+    except Exception as exc:
+        logger.warning("Trace flush failed: %s", type(exc).__name__)
+
+
+async def _flush_traces() -> None:
+    """LangChain's tracer sends the dialogue turns from a background thread:
+    wait for it before the job process exits, bounded, on a daemon thread so
+    an unresponsive LangSmith cannot hold the exit. Nothing to send without a
+    key."""
+    flush = threading.Thread(
+        target=_wait_for_tracers, name="interview-agent-trace-flush", daemon=True
+    )
+    flush.start()
+    await asyncio.to_thread(flush.join, _TRACES_FLUSH_SECONDS)
+    if flush.is_alive():
+        logger.warning("Trace flush did not complete")
+
+
 async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
     engine, sessionmaker = db.create_engine_and_sessionmaker(settings.database_url)
     startup_cleanup = []
@@ -588,35 +657,12 @@ async def _run_interview_job(ctx, conversation_id, engine, sessionmaker, startup
 
     run_config = conversation.run_config
     telemetry = Telemetry(
-        sessionmaker,
-        conversation_id,
-        settings,
-        run_config,
-        process="worker",
-        thread_of=conversation.repeat_of_id,
-        inputs={
-            "plan": conversation.plan,
-            "agent_settings": conversation.agent_settings,
-            "resumed_messages": len(prior_messages),
-        },
+        conversation_id, run_config, process="worker", thread_of=conversation.repeat_of_id
     )
-    voice_tracing = ctx.proc.userdata.get("voice_tracing")
-    session_trace = voice_tracing.session_trace_id() if voice_tracing is not None else None
-    if session_trace is None:
-        voice_tracing = None
-    else:
-        # Registered for deletion before anything of it is exported.
-        try:
-            registered = await register_trace(
-                sessionmaker, session_trace, conversation_id, settings
-            )
-        except Exception as exc:
-            registered = None
-            logger.warning("Voice trace registration failed: %s", type(exc).__name__)
-        if registered:
-            voice_tracing.follow(telemetry, session_trace)
-        else:
-            voice_tracing = None
+    voice_processor = ctx.proc.userdata.get("langsmith_processor")
+    # The voice session's spans start from this task (session.start): its
+    # LangSmith trace joins the interview's Thread.
+    set_thread_id(telemetry.trace_metadata()["thread_id"])
     model_config = run_config["models"]["interviewer"]
     effective = settings.model_copy(
         update={
@@ -907,33 +953,6 @@ async def _run_interview_job(ctx, conversation_id, engine, sessionmaker, startup
                 await coordinator.finish(shutdown_reason or "candidate_left", say_goodbye=False)
         except Exception:
             logger.exception("failed to record candidate_left")
-        try:
-            # Outcome and transcript on the worker's span of the interview trace.
-            async with sessionmaker() as s:
-                outcome = await db.get_conversation(s, conversation_id)
-                transcript = await db.get_messages(s, conversation_id)
-            if outcome is not None:
-                telemetry.set_outputs(
-                    {
-                        "status": outcome.status,
-                        "ended_reason": outcome.ended_reason,
-                        "transcript": [
-                            {"role": m.role, "content": m.content, "interrupted": m.interrupted}
-                            for m in transcript
-                        ],
-                    }
-                )
-                telemetry.annotate(
-                    ended_reason=outcome.ended_reason,
-                    farewell_status=outcome.farewell_status,
-                    transcript_integrity=outcome.transcript_integrity,
-                )
-                if outcome.transcript_integrity is not None:
-                    telemetry.feedback(
-                        "transcript_complete", outcome.transcript_integrity == "complete"
-                    )
-        except Exception:
-            logger.warning("Trace outcome could not be read")
         for cleanup in (coordinator.aclose, user_transcript.aclose, telemetry.drain):
             try:
                 await coordinator._bounded(cleanup(), 10)
@@ -987,6 +1006,7 @@ async def _run_interview_job(ctx, conversation_id, engine, sessionmaker, startup
                 task.cancel()
                 task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
             await _flush_metrics(telemetry)
+            await _flush_traces()
             try:
                 async with asyncio.timeout(2):
                     await engine.dispose()
@@ -1030,7 +1050,7 @@ async def _run_interview_job(ctx, conversation_id, engine, sessionmaker, startup
         await session.start(
             # Independent of LiveKit project defaults. With LangSmith, LiveKit
             # records the session audio for the trace; without it nothing.
-            record=RECORD_AUDIO if voice_tracing is not None else False,
+            record=RECORD_AUDIO if voice_processor is not None else False,
             room=ctx.room,
             room_options=room_io.RoomOptions(close_on_disconnect=False),
             agent=InterviewAgent(

@@ -1,6 +1,8 @@
 """run_planner with the LLM mocked out: exercises prompt assembly and the
 structured-output type check, not OpenAI."""
 
+from unittest.mock import Mock
+
 import pytest
 
 from interview_agent.config import Settings
@@ -177,3 +179,28 @@ async def test_run_planner_defaults_to_a_standard_length(settings, monkeypatch):
         agent_name="Alex",
     )
     assert "between 4 and 6 milestones" in fake.messages[0].content
+
+
+async def test_a_traced_planning_is_one_root_with_the_interview_but_never_the_settings(
+    monkeypatch, langsmith_runs
+):
+    fake = _FakeChain(_plan())
+    monkeypatch.setattr(planner, "build_chat_model", lambda *a, **k: fake)
+
+    await planner.run_planner(
+        Settings(_env_file=None, OPENAI_API_KEY="CANARY_OPENAI_KEY"),
+        resume_markdown="# Resume",
+        job_offer="Backend engineer.",
+        language="en",
+        agent_name="Alex",
+        usage_callback=Mock(),
+        telemetry_callback=Mock(),
+        langsmith_extra={"metadata": {"thread_id": "synthetic-thread"}},
+    )
+
+    (run,) = langsmith_runs()
+    assert run["name"] == "planner" and run.get("parent_run_id") is None
+    assert run["inputs"]["job_offer"] == "Backend engineer."
+    assert not {"settings", "usage_callback", "telemetry_callback"} & run["inputs"].keys()
+    assert run["extra"]["metadata"]["thread_id"] == "synthetic-thread"
+    assert "CANARY_OPENAI_KEY" not in str(langsmith_runs.client.mock_calls)

@@ -97,16 +97,23 @@ async def test_invalid_worker_context_marks_failure_closes_room_and_releases_eng
 
 
 @pytest.mark.parametrize(
-    "reconnecting,displaced,recovering",
+    "reconnecting,displaced,recovering,traced",
     [
-        (False, False, False),
-        (True, False, False),
-        (False, True, False),
-        (False, False, True),
+        (False, False, False, False),
+        (True, False, False, False),
+        (False, True, False, False),
+        (False, False, True, False),
+        (False, False, False, True),
     ],
 )
 async def test_worker_reaches_session_start_with_a_real_unconnected_room(
-    monkeypatch, postgres_sessionmaker, recorded_metrics, reconnecting, displaced, recovering
+    monkeypatch,
+    postgres_sessionmaker,
+    recorded_metrics,
+    reconnecting,
+    displaced,
+    recovering,
+    traced,
 ):
     conversation_id = uuid.uuid4()
     async with postgres_sessionmaker() as transaction:
@@ -180,6 +187,8 @@ async def test_worker_reaches_session_start_with_a_real_unconnected_room(
     monkeypatch.setattr(session, "start", start)
     monkeypatch.setattr(session, "generate_reply", AsyncMock())
     monkeypatch.setattr(agent, "_build_session", lambda *args: session)
+    threads = []
+    monkeypatch.setattr(agent, "set_thread_id", threads.append)
     callbacks = []
     room = rtc.Room()
     if reconnecting:
@@ -190,13 +199,15 @@ async def test_worker_reaches_session_start_with_a_real_unconnected_room(
         shutdown=Mock(),
         api=SimpleNamespace(room=SimpleNamespace(delete_room=AsyncMock())),
         job=SimpleNamespace(room=SimpleNamespace(name="dispatched-room")),
-        # No LangSmith key: prewarm configured no voice tracing.
-        proc=SimpleNamespace(userdata={"voice_tracing": None}),
+        # With a LangSmith key prewarm built the voice processor; without, none.
+        proc=SimpleNamespace(userdata={"langsmith_processor": Mock() if traced else None}),
     )
     await agent._run_interview(ctx, conversation_id)
     start.assert_awaited_once()
-    # Without LangSmith nothing is recorded.
-    assert start.call_args.kwargs["record"] is False
+    # LiveKit records the session audio for LangSmith only.
+    assert start.call_args.kwargs["record"] is (agent.RECORD_AUDIO if traced else False)
+    # The voice session's trace joins the interview's Thread.
+    assert threads == [str(conversation_id)]
     assert start.call_args.kwargs["room"] is room
     assert start.call_args.kwargs["agent"]._worker.lease.epoch == (
         2 if reconnecting or recovering else 1
@@ -264,11 +275,61 @@ async def test_end_of_interview_flush_waits_briefly_for_samples_in_flight(
 
     monkeypatch.setattr(agent.otel_metrics, "force_flush", flush)
     # Deferred dimensions hold the sample back for a moment, as a busy loop would.
-    telemetry = Telemetry(None, uuid.uuid4(), settings, defer_dimensions=True)
+    telemetry = Telemetry(uuid.uuid4(), defer_dimensions=True)
     telemetry.emit("worker", "ownership_lost", 1)
     asyncio.get_running_loop().call_later(0.05, telemetry.resolve_dimensions, {})
     await agent._flush_metrics(telemetry)
     assert exported == [1]
+
+
+def test_prewarm_without_a_langsmith_key_builds_no_voice_processor(monkeypatch):
+    monkeypatch.setattr(settings, "langsmith_api_key", "")
+    monkeypatch.setattr(agent.silero.VAD, "load", Mock(return_value="vad"))
+    monkeypatch.setattr(agent.otel_metrics, "configure", Mock())
+    unexpected = Mock(side_effect=AssertionError("no LangSmith export without a key"))
+    monkeypatch.setattr(agent, "LiveKitLangSmithSpanProcessor", unexpected)
+    monkeypatch.setattr(agent.livekit_telemetry, "set_tracer_provider", unexpected)
+    proc = SimpleNamespace(userdata={})
+    agent.prewarm(proc)
+    assert proc.userdata == {"vad": "vad", "langsmith_processor": None}
+
+
+def test_a_langsmith_key_binds_livekit_spans_to_a_private_provider(monkeypatch):
+    from opentelemetry import trace as otel_trace
+
+    from interview_agent.config import Settings
+
+    processor = Mock()
+    built = Mock(return_value=processor)
+    providers = []
+    monkeypatch.setattr(agent, "LiveKitLangSmithSpanProcessor", built)
+    monkeypatch.setattr(agent.livekit_telemetry, "set_tracer_provider", providers.append)
+    configured = Settings(
+        _env_file=None,
+        LANGSMITH_API_KEY="synthetic-key",
+        LANGSMITH_PROJECT="interview-agent",
+        LANGSMITH_ENDPOINT="https://ls.example.com/api/v1",
+    )
+    assert agent.langsmith_voice_processor(configured) is processor
+    assert built.call_args.kwargs == {
+        "api_key": "synthetic-key",
+        "project": "interview-agent",
+        "endpoint": "https://ls.example.com/api/v1/otel/v1/traces",
+        "recording_mode": "session_report",
+    }
+    (provider,) = providers
+    # Never the OTel global: nothing else starts exporting through it.
+    assert otel_trace.get_tracer_provider() is not provider
+    tracer = provider.get_tracer("livekit-agents")
+    root = tracer.start_span("job_entrypoint")
+    with otel_trace.use_span(root):
+        tracer.start_span("agent_session").end()
+    processor.force_flush.assert_not_called()
+    # LiveKit ends the root as the job process exits: it (and its recording)
+    # is sent then, not on the batch exporter's timer.
+    root.end()
+    processor.force_flush.assert_called_once_with(10_000)
+    provider.shutdown()
 
 
 class LocalEndOfTurnDetector:

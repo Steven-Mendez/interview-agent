@@ -8,15 +8,18 @@ from __future__ import annotations
 
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import HumanMessage, SystemMessage
-from langsmith import tracing_context
+from langsmith import traceable
 
 from interview_agent.config import Settings
 from interview_agent.interview.context import SOURCE_RULE, source_block, validate_source_documents
 from interview_agent.interview.models import InterviewLength, InterviewPlan, Seniority
 from interview_agent.llm import build_chat_model, close_chat_model
+from interview_agent.observability import traced_inputs
 from interview_agent.prompts import build_planner_prompt
 
 
+# One root per planning, so a failed attempt and its repair share a trace.
+@traceable(name="planner", process_inputs=traced_inputs)
 async def run_planner(
     settings: Settings,
     resume_markdown: str,
@@ -87,10 +90,7 @@ async def run_planner(
         ]
         for attempt in range(2):
             try:
-                # Automatic LangSmith capture is disabled: our observer exports this call
-                # inside the interview trace instead of a separate one.
-                with tracing_context(enabled=False):
-                    result = await llm.ainvoke(messages, config=config)
+                result = await llm.ainvoke(messages, config=config)
                 if not isinstance(result, InterviewPlan):
                     raise TypeError(
                         f"Planner returned {type(result).__name__}, expected InterviewPlan"

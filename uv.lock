@@ -970,7 +970,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "langchain-openai", specifier = ">=1.3.3" },
     { name = "langgraph", specifier = ">=1.2.7" },
-    { name = "langsmith", extras = ["livekit"], specifier = ">=0.12.4" },
+    { name = "langsmith", extras = ["livekit"], specifier = ">=0.14.1,<0.15" },
     { name = "livekit-agents", specifier = "==1.8.3" },
     { name = "livekit-plugins-langchain", specifier = ">=1.6.6" },
     { name = "livekit-plugins-silero", specifier = ">=1.6.6" },

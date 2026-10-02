@@ -45,8 +45,6 @@ from interview_agent.observability import (
     Telemetry,
     content_hash,
     execution_config,
-    interview_trace_id,
-    send_trace_feedback,
 )
 from interview_agent.playback import PlaybackAck, acknowledge_playback, closing_state
 from interview_agent.prompts import DEFAULT_SENIORITY, fit_length, followup_budget, length_for
@@ -161,10 +159,6 @@ async def record_response_onset(request: Request, interview_id: uuid.UUID, body:
             "length": config.get("interview_length", "unknown"),
             "model": (config.get("models") or {}).get("interviewer", {}).get("model", "unknown"),
         },
-    )
-    # Also on the interview's LangSmith trace, without delaying the browser.
-    send_trace_feedback(
-        _sessionmaker(request), settings, interview_id, "response_onset_seconds", body.seconds
     )
     return {"accepted": True}
 
@@ -858,24 +852,11 @@ async def _plan_and_persist(
 
         planner_usage = UsageMetadataCallbackHandler()
         telemetry = Telemetry(
-            _sessionmaker(request),
             conversation_id,
-            settings,
             run_config,
             defer_dimensions=requested_seniority is None,
             process="planner",
             thread_of=repeat_of_id,
-            # The interview's inputs; also the root's, the planner registers it.
-            inputs={
-                "resume_markdown": resume_markdown,
-                "resume_filename": resume_filename,
-                "job_offer": job_offer,
-                "interviewer": interviewer,
-                "requested_seniority": requested_seniority.value if requested_seniority else None,
-                "interview_length": length.value,
-                "max_minutes": max_minutes,
-                "question_limit": question_limit,
-            },
         )
         observer = LLMObserver(
             telemetry, "planner", settings.planner_model, settings.planner_reasoning_effort
@@ -895,6 +876,7 @@ async def _plan_and_persist(
                 usage_callback=planner_usage,
                 question_limit=question_limit,
                 telemetry_callback=observer,
+                langsmith_extra={"metadata": telemetry.trace_metadata()},
             )
             if requested_seniority is None and (
                 plan.detected_seniority is None or not plan.seniority_evidence
@@ -905,17 +887,8 @@ async def _plan_and_persist(
                     "seniority": (requested_seniority or plan.detected_seniority).value,
                 }
             )
-            telemetry.set_outputs(plan)
-            telemetry.annotate(
-                outcome="planned",
-                milestones=len(plan.milestones),
-                question_limit=min(question_limit, len(plan.milestones)),
-                seniority_source="explicit" if requested_seniority else "detected",
-            )
         except Exception as exc:
             logger.exception("planning failed for %s", conversation_id)
-            telemetry.annotate(outcome="error")
-            telemetry.set_outputs({"error": type(exc).__name__, "detail": str(exc)})
             await db.set_status(session, conversation_id, "error")
             # The attempts inside with_retry were real spend even though no
             # plan came out of them.
@@ -1066,7 +1039,7 @@ async def get_interview(request: Request, interview_id: uuid.UUID):
         if conversation.status in ("interviewing", "closing"):
             await reconcile_interview(session, interview_id, settings)
             await session.refresh(conversation)
-        body = _serialize(
+        return _serialize(
             conversation,
             await session.scalar(select(func.clock_timestamp())),
             evaluation_invalid=await result_invalid(
@@ -1075,35 +1048,6 @@ async def get_interview(request: Request, interview_id: uuid.UUID):
                 conversation.evaluation.result if conversation.evaluation else None,
             ),
         )
-        body["langsmith_url"], body["langsmith_voice_urls"] = await _trace_urls(
-            request, session, interview_id
-        )
-        return body
-
-
-async def _trace_urls(
-    request: Request, session, interview_id: uuid.UUID
-) -> tuple[str | None, list[str]]:
-    """Links to the interview's LangSmith trace and its voice sessions (one per
-    worker run: a resumed interview has several) while exported, not retired."""
-    links = getattr(request.app.state, "trace_links", None)
-    if links is None or links.base is None:
-        return None, []
-    traces = list(
-        await session.scalars(
-            select(db.ExternalTrace)
-            .where(
-                db.ExternalTrace.conversation_id == interview_id,
-                db.ExternalTrace.state == "active",
-            )
-            .order_by(db.ExternalTrace.created_at)
-        )
-    )
-    interview = interview_trace_id(interview_id)
-    return (
-        links.url(interview) if any(t.id == interview for t in traces) else None,
-        [links.url(t.id) for t in traces if t.id != interview],
-    )
 
 
 @router.get("/interviews/{interview_id}/evaluations")

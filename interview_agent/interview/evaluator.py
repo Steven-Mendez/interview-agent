@@ -11,7 +11,7 @@ from typing import Any
 
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import HumanMessage, SystemMessage
-from langsmith import tracing_context
+from langsmith import traceable
 
 from interview_agent.config import Settings
 from interview_agent.interview.context import SOURCE_RULE, source_block, validate_source_documents
@@ -22,9 +22,12 @@ from interview_agent.interview.evaluation_contract import (
 )
 from interview_agent.interview.models import EvaluationResult, Seniority
 from interview_agent.llm import build_chat_model, close_chat_model
+from interview_agent.observability import traced_inputs
 from interview_agent.prompts import build_evaluator_prompt
 
 
+# One root per evaluation, so a failed attempt and its repair share a trace.
+@traceable(name="evaluator", process_inputs=traced_inputs)
 async def run_evaluator(
     settings: Settings,
     resume_markdown: str,
@@ -123,8 +126,7 @@ async def run_evaluator(
         messages = [SystemMessage(content=system), HumanMessage(content=content)]
         for attempt in range(2):
             try:
-                with tracing_context(enabled=False):
-                    result = await llm.ainvoke(messages, config=config)
+                result = await llm.ainvoke(messages, config=config)
                 if not isinstance(result, EvaluationResult):
                     raise TypeError(
                         f"Evaluator returned {type(result).__name__}, expected EvaluationResult"

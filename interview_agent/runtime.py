@@ -19,7 +19,7 @@ from sqlalchemy import text
 from interview_agent.interview import db
 from interview_agent.llm import build_chat_model, close_chat_model
 
-EXPECTED_REVISION = "dad9ce0068bd"
+EXPECTED_REVISION = "2d4e8adaf02e"
 ROOT = Path(__file__).resolve().parents[1]
 FIELDS = (
     "planner_model",
@@ -50,7 +50,6 @@ SOURCES = (
     "interview_agent/server/evaluations.py",
     "interview_agent/closing.py",
     "interview_agent/stt_drain.py",
-    "interview_agent/privacy.py",
     "interview_agent/runtime.py",
     "interview_agent/prompts.py",
     "interview_agent/voices.py",
@@ -133,9 +132,10 @@ async def process_manifest(settings, role: str, *, config=None, functions=()) ->
         "disk_artifact_hashes": {
             name: hashlib.sha256((ROOT / name).read_bytes()).hexdigest() for name in SOURCES
         },
+        # Unwrapped: a @traceable function's own code, not LangSmith's wrapper.
         "loaded_callable_hashes": {
             function.__module__ + "." + function.__qualname__: hashlib.sha256(
-                marshal.dumps(function.__code__)
+                marshal.dumps(inspect.unwrap(function).__code__)
             ).hexdigest()
             for function in functions
         },

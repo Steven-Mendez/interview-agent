@@ -14,7 +14,6 @@ from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai.chat_models.base import OpenAIRefusalError
 from langgraph.graph import END, START, StateGraph
-from langsmith import tracing_context
 from livekit.agents import llm
 from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS
 from openai import APIError
@@ -65,35 +64,6 @@ class DialogueState(TypedDict, total=False):
     reload_required: bool
     lease: TurnLease
     initial_reservation: InvocationReservation | None
-
-
-_CLOSE_REASONS = frozenset(
-    {"plan_complete", "plan_exhausted", "timeout", "candidate_requested", "question_limit"}
-)
-
-
-# Live coordination objects in the graph state, not part of a node's result.
-_RUNTIME_KEYS = frozenset({"lease", "initial_reservation"})
-
-
-def _node_facts(state: dict, result: dict | None) -> dict:
-    """Categorical facts about a graph node, as filterable trace metadata.
-    The node's content (decision, spoken text, errors) goes in its outputs."""
-    result = result or {}
-    decision = result.get("decision") or {}
-    facts = {}
-    if decision.get("action") in ("question", "clarification", "followup", "advance", "close"):
-        facts["action"] = decision["action"]
-    if decision.get("close_reason") in _CLOSE_REASONS:
-        facts["close_reason"] = decision["close_reason"]
-    if "error" in result:
-        facts["validation_failed"] = bool(result["error"])
-    attempts = result.get("attempts", state.get("attempts"))
-    if isinstance(attempts, int):
-        facts["attempts"] = attempts
-    if result.get("replayed"):
-        facts["replayed"] = True
-    return facts
 
 
 def _question_key(text: str) -> str:
@@ -310,18 +280,8 @@ class DialogueController:
     def _timed(self, name, function):
         async def run(state):
             start = time.monotonic()
-            inputs = {"turn_id": state["turn_id"], "attempts": state.get("attempts")}
-            if name in ("validate", "persist"):
-                inputs["decision"] = state.get("decision")
             try:
-                async with self.telemetry.span("graph." + name, inputs) as span_id:
-                    result = await function(state)
-                    self.telemetry.annotate_span(span_id, **_node_facts(state, result))
-                    self.telemetry.span_outputs(
-                        span_id,
-                        {k: v for k, v in (result or {}).items() if k not in _RUNTIME_KEYS},
-                    )
-                    return result
+                return await function(state)
             finally:
                 self.telemetry.emit(
                     "graph", name + "_seconds", time.monotonic() - start, turn_id=state["turn_id"]
@@ -474,14 +434,13 @@ class DialogueController:
                     telemetry_callback=observer,
                 )
                 structured = model.with_structured_output(TurnDecision, method="json_schema")
-                with tracing_context(enabled=False):
-                    result = await structured.ainvoke(
-                        [
-                            SystemMessage(content=system),
-                            HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
-                        ],
-                        config={"callbacks": [usage, observer]},
-                    )
+                result = await structured.ainvoke(
+                    [
+                        SystemMessage(content=system),
+                        HumanMessage(content=json.dumps(payload, ensure_ascii=False)),
+                    ],
+                    config={"callbacks": [usage, observer]},
+                )
             if not isinstance(result, TurnDecision):
                 raise ValueError("Expected a structured TurnDecision")
             outcome = "returned"
@@ -677,15 +636,19 @@ class DialogueController:
             self.telemetry.emit("dialogue", "invocations_reserved", 1, turn_id=turn_id)
         try:
             async with asyncio.timeout(lease.remaining_seconds):
-                with tracing_context(enabled=False):
-                    return await self.graph.ainvoke(
-                        {
-                            "turn_id": turn_id,
-                            "lease": lease,
-                            "initial_reservation": lease.initial_reservation,
-                        },
-                        config={"recursion_limit": 64},
-                    )
+                return await self.graph.ainvoke(
+                    {
+                        "turn_id": turn_id,
+                        "lease": lease,
+                        "initial_reservation": lease.initial_reservation,
+                    },
+                    config={
+                        "recursion_limit": 64,
+                        # Each turn is a root in the interview's LangSmith Thread.
+                        "run_name": "dialogue_turn",
+                        "metadata": self.telemetry.trace_metadata(turn_id=turn_id),
+                    },
+                )
         except TimeoutError as exc:
             raise TurnDecisionError(
                 DecisionLimitError("Interview decision deadline exhausted"), lease

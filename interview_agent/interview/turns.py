@@ -17,6 +17,10 @@ from interview_agent.interview import db
 DECISION_SECONDS = 15
 QUEUE_SECONDS = 30
 WAITER_SECONDS = 3
+# How long a confirmed capture may wait for its own claim. Capture precedes
+# the chat message that claims it, so a later turn briefly yields to it; a
+# voice reply cancelled before claiming never arrives, and must not block.
+CLAIM_GRACE_SECONDS = 5
 MAX_INVOCATIONS = 2
 CLEANUP_SECONDS = 1
 logger = logging.getLogger(__name__)
@@ -207,7 +211,7 @@ class TurnCoordinator:
                     item.status = "idle"
             if execution.status == "failed":
                 failure = DecisionLimitError("Interview decision budget or deadline exhausted")
-            elif execution.status == "applied":
+            elif execution.status in ("applied", "superseded"):
                 return True, None
             else:
                 running = any(item.status == "running" for item in executions)
@@ -216,13 +220,25 @@ class TurnCoordinator:
                 for capture in captures:
                     if capture.capture_order >= capture_order.get(turn_id, 0):
                         break
-                    prior = next((e for e in executions if e.turn_id == capture.turn_id), None)
                     message = await session.get(db.Message, capture.message_id)
-                    if (message.metrics or {}).get("stt_confirmed") is True and (
-                        prior is None or prior.status not in ("failed", "applied")
-                    ):
+                    if (message.metrics or {}).get("stt_confirmed") is not True:
+                        continue
+                    prior = next((e for e in executions if e.turn_id == capture.turn_id), None)
+                    if prior is None:
+                        # Its claim may still be on the way, but only briefly.
+                        if (now - capture.captured_at).total_seconds() < CLAIM_GRACE_SECONDS:
+                            earlier_pending = True
+                            break
+                    elif prior.status in ("queued", "running"):
                         earlier_pending = True
                         break
+                    elif prior.status == "idle":
+                        # Claimed, then left with nobody waiting: the voice
+                        # session moved on (the candidate kept talking over a
+                        # pending reply, or answered a technical notice). The
+                        # later turn decides with this one in its transcript,
+                        # so it is superseded rather than awaited forever.
+                        prior.status = "superseded"
                 if (
                     not running
                     and not earlier_pending
@@ -454,7 +470,7 @@ class TurnCoordinator:
             )
             if (
                 execution is None
-                or execution.status == "applied"
+                or execution.status in ("applied", "superseded")
                 or execution.last_owner_id is not None
                 or execution.notice_claimed_at is not None
             ):

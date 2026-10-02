@@ -260,6 +260,52 @@ async def test_capture_order_precedes_delayed_chat_message_claims(postgres_sessi
     assert second and second.initial_reservation.ordinal == 1
 
 
+async def test_abandoned_earlier_turn_is_superseded_not_awaited(postgres_sessionmaker):
+    """A reply cancelled because the candidate kept talking is never retried:
+    the voice session answers the newer turn. Its idle execution must not hold
+    the queue until the timeout notice."""
+    interview_id = await seed(postgres_sessionmaker)
+    worker = WorkerCoordinator(interview_id, postgres_sessionmaker)
+    await worker.claim()
+    await admit(worker.sessionmaker, interview_id, source="a", metrics=proof(turn_id="a"))
+    turns = TurnCoordinator(interview_id, worker.sessionmaker)
+    first = await turns.claim("a")
+    await turns.release(first)  # cancelled mid-decision, nobody waiting
+    await admit(worker.sessionmaker, interview_id, source="b", metrics=proof(turn_id="b"))
+
+    finished, second = await turns._claim_once("b", uuid.uuid4())
+
+    assert finished and second is not None
+    async with worker.sessionmaker() as session:
+        earlier = await session.get(db.TurnExecution, first.execution_id)
+        assert earlier.status == "superseded"
+    # Should the abandoned turn be claimed again, it is done: no model call
+    # and no technical notice for it.
+    assert await turns._claim_once("a", uuid.uuid4()) == (True, None)
+    assert not await turns.claim_queue_notice("a")
+
+
+async def test_unclaimed_earlier_capture_only_blocks_within_the_grace(postgres_sessionmaker):
+    interview_id = await seed(postgres_sessionmaker)
+    worker = WorkerCoordinator(interview_id, postgres_sessionmaker)
+    await worker.claim()
+    await admit(worker.sessionmaker, interview_id, source="a", metrics=proof(turn_id="a"))
+    await admit(worker.sessionmaker, interview_id, source="b", metrics=proof(turn_id="b"))
+    turns = TurnCoordinator(interview_id, worker.sessionmaker)
+    # "a" was cancelled before it ever claimed: past the grace it is not
+    # coming, and "b" goes ahead.
+    async with worker.sessionmaker() as session:
+        capture = await session.scalar(
+            select(db.CapturedTurn).where(db.CapturedTurn.turn_id == "a")
+        )
+        capture.captured_at = capture.captured_at - timedelta(seconds=30)
+        await session.commit()
+
+    finished, lease = await turns._claim_once("b", uuid.uuid4())
+
+    assert finished and lease is not None
+
+
 async def test_unfenced_coordinator_rejects_displaced_producer(postgres_sessionmaker):
     from interview_agent.interview.turns import TurnOwnershipError
 

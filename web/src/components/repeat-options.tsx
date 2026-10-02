@@ -1,7 +1,23 @@
 import * as React from "react"
 
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Field, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
 import { LENGTH_LABELS } from "@/lib/api"
 import type { Interview, InterviewLength, RepeatRequest } from "@/lib/api"
 
@@ -25,10 +41,13 @@ export function RepeatOptions({
   interview,
   pending,
   onRepeat,
+  footer,
 }: {
   interview: Interview
   pending: boolean
   onRepeat: (body: RepeatRequest) => void
+  /** Extra actions next to the submit button (e.g. a dialog's Cancel). */
+  footer?: React.ReactNode
 }) {
   const [length, setLength] = React.useState<InterviewLength>(
     interview.interview_length
@@ -49,61 +68,110 @@ export function RepeatOptions({
         Number(followups) <= 2
       ))
   return (
-    <details className="w-full rounded-xl border p-3 text-left text-sm">
-      <summary className="cursor-pointer">Repeat with changes…</summary>
-      <form
-        className="mt-3 grid gap-3 @xl/main:grid-cols-3"
-        onSubmit={(event) => {
-          event.preventDefault()
-          if (!invalid)
-            onRepeat(repeatBody(interview, length, questions, followups))
-        }}
-      >
-        <label className="flex flex-col gap-1">
-          <span className="text-xs text-muted-foreground">Duration</span>
-          <select
-            className="h-9 rounded-md border bg-background px-2"
-            value={length}
-            onChange={(event) =>
-              setLength(event.target.value as InterviewLength)
-            }
-          >
+    <form
+      className="flex flex-col gap-5 text-left"
+      onSubmit={(event) => {
+        event.preventDefault()
+        if (!invalid)
+          onRepeat(repeatBody(interview, length, questions, followups))
+      }}
+    >
+      <Field>
+        <FieldLabel htmlFor="repeat-length">Duration</FieldLabel>
+        <Select
+          value={length}
+          onValueChange={(next) => next && setLength(next)}
+        >
+          <SelectTrigger id="repeat-length" className="w-full">
+            <SelectValue>
+              {(value: InterviewLength) => LENGTH_LABELS[value]}
+            </SelectValue>
+          </SelectTrigger>
+          <SelectContent>
             {(Object.keys(LENGTH_LABELS) as InterviewLength[]).map((value) => (
-              <option key={value} value={value}>
+              <SelectItem key={value} value={value}>
                 {LENGTH_LABELS[value]}
-              </option>
+              </SelectItem>
             ))}
-          </select>
-        </label>
-        <label className="flex flex-col gap-1">
-          <span className="text-xs text-muted-foreground">
+          </SelectContent>
+        </Select>
+      </Field>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Field>
+          <FieldLabel htmlFor="repeat-questions">
             Main questions (1–12, blank = profile)
-          </span>
+          </FieldLabel>
           <Input
+            id="repeat-questions"
             inputMode="numeric"
             value={questions}
+            aria-invalid={
+              questions.trim() !== "" &&
+              !(Number(questions) >= 1 && Number(questions) <= 12)
+            }
             onChange={(event) => setQuestions(event.target.value)}
           />
-        </label>
-        <label className="flex flex-col gap-1">
-          <span className="text-xs text-muted-foreground">
+        </Field>
+        <Field>
+          <FieldLabel htmlFor="repeat-followups">
             Follow-ups per topic (0–2, blank = profile)
-          </span>
+          </FieldLabel>
           <Input
+            id="repeat-followups"
             inputMode="numeric"
             value={followups}
             onChange={(event) => setFollowups(event.target.value)}
           />
-        </label>
-        <p className="text-xs text-muted-foreground @xl/main:col-span-2">
-          Same duration keeps the saved limits unless you change them; a new
-          duration recalculates them first. The final values are shown before
-          you start.
-        </p>
+        </Field>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Same duration keeps the saved limits unless you change them; a new
+        duration recalculates them first. The final values are shown before you
+        start.
+      </p>
+      <DialogFooter>
+        {footer}
         <Button type="submit" disabled={pending || invalid}>
           {pending ? "Planning…" : "Repeat with these settings"}
         </Button>
-      </form>
-    </details>
+      </DialogFooter>
+    </form>
+  )
+}
+
+/** "Repeat with changes…" as a dialog: same role and resume, new limits. */
+export function RepeatOptionsDialog({
+  open,
+  onOpenChange,
+  interview,
+  pending,
+  onRepeat,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+  interview: Interview
+  pending: boolean
+  onRepeat: (body: RepeatRequest) => void
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="[--dialog-width:32rem]">
+        <DialogTitle>Repeat with changes</DialogTitle>
+        <DialogDescription>
+          Plans a new interview from the same resume and job offer. Leave a
+          field blank to keep what the profile decides.
+        </DialogDescription>
+        <RepeatOptions
+          interview={interview}
+          pending={pending}
+          onRepeat={onRepeat}
+          footer={
+            <DialogClose render={<Button type="button" variant="ghost" />}>
+              Cancel
+            </DialogClose>
+          }
+        />
+      </DialogContent>
+    </Dialog>
   )
 }

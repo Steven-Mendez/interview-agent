@@ -25,12 +25,17 @@ export interface DevicePreview {
   outputSelectable: boolean
   /** True only while the live stream carries a video track. */
   cameraOn: boolean
+  /** The camera was asked for: with `cameraOn` still false and no error,
+   *  it is starting. */
+  cameraWanted: boolean
   /** Smoothed 0..1 input level of the selected microphone. */
   level: number
   /** The live preview stream, for the <video> self-view. */
   stream: MediaStream | null
-  /** Ask for permission and open the preview. Safe to call again. */
-  request: () => void
+  /** Ask for permission and open the preview. Safe to call again.
+   *  `camera` sets whether the camera opens with it (one prompt for both,
+   *  the way a call's pre-join screen asks); omitted keeps the choice. */
+  request: (camera?: boolean) => void
   selectMic: (id: string) => void
   selectCam: (id: string) => void
   toggleCamera: () => void
@@ -88,6 +93,7 @@ export function useDevicePreview(): DevicePreview {
   const [micId, setMicId] = React.useState("")
   const [camId, setCamId] = React.useState("")
   const [cameraOn, setCameraOn] = React.useState(false)
+  const [cameraWanted, setCameraWanted] = React.useState(false)
   const [level, setLevel] = React.useState(0)
   const [stream, setStream] = React.useState<MediaStream | null>(null)
 
@@ -98,6 +104,10 @@ export function useDevicePreview(): DevicePreview {
   // stream actually carries: a camera that failed to open reads as off, but
   // the next "Turn on" still knows there is nothing to undo.
   const wantCameraRef = React.useRef(false)
+  const setWantCamera = React.useCallback((value: boolean) => {
+    wantCameraRef.current = value
+    setCameraWanted(value)
+  }, [])
   // Every open() takes a new generation; a request still in flight when the
   // generation moves on (a newer pick, a release, unmount) is stale: its
   // stream is stopped the moment it arrives and it touches no state. Without
@@ -110,6 +120,9 @@ export function useDevicePreview(): DevicePreview {
   // Whether releaseMic actually stopped a live audio track — the only case
   // reclaimMic has anything to restore.
   const releasedRef = React.useRef(false)
+  // Set from releaseMic until reclaimMic: LiveKit owns the microphone, so a
+  // camera switched on or off during the interview reopens video only.
+  const micHandedOverRef = React.useRef(false)
 
   const stopMeter = React.useCallback(() => {
     if (meterRef.current) clearInterval(meterRef.current)
@@ -122,6 +135,7 @@ export function useDevicePreview(): DevicePreview {
   const stop = React.useCallback(() => {
     generationRef.current += 1
     releasedRef.current = false
+    micHandedOverRef.current = false
     stopMeter()
     streamRef.current?.getTracks().forEach((track) => track.stop())
     streamRef.current = null
@@ -185,7 +199,19 @@ export function useDevicePreview(): DevicePreview {
           )
           return
         }
-        setStatus((current) => (current === "ready" ? current : "requesting"))
+        const withAudio = !micHandedOverRef.current
+        if (!withAudio && !wantCamera) {
+          // Camera off while the interview holds the microphone: drop the
+          // video and leave everything else as it is.
+          streamRef.current?.getTracks().forEach((track) => track.stop())
+          streamRef.current = null
+          setStream(null)
+          setCameraOn(false)
+          setError(null)
+          return
+        }
+        if (withAudio)
+          setStatus((current) => (current === "ready" ? current : "requesting"))
         setError(null)
 
         const audio: MediaTrackConstraints | boolean = nextMicId
@@ -202,10 +228,20 @@ export function useDevicePreview(): DevicePreview {
         try {
           try {
             next = await media.getUserMedia({
-              audio,
+              audio: withAudio ? audio : false,
               video: wantCamera ? video : false,
             })
           } catch (err) {
+            if (!withAudio) {
+              // Video only: the microphone is not part of this request, so
+              // the failure is the camera's alone.
+              if (stale()) return
+              console.error("[app] camera preview failed:", err)
+              setWantCamera(false)
+              setCameraOn(false)
+              setError(messageFor(err, "camera"))
+              return
+            }
             if (!wantCamera || stale()) throw err
             // One request, one rejection: which of the two devices failed is
             // not in the error. Asking for audio alone tells them apart and
@@ -238,15 +274,17 @@ export function useDevicePreview(): DevicePreview {
         streamRef.current = next
         releasedRef.current = false
         setStream(next)
-        startMeter(next)
-        setStatus("ready")
+        if (withAudio) {
+          startMeter(next)
+          setStatus("ready")
+        }
         // On only when a video track actually opened — never the intent
         // alone, or a failed camera would keep the self-view (a black box
         // over an audio-only stream) and put video back into every later
         // microphone switch.
         const hasVideo = next.getVideoTracks().length > 0
         setCameraOn(hasVideo)
-        if (cameraError) wantCameraRef.current = false
+        if (cameraError) setWantCamera(false)
         setError(cameraError)
 
         // Labels are only populated once permission is granted, so the
@@ -266,12 +304,16 @@ export function useDevicePreview(): DevicePreview {
         )
       })()
     },
-    [startMeter, outputSelectable]
+    [startMeter, outputSelectable, setWantCamera]
   )
 
-  const request = React.useCallback(() => {
-    open(micId, camId, wantCameraRef.current)
-  }, [open, micId, camId])
+  const request = React.useCallback(
+    (camera?: boolean) => {
+      if (camera !== undefined) setWantCamera(camera)
+      open(micId, camId, camera ?? wantCameraRef.current)
+    },
+    [open, micId, camId, setWantCamera]
+  )
 
   const selectMic = React.useCallback(
     (id: string) => {
@@ -284,19 +326,19 @@ export function useDevicePreview(): DevicePreview {
   const selectCam = React.useCallback(
     (id: string) => {
       setCamId(id)
-      wantCameraRef.current = true
+      setWantCamera(true)
       open(micId, id, true)
     },
-    [open, micId]
+    [open, micId, setWantCamera]
   )
 
   const selectSpeaker = React.useCallback((id: string) => setSpeakerId(id), [])
 
   const toggleCamera = React.useCallback(() => {
     const next = !wantCameraRef.current
-    wantCameraRef.current = next
+    setWantCamera(next)
     open(micId, camId, next)
-  }, [open, micId, camId])
+  }, [open, micId, camId, setWantCamera])
 
   const releaseMic = React.useCallback(() => {
     // A prompt still pending would deliver its stream after the hand-over:
@@ -308,11 +350,13 @@ export function useDevicePreview(): DevicePreview {
     releasedRef.current = audioTracks.some(
       (track) => track.readyState === "live"
     )
+    micHandedOverRef.current = true
     audioTracks.forEach((track) => track.stop())
     stopMeter()
   }, [stopMeter])
 
   const reclaimMic = React.useCallback(() => {
+    micHandedOverRef.current = false
     if (!releasedRef.current) return
     releasedRef.current = false
     open(micId, camId, wantCameraRef.current)
@@ -326,6 +370,10 @@ export function useDevicePreview(): DevicePreview {
     return () => {
       disposedRef.current = true
       generationRef.current += 1
+      // The prompt that was pending is now stale and will never settle the
+      // status: back to idle, so a remount (StrictMode's mount/unmount/
+      // mount in development) can ask again instead of waiting forever.
+      setStatus((current) => (current === "requesting" ? "idle" : current))
       if (meterRef.current) clearInterval(meterRef.current)
       meterRef.current = null
       void audioContextRef.current?.close().catch(() => {})
@@ -345,6 +393,7 @@ export function useDevicePreview(): DevicePreview {
     speakerId,
     outputSelectable,
     cameraOn,
+    cameraWanted,
     level,
     stream,
     request,

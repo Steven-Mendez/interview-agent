@@ -2,7 +2,10 @@ import { useState } from "react"
 import { useQuery } from "@tanstack/react-query"
 import { getEvaluationHistory } from "@/lib/api"
 import type { Milestone } from "@/lib/api"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Disclosure } from "@/components/ui/disclosure"
+import { Spinner } from "@/components/ui/spinner"
 import { CriterionFeedback, EvaluationOutcome } from "./evaluation-feedback"
 
 type History = Awaited<ReturnType<typeof getEvaluationHistory>>
@@ -41,37 +44,56 @@ export function EvaluationHistory({
         : false,
   })
   return (
-    <details
-      className="rounded-xl border p-4"
+    <Disclosure
+      summary="Evaluation history"
       onToggle={(event) => setOpen(event.currentTarget.open)}
+      bodyClassName="flex flex-col gap-4"
     >
-      <summary className="cursor-pointer font-medium">
-        Evaluation history
-      </summary>
       {query.isError && (
-        <div className="mt-3">
-          <p role="alert">Evaluation history could not be loaded.</p>
-          <Button variant="outline" onClick={() => void query.refetch()}>
+        <div className="flex flex-wrap items-center gap-3">
+          <p role="alert" className="text-destructive">
+            Evaluation history could not be loaded.
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void query.refetch()}
+          >
             Reload history
           </Button>
         </div>
       )}
-      {open && query.isPending && <p>Loading evaluation history…</p>}
+      {open && query.isPending && (
+        <p className="flex items-center gap-2 text-muted-foreground">
+          <Spinner />
+          Loading evaluation history…
+        </p>
+      )}
       {query.data?.requests.map((request, index) => (
-        <div key={request.id} className="mt-4 text-sm">
-          <p className="font-medium">
-            Assessment {index + 1} ·{" "}
-            {request.id === query.data.current_request_id
-              ? "Current request"
-              : "Earlier request"}
+        <div key={request.id} className="flex flex-col gap-1 text-sm">
+          <p className="flex flex-wrap items-center gap-2 font-medium">
+            Assessment {index + 1}
+            <Badge
+              variant={
+                request.id === query.data.current_request_id
+                  ? "default"
+                  : "secondary"
+              }
+            >
+              {request.id === query.data.current_request_id
+                ? "Current request"
+                : "Earlier request"}
+            </Badge>
           </p>
-          <p>
+          <p className="text-muted-foreground">
             {request.automatic ? "Automatic" : "Requested manually"} ·{" "}
             {STATUS_LABELS[request.status] ?? "Status unavailable"} ·{" "}
             {request.attempts} attempts
           </p>
           {request.seal_version != null && (
-            <p>Saved answers version {request.seal_version}</p>
+            <p className="text-muted-foreground">
+              Saved answers version {request.seal_version}
+            </p>
           )}
           {query.data.attempts
             .filter((attempt) => attempt.request_id === request.id)
@@ -87,11 +109,11 @@ export function EvaluationHistory({
       ))}
       {query.data?.requests.length === 0 &&
         query.data.attempts.length === 0 && (
-          <p className="mt-2 text-sm">
+          <p className="text-muted-foreground">
             No assessment history was recorded for this interview.
           </p>
         )}
-    </details>
+    </Disclosure>
   )
 }
 
@@ -106,8 +128,8 @@ function HistoricalAttempt({
 }) {
   const result = attempt.result
   return (
-    <details className="mt-3 rounded-lg border p-3">
-      <summary className="cursor-pointer">
+    <details className="mt-2 rounded-lg bg-muted px-3 py-2">
+      <summary className="text-label cursor-pointer py-1">
         {attempt.ordinal != null
           ? `Attempt ${attempt.ordinal}`
           : "Saved assessment"}
@@ -133,7 +155,7 @@ function HistoricalAttempt({
         </div>
       )}
       {attempt.error && (
-        <p className="mt-3">
+        <p className="mt-2 text-muted-foreground">
           This attempt could not produce a valid assessment.
         </p>
       )}
@@ -145,7 +167,7 @@ function FeedbackList({ title, items }: { title: string; items?: string[] }) {
   if (!items?.length) return null
   return (
     <div>
-      <p className="font-medium">{title}</p>
+      <p className="mb-1 font-medium">{title}</p>
       <ul className="list-disc space-y-1 pl-5">
         {items.map((item, index) => (
           <li key={index} className="whitespace-pre-wrap">

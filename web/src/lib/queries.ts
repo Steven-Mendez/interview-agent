@@ -61,3 +61,30 @@ export function transcriptQueryOptions(interviewId: string) {
     staleTime: Infinity,
   })
 }
+
+/** The newest interviews for the home screen, optionally one status only. */
+export function recentInterviewsQueryOptions(params: {
+  limit: number
+  status?: InterviewStatus
+}) {
+  return queryOptions({
+    queryKey: [
+      "interviews",
+      "recent",
+      { limit: params.limit, status: params.status ?? null },
+    ] as const,
+    queryFn: () =>
+      listInterviews({ limit: params.limit, status: params.status }),
+    staleTime: 10_000,
+  })
+}
+
+/** How many interviews are in a status — the page's `total`, one row read. */
+export function interviewCountQueryOptions(status?: InterviewStatus) {
+  return queryOptions({
+    queryKey: ["interviews", "count", status ?? null] as const,
+    queryFn: () => listInterviews({ limit: 1, status }),
+    select: (page) => page.total,
+    staleTime: 10_000,
+  })
+}

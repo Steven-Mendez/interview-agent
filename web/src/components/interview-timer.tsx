@@ -1,10 +1,14 @@
 import { useEffect, useRef, useState } from "react"
 
+import { cn } from "@/lib/utils"
+
 /** Display only. Interview deadlines remain authoritative in PostgreSQL. */
 export function InterviewTimer({
   elapsedSeconds,
+  className,
 }: {
   elapsedSeconds?: number | null
+  className?: string
 }) {
   const known =
     typeof elapsedSeconds === "number" &&
@@ -36,9 +40,15 @@ export function InterviewTimer({
           ? "Elapsed interview time unavailable"
           : "Elapsed interview time"
       }
-      className="ml-1 flex items-center gap-1.5 text-xs font-normal text-muted-foreground tabular-nums"
+      className={cn(
+        "flex items-center gap-2 font-heading text-sm font-medium tabular-nums",
+        className
+      )}
     >
-      <span className="size-1.5 animate-pulse rounded-full bg-primary" />
+      <span
+        aria-hidden
+        className="size-2 animate-pulse rounded-full bg-end-call"
+      />
       {display}
     </span>
   )

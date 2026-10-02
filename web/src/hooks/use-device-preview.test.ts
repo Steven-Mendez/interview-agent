@@ -1,4 +1,5 @@
 /** @vitest-environment jsdom */
+import * as React from "react"
 import { act, renderHook } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -99,6 +100,51 @@ describe("useDevicePreview", () => {
     expect(trackA.stop).toHaveBeenCalled()
     expect(result.current.stream).toBe(streamB)
     expect(result.current.micId).toBe("b")
+  })
+
+  it("asks for the camera and microphone in one prompt on request(true)", async () => {
+    const audio = fakeTrack("audio", "m")
+    const video = fakeTrack("video", "c")
+    getUserMedia.mockResolvedValueOnce(fakeStream([audio, video]))
+    const { result } = renderHook(() => useDevicePreview())
+
+    await act(async () => {
+      result.current.request(true)
+      await settle()
+    })
+    expect(getUserMedia).toHaveBeenCalledTimes(1)
+    expect(getUserMedia.mock.calls[0][0]).toEqual({ audio: true, video: true })
+    expect(result.current.status).toBe("ready")
+    expect(result.current.cameraWanted).toBe(true)
+    expect(result.current.cameraOn).toBe(true)
+  })
+
+  it("does not stay requesting when StrictMode cancels the first prompt", async () => {
+    const first = deferred<MediaStream>()
+    getUserMedia.mockReturnValueOnce(first.promise)
+    const { result } = renderHook(
+      () => {
+        const preview = useDevicePreview()
+        const asked = React.useRef(false)
+        // Asks straight from an effect, the way a mount-time check does.
+        React.useEffect(() => {
+          if (asked.current) return
+          asked.current = true
+          preview.request(true)
+        }, [preview])
+        return preview
+      },
+      { reactStrictMode: true }
+    )
+    const track = fakeTrack("audio", "m")
+    await act(async () => {
+      first.resolve(fakeStream([track]))
+      await settle()
+    })
+    // The cancelled prompt's stream is stopped, and the check is idle — free
+    // to be asked again — rather than waiting forever.
+    expect(track.stop).toHaveBeenCalled()
+    expect(result.current.status).toBe("idle")
   })
 
   it("stops a stream that arrives after unmount", async () => {
@@ -213,5 +259,56 @@ describe("useDevicePreview", () => {
     expect(track.stop).toHaveBeenCalled()
     expect(result.current.stream).toBeNull()
     expect(result.current.status).toBe("idle")
+  })
+
+  it("toggles only the camera once the microphone is handed over", async () => {
+    getUserMedia.mockResolvedValueOnce(fakeStream([fakeTrack("audio", "m")]))
+    const { result } = renderHook(() => useDevicePreview())
+    await act(async () => {
+      result.current.request()
+      await settle()
+    })
+    act(() => result.current.releaseMic())
+
+    const video = fakeTrack("video", "c")
+    getUserMedia.mockResolvedValueOnce(fakeStream([video]))
+    await act(async () => {
+      result.current.toggleCamera()
+      await settle()
+    })
+    expect(getUserMedia).toHaveBeenLastCalledWith({ audio: false, video: true })
+    expect(result.current.cameraOn).toBe(true)
+    expect(result.current.status).toBe("ready")
+
+    const calls = getUserMedia.mock.calls.length
+    await act(async () => {
+      result.current.toggleCamera()
+      await settle()
+    })
+    // Off needs no new capture: the video track is just stopped.
+    expect(getUserMedia.mock.calls.length).toBe(calls)
+    expect(video.stop).toHaveBeenCalled()
+    expect(result.current.cameraOn).toBe(false)
+    expect(result.current.stream).toBeNull()
+  })
+
+  it("reports a camera failure during the interview without touching audio", async () => {
+    getUserMedia.mockResolvedValueOnce(fakeStream([fakeTrack("audio", "m")]))
+    const { result } = renderHook(() => useDevicePreview())
+    await act(async () => {
+      result.current.request()
+      await settle()
+    })
+    act(() => result.current.releaseMic())
+
+    getUserMedia.mockRejectedValueOnce(domError("NotReadableError"))
+    await act(async () => {
+      result.current.toggleCamera()
+      await settle()
+    })
+    expect(getUserMedia).toHaveBeenCalledTimes(2)
+    expect(result.current.cameraOn).toBe(false)
+    expect(result.current.status).toBe("ready")
+    expect(result.current.error).toMatch(/camera is already in use/)
   })
 })

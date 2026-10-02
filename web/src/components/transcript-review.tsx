@@ -8,8 +8,24 @@ import {
 } from "@/lib/api"
 import type { IncidentDecision, SealHistory } from "@/lib/api"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
+import { Disclosure } from "@/components/ui/disclosure"
 import { Input } from "@/components/ui/input"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { Spinner } from "@/components/ui/spinner"
 import { Textarea } from "@/components/ui/textarea"
+
+const DECISION_LABELS: Record<IncidentDecision, string> = {
+  duplicate: "Already recorded",
+  post_cut: "Spoken after the interview ended",
+  omission: "Admitted answer missing from the saved recording",
+}
 
 export function TranscriptReview({ interviewId }: { interviewId: string }) {
   const [open, setOpen] = useState(false)
@@ -60,18 +76,28 @@ export function TranscriptReview({ interviewId }: { interviewId: string }) {
     },
   })
   return (
-    <details
-      className="rounded-xl border p-4"
+    <Disclosure
+      summary="Review saved answers"
       onToggle={(event) => setOpen(event.currentTarget.open)}
+      bodyClassName="flex flex-col gap-2"
     >
-      <summary className="cursor-pointer font-medium">
-        Review saved answers
-      </summary>
-      {open && query.isPending && <p>Loading saved versions…</p>}
-      {query.isError && <p role="alert">Saved versions could not be loaded.</p>}
+      {open && query.isPending && (
+        <p className="flex items-center gap-2 text-muted-foreground">
+          <Spinner />
+          Loading saved versions…
+        </p>
+      )}
+      {query.isError && (
+        <p role="alert" className="text-destructive">
+          Saved versions could not be loaded.
+        </p>
+      )}
       {query.data?.seals.map((seal) => (
-        <details key={seal.id} className="mt-3 text-sm">
-          <summary>
+        <details
+          key={seal.id}
+          className="rounded-lg bg-muted px-3 py-2 text-sm"
+        >
+          <summary className="text-label cursor-pointer py-1">
             Version {seal.version} ·{" "}
             {seal.integrity === "complete"
               ? "Complete recording"
@@ -80,7 +106,7 @@ export function TranscriptReview({ interviewId }: { interviewId: string }) {
           </summary>
           {seal.records.map((record) => (
             <p key={record.id} className="mt-2 whitespace-pre-wrap">
-              <strong>
+              <strong className="font-medium">
                 {record.role === "user" ? "Candidate" : "Interviewer"}:
               </strong>{" "}
               {record.content}
@@ -97,7 +123,7 @@ export function TranscriptReview({ interviewId }: { interviewId: string }) {
         />
       ))}
       {(omitted.length > 0 || pending.current) && (
-        <div className="mt-5 flex flex-col gap-3 border-t pt-4">
+        <div className="mt-3 flex flex-col gap-3 border-t pt-4">
           <p className="text-sm">
             Confirmed missing answers keep the earlier score hidden. A revised
             assessment includes them and preserves the earlier history.
@@ -116,12 +142,11 @@ export function TranscriptReview({ interviewId }: { interviewId: string }) {
             disabled={revised.isPending || !!pending.current}
             onChange={(event) => setRationale(event.target.value)}
           />
-          <label className="flex gap-2 text-sm">
-            <input
-              type="checkbox"
+          <label className="flex gap-3 text-sm">
+            <Checkbox
               checked={confirmed}
               disabled={revised.isPending || !!pending.current}
-              onChange={(event) => setConfirmed(event.target.checked)}
+              onCheckedChange={(checked) => setConfirmed(checked === true)}
             />
             I checked all audio admitted before the interview ended and confirm
             these saved answers are complete.
@@ -132,6 +157,7 @@ export function TranscriptReview({ interviewId }: { interviewId: string }) {
           </p>
           {revised.isError && <p role="alert">{revised.error.message}</p>}
           <Button
+            className="self-start"
             disabled={
               revised.isPending || !reviewer.trim() || !rationale.trim()
             }
@@ -144,11 +170,11 @@ export function TranscriptReview({ interviewId }: { interviewId: string }) {
         </div>
       )}
       {query.data?.seals.length === 0 && (
-        <p className="mt-3 text-sm">
+        <p className="text-muted-foreground">
           No version history was recorded for this interview.
         </p>
       )}
-    </details>
+    </Disclosure>
   )
 }
 
@@ -180,8 +206,8 @@ function IncidentReview({
     onSuccess: refresh,
   })
   return (
-    <div className="mt-4 flex flex-col gap-3 border-t pt-4 text-sm">
-      <p className="font-medium">Capture requiring review</p>
+    <div className="mt-3 flex flex-col gap-3 border-t pt-4 text-sm">
+      <p className="text-label">Capture requiring review</p>
       <p className="whitespace-pre-wrap">{incident.content}</p>
       {incident.review ? (
         <p>
@@ -192,23 +218,31 @@ function IncidentReview({
         </p>
       ) : (
         <>
-          <label>
-            Review decision
-            <select
-              className="ml-3 rounded border p-2"
+          <div className="flex flex-col gap-2">
+            <label htmlFor={`decision-${incident.id}`} className="text-label">
+              Review decision
+            </label>
+            <Select
               value={decision}
               disabled={mutation.isPending || !!pending.current}
-              onChange={(event) =>
-                setDecision(event.target.value as IncidentDecision)
-              }
+              onValueChange={(next) => next && setDecision(next)}
             >
-              <option value="duplicate">Already recorded</option>
-              <option value="post_cut">Spoken after the interview ended</option>
-              <option value="omission">
-                Admitted answer missing from the saved recording
-              </option>
-            </select>
-          </label>
+              <SelectTrigger id={`decision-${incident.id}`} className="w-full">
+                <SelectValue>
+                  {(value: IncidentDecision) => DECISION_LABELS[value]}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {(Object.keys(DECISION_LABELS) as IncidentDecision[]).map(
+                  (value) => (
+                    <SelectItem key={value} value={value}>
+                      {DECISION_LABELS[value]}
+                    </SelectItem>
+                  )
+                )}
+              </SelectContent>
+            </Select>
+          </div>
           <Input
             aria-label="Reviewer"
             placeholder="Your name"
@@ -229,6 +263,7 @@ function IncidentReview({
           </p>
           {mutation.isError && <p role="alert">{mutation.error.message}</p>}
           <Button
+            className="self-start"
             disabled={
               mutation.isPending || !reviewer.trim() || !rationale.trim()
             }

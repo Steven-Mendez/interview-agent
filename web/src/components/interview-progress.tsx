@@ -1,4 +1,7 @@
-import type { Interview, Milestone } from "@/lib/api"
+import { CheckIcon, SkipForwardIcon } from "lucide-react"
+
+import type { Milestone } from "@/lib/api"
+import { cn } from "@/lib/utils"
 
 export function topicState(milestone: Milestone) {
   return milestone.lifecycle ?? (milestone.completed ? "closed" : "pending")
@@ -15,78 +18,42 @@ const TOPIC_LABELS = {
   skipped: "Skipped",
 }
 
-export function TopicStatus({ milestone }: { milestone: Milestone }) {
+export function topicLabel(milestone: Milestone) {
+  return TOPIC_LABELS[topicState(milestone)]
+}
+
+/** The leading marker of a topic row: its number while pending, a live dot
+ *  while being asked, a check once closed, a skip glyph when skipped. The
+ *  label next to it always says the same in words. */
+export function TopicMarker({
+  milestone,
+  index,
+  className,
+}: {
+  milestone: Milestone
+  index: number
+  className?: string
+}) {
+  const state = topicState(milestone)
   return (
-    <span className="text-xs text-muted-foreground">
-      {TOPIC_LABELS[topicState(milestone)]}
+    <span
+      aria-hidden
+      className={cn(
+        "flex size-6 shrink-0 items-center justify-center rounded-full font-heading text-xs font-medium tabular-nums",
+        state === "pending" && "border border-border text-muted-foreground",
+        state === "active" && "bg-primary text-primary-foreground",
+        state === "closed" && "bg-success-container text-on-success-container",
+        state === "skipped" && "bg-muted text-muted-foreground",
+        className
+      )}
+    >
+      {state === "closed" ? (
+        <CheckIcon className="size-3.5" strokeWidth={3} />
+      ) : state === "skipped" ? (
+        <SkipForwardIcon className="size-3.5" />
+      ) : (
+        index + 1
+      )}
     </span>
-  )
-}
-
-function requested(
-  interview: Interview,
-  key: string,
-  effective: number | null
-) {
-  const value = interview.run_config?.[key]
-  return typeof value === "number" && effective !== null && value > effective
-    ? value
-    : null
-}
-
-export function InterviewLimits({ interview }: { interview: Interview }) {
-  const limits = [
-    [
-      "Main questions",
-      interview.question_limit,
-      requested(
-        interview,
-        "requested_question_limit",
-        interview.question_limit
-      ),
-      "one per planned topic",
-    ],
-    [
-      "Follow-ups per topic",
-      interview.followup_limit,
-      requested(
-        interview,
-        "requested_followup_limit",
-        interview.followup_limit
-      ),
-      "capped by level and length",
-    ],
-    [
-      "Time limit",
-      interview.max_minutes === null ? null : `${interview.max_minutes} min`,
-      null,
-      "",
-    ],
-  ] as const
-  return (
-    <div className="rounded-xl border bg-card p-4">
-      <h2 className="mb-3 text-sm font-medium">Interview limits</h2>
-      <dl className="grid grid-cols-3 gap-3 text-sm">
-        {limits.map(([label, value, asked, why]) => (
-          <div key={label}>
-            <dt className="text-xs text-muted-foreground">{label}</dt>
-            <dd className="mt-1 font-medium tabular-nums">
-              {value ?? "Not recorded"}
-            </dd>
-            {asked !== null && (
-              <dd className="mt-1 text-xs text-muted-foreground">
-                Requested {asked}; {why}.
-              </dd>
-            )}
-          </div>
-        ))}
-      </dl>
-      {interview.seniority_source === "detected" &&
-        interview.seniority_evidence && (
-          <p className="mt-3 text-xs text-muted-foreground">
-            Level detected from the offer: “{interview.seniority_evidence}”
-          </p>
-        )}
-    </div>
   )
 }

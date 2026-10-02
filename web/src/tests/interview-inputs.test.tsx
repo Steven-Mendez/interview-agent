@@ -88,7 +88,7 @@ describe("reviewed interview inputs", () => {
     })
     next()
     fireEvent.click(
-      await screen.findByRole("button", { name: "Start interview" })
+      await screen.findByRole("button", { name: "Prepare interview" })
     )
     await waitFor(() => expect(mocks.create).toHaveBeenCalledTimes(1))
     const payload = mocks.create.mock.calls[0][0] as FormData
@@ -134,7 +134,9 @@ describe("reviewed interview inputs", () => {
     })
     next()
     await screen.findByText("Use a whole number from 1 to 12, or leave blank.")
-    expect(screen.queryByRole("button", { name: "Start interview" })).toBeNull()
+    expect(
+      screen.queryByRole("button", { name: "Prepare interview" })
+    ).toBeNull()
     expect(mocks.create).not.toHaveBeenCalled()
   })
 })

@@ -2,6 +2,7 @@ import { QueryClient } from "@tanstack/react-query"
 import { createRouter as createTanStackRouter } from "@tanstack/react-router"
 import { setupRouterSsrQueryIntegration } from "@tanstack/react-router-ssr-query"
 
+import { RouteError, RoutePending } from "@/components/route-states"
 import { routeTree } from "./routeTree.gen"
 
 export function getRouter() {
@@ -14,6 +15,8 @@ export function getRouter() {
     scrollRestoration: true,
     defaultPreload: "intent",
     defaultPreloadStaleTime: 0,
+    defaultErrorComponent: RouteError,
+    defaultPendingComponent: RoutePending,
   })
 
   // Exposes `queryClient` on the router context (used by route loaders via

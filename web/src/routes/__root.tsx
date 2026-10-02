@@ -7,12 +7,16 @@ import { TanStackRouterDevtoolsPanel } from "@tanstack/react-router-devtools"
 import { TanStackDevtools } from "@tanstack/react-devtools"
 import type { QueryClient } from "@tanstack/react-query"
 
-import { AppSidebar } from "@/components/app-sidebar"
-import { SiteHeader } from "@/components/site-header"
+import { Mascot } from "@/components/mascot"
+import { ShellProvider } from "@/components/app-shell"
 import { ThemeProvider } from "@/components/theme-provider"
-import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
+import { EmptyState } from "@/components/ui/empty-state"
+import { LinkButton } from "@/components/ui/link-button"
+import { PageShell } from "@/components/ui/page"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
+
+import { PRODUCT_NAME } from "@/lib/head"
 
 import appCss from "../styles.css?url"
 
@@ -23,55 +27,34 @@ interface RouterContext {
 export const Route = createRootRouteWithContext<RouterContext>()({
   head: () => ({
     meta: [
+      { charSet: "utf-8" },
+      { name: "viewport", content: "width=device-width, initial-scale=1" },
+      { title: PRODUCT_NAME },
       {
-        charSet: "utf-8",
+        name: "description",
+        content:
+          "Practice job interviews by voice with an AI interviewer that plans around your resume and the role, then scores your answers with evidence.",
       },
-      {
-        name: "viewport",
-        content: "width=device-width, initial-scale=1",
-      },
-      {
-        title: "Voice Interview",
-      },
+      { name: "application-name", content: PRODUCT_NAME },
+      { name: "apple-mobile-web-app-title", content: PRODUCT_NAME },
     ],
     links: [
-      {
-        rel: "stylesheet",
-        href: appCss,
-      },
-      {
-        rel: "icon",
-        href: "/favicon.ico",
-        sizes: "any",
-      },
-      {
-        rel: "icon",
-        type: "image/png",
-        sizes: "16x16",
-        href: "/favicon-16x16.png",
-      },
-      {
-        rel: "icon",
-        type: "image/png",
-        sizes: "32x32",
-        href: "/favicon-32x32.png",
-      },
-      {
-        rel: "apple-touch-icon",
-        sizes: "180x180",
-        href: "/apple-touch-icon.png",
-      },
-      {
-        rel: "manifest",
-        href: "/manifest.json",
-      },
+      { rel: "stylesheet", href: appCss },
+      { rel: "icon", href: "/favicon.ico", sizes: "32x32" },
+      { rel: "icon", href: "/favicon.svg", type: "image/svg+xml" },
+      { rel: "apple-touch-icon", href: "/apple-touch-icon.png" },
+      { rel: "manifest", href: "/manifest.json" },
     ],
   }),
   notFoundComponent: () => (
-    <main className="container mx-auto p-4 pt-16">
-      <h1>404</h1>
-      <p>The requested page could not be found.</p>
-    </main>
+    <PageShell center>
+      <EmptyState
+        illustration={<Mascot state="thinking" className="w-36" />}
+        title="This page doesn’t exist"
+        description="The link may be out of date, or the interview was removed."
+        actions={<LinkButton to="/">Back to Home</LinkButton>}
+      />
+    </PageShell>
   ),
   shellComponent: RootDocument,
 })
@@ -81,28 +64,23 @@ function RootDocument({ children }: { children: React.ReactNode }) {
     <html lang="en" suppressHydrationWarning>
       <head>
         <HeadContent />
+        {/* Two theme colors, one per scheme: head() merges meta by name and
+            would keep only one. */}
+        <meta
+          name="theme-color"
+          content="#f8f9fa"
+          media="(prefers-color-scheme: light)"
+        />
+        <meta
+          name="theme-color"
+          content="#202124"
+          media="(prefers-color-scheme: dark)"
+        />
       </head>
       <body>
         <ThemeProvider>
           <TooltipProvider>
-            <SidebarProvider
-              style={
-                {
-                  "--sidebar-width": "calc(var(--spacing) * 72)",
-                  "--header-height": "calc(var(--spacing) * 12)",
-                } as React.CSSProperties
-              }
-            >
-              <AppSidebar variant="inset" />
-              <SidebarInset>
-                <SiteHeader />
-                <div className="flex flex-1 flex-col">
-                  <div className="@container/main flex flex-1 flex-col gap-2">
-                    {children}
-                  </div>
-                </div>
-              </SidebarInset>
-            </SidebarProvider>
+            <ShellProvider>{children}</ShellProvider>
           </TooltipProvider>
           <Toaster />
           <TanStackDevtools

@@ -1,41 +1,43 @@
 "use client"
 
-import { useTheme } from "next-themes"
 import { Toaster as Sonner } from "sonner"
 import type { ToasterProps } from "sonner"
 import {
+  CircleAlertIcon,
   CircleCheckIcon,
   InfoIcon,
   TriangleAlertIcon,
-  OctagonXIcon,
-  Loader2Icon,
 } from "lucide-react"
 
-const Toaster = ({ ...props }: ToasterProps) => {
-  const { theme = "system" } = useTheme()
+import { Spinner } from "@/components/ui/spinner"
 
+/** Snackbar-style toasts: inverse surface, bottom-left, one line where
+ *  possible, an optional text action. */
+const Toaster = ({ ...props }: ToasterProps) => {
   return (
     <Sonner
-      theme={theme as ToasterProps["theme"]}
+      position="bottom-left"
       className="toaster group"
       icons={{
-        success: <CircleCheckIcon className="size-4" />,
-        info: <InfoIcon className="size-4" />,
-        warning: <TriangleAlertIcon className="size-4" />,
-        error: <OctagonXIcon className="size-4" />,
-        loading: <Loader2Icon className="size-4 animate-spin" />,
+        success: <CircleCheckIcon className="size-5" />,
+        info: <InfoIcon className="size-5" />,
+        warning: <TriangleAlertIcon className="size-5" />,
+        error: <CircleAlertIcon className="size-5" />,
+        loading: <Spinner className="size-5 text-inverse-foreground" />,
       }}
       style={
         {
-          "--normal-bg": "var(--popover)",
-          "--normal-text": "var(--popover-foreground)",
-          "--normal-border": "var(--border)",
-          "--border-radius": "var(--radius)",
+          "--normal-bg": "var(--inverse-surface)",
+          "--normal-text": "var(--inverse-foreground)",
+          "--normal-border": "transparent",
+          "--border-radius": "var(--radius-md)",
         } as React.CSSProperties
       }
       toastOptions={{
         classNames: {
-          toast: "cn-toast",
+          toast: "shadow-e2! font-sans! text-sm! gap-3!",
+          actionButton:
+            "bg-transparent! text-primary-container! font-heading! font-medium!",
         },
       }}
       {...props}

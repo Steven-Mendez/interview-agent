@@ -6,21 +6,49 @@ import {
   useQueryClient,
 } from "@tanstack/react-query"
 import {
-  ArrowRightIcon,
+  AlertCircleIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
-  ClockIcon,
-  GaugeIcon,
+  FilterIcon,
   HistoryIcon,
-  ListChecksIcon,
-  MicIcon,
+  PlusIcon,
   RotateCcwIcon,
+  SearchXIcon,
 } from "lucide-react"
 
 import {
+  EvaluationSummary,
+  InterviewStatusChip,
+  STATUS_META,
+} from "@/components/interview-status"
+import { Mascot } from "@/components/mascot"
+import { Alert, AlertDescription } from "@/components/ui/alert"
+import { Badge } from "@/components/ui/badge"
+import { EmptyState } from "@/components/ui/empty-state"
+import { IconButton } from "@/components/ui/icon-button"
+import { LinkButton } from "@/components/ui/link-button"
+import { PageContainer, PageHeader, PageShell } from "@/components/ui/page"
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { Skeleton } from "@/components/ui/skeleton"
+import { Button } from "@/components/ui/button"
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table"
+import {
   ApiError,
-  durationLabel,
   SENIORITY_LABELS,
+  durationLabel,
   repeatInterview,
 } from "@/lib/api"
 import type { InterviewStatus, InterviewSummary } from "@/lib/api"
@@ -31,19 +59,7 @@ import {
 } from "@/lib/queries"
 import { log } from "@/lib/log"
 import { cn } from "@/lib/utils"
-import { Button } from "@/components/ui/button"
-import { Badge } from "@/components/ui/badge"
-import { Card, CardContent } from "@/components/ui/card"
-import { Alert, AlertDescription } from "@/components/ui/alert"
-import { Skeleton } from "@/components/ui/skeleton"
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select"
-import { PageContainer, PageShell } from "@/components/ui/page"
+import { pageHead } from "@/lib/head"
 
 // The filter and the page live in the URL: a history you can link to, and a
 // back button that returns to the page you were actually on.
@@ -60,13 +76,14 @@ const STATUS_FILTERS = [
 ] as const
 
 // Both optional: the defaults are the first page, unfiltered, so plain
-// `<Link to="/interviews">` (sidebar, scorecard) needs no search params.
+// `<Link to="/interviews">` (navigation, results) needs no search params.
 interface HistorySearch {
   offset?: number
   status?: InterviewStatus
 }
 
 export const Route = createFileRoute("/interviews/")({
+  head: () => pageHead("History"),
   validateSearch: (search: Record<string, unknown>): HistorySearch => {
     const offset = Number(search.offset)
     const status = String(search.status ?? "")
@@ -80,37 +97,6 @@ export const Route = createFileRoute("/interviews/")({
   },
   component: HistoryPage,
 })
-
-interface StatusMeta {
-  label: string
-  variant: "outline" | "secondary" | "destructive" | "default"
-}
-
-/** How each status reads, and the badge tone that carries it. */
-const STATUS_META: Record<InterviewStatus, StatusMeta> = {
-  closing: { label: "Closing", variant: "secondary" },
-  created: { label: "Planning…", variant: "outline" },
-  planned: { label: "Ready to start", variant: "outline" },
-  interviewing: { label: "In progress", variant: "default" },
-  completed: { label: "Ended", variant: "secondary" },
-  evaluating: { label: "Evaluating…", variant: "secondary" },
-  evaluated: { label: "Evaluated", variant: "secondary" },
-  evaluation_failed: { label: "Evaluation failed", variant: "destructive" },
-  error: { label: "Failed", variant: "destructive" },
-}
-
-// The one status the row alone does not settle: `interviewing` past its
-// reconnect window is a worker that died mid-run, not an interview going on.
-const INTERRUPTED_META: StatusMeta = {
-  label: "Interrupted",
-  variant: "outline",
-}
-
-function statusMeta(row: InterviewSummary): StatusMeta {
-  return row.status === "interviewing" && !row.can_start
-    ? INTERRUPTED_META
-    : STATUS_META[row.status]
-}
 
 const dateFormat = new Intl.DateTimeFormat(undefined, {
   dateStyle: "medium",
@@ -180,46 +166,54 @@ function HistoryPage() {
       search: { offset: nextOffset > 0 ? nextOffset : undefined, status },
     })
 
+  const setStatus = (next: InterviewStatus | undefined) =>
+    // Any filter change resets to the first page: page 3 of the old filter
+    // is rarely page 3 of the new one.
+    void navigate({ search: { offset: undefined, status: next } })
+
+  const rowProps = (item: InterviewSummary) => ({
+    item,
+    onRepeat: () => repeat.mutate(item.id),
+    repeating: repeat.isPending && repeat.variables === item.id,
+    disabled: repeat.isPending,
+  })
+
   return (
     <PageShell>
       <PageContainer variant="wide" className="flex flex-col gap-6">
-        <div className="flex flex-wrap items-end justify-between gap-3">
-          <div className="flex flex-col gap-1">
-            <h1 className="flex items-center gap-2 text-lg font-medium">
-              <HistoryIcon className="size-5 text-muted-foreground" />
-              Interview history
-            </h1>
-            <p className="text-sm text-muted-foreground">
-              Every interview you have run — open one to review its scorecard
-              and transcript, or run the same role again.
-            </p>
-          </div>
+        <PageHeader
+          title="History"
+          description="Your interviews and their results."
+        />
+
+        <div className="flex flex-wrap items-center gap-2">
           <Select
             value={status ?? "all"}
             onValueChange={(next) =>
               next &&
-              // Any filter change resets to the first page: page 3 of the old
-              // filter is rarely page 3 of the new one.
-              void navigate({
-                search: {
-                  offset: undefined,
-                  status:
-                    next === "all" ? undefined : (next as InterviewStatus),
-                },
-              })
+              setStatus(next === "all" ? undefined : (next as InterviewStatus))
             }
           >
-            <SelectTrigger className="w-52">
+            <SelectTrigger
+              size="sm"
+              aria-label="Filter by status"
+              className={cn(
+                "gap-2",
+                status &&
+                  "border-transparent bg-primary-container text-on-primary-container"
+              )}
+            >
+              <FilterIcon className="size-4" />
               <SelectValue>
                 {(value: string) =>
                   value === "all"
-                    ? "All interviews"
+                    ? "All statuses"
                     : STATUS_META[value as InterviewStatus].label
                 }
               </SelectValue>
             </SelectTrigger>
             <SelectContent>
-              <SelectItem value="all">All interviews</SelectItem>
+              <SelectItem value="all">All statuses</SelectItem>
               {STATUS_FILTERS.map((value) => (
                 <SelectItem key={value} value={value}>
                   {STATUS_META[value].label}
@@ -227,233 +221,281 @@ function HistoryPage() {
               ))}
             </SelectContent>
           </Select>
+          {status && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => setStatus(undefined)}
+            >
+              Clear filter
+            </Button>
+          )}
+          {total > 0 && !pastEnd && (
+            <span className="ml-auto text-xs text-muted-foreground tabular-nums">
+              {total} {total === 1 ? "interview" : "interviews"}
+            </span>
+          )}
         </div>
 
         {repeat.isError && (
           <Alert variant="destructive">
+            <AlertCircleIcon />
             <AlertDescription>{errorMessage(repeat.error)}</AlertDescription>
           </Alert>
         )}
         {query.isError && (
           <Alert variant="destructive">
+            <AlertCircleIcon />
             <AlertDescription>{errorMessage(query.error)}</AlertDescription>
           </Alert>
         )}
 
         {query.isPending ? (
-          <div className="flex flex-col gap-3">
-            {Array.from({ length: 4 }, (_, i) => (
-              <Card key={i}>
-                <CardContent className="flex flex-col gap-3">
-                  <Skeleton className="h-5 w-64" />
-                  <Skeleton className="h-4 w-96 max-w-full" />
-                </CardContent>
-              </Card>
-            ))}
-          </div>
+          <HistorySkeleton />
         ) : pastEnd ? (
-          <Card>
-            <CardContent className="flex flex-col items-center gap-4 py-12 text-center">
-              <p className="text-sm text-muted-foreground">
-                There is nothing this far down — the history ends at page{" "}
-                {Math.floor(lastOffset / HISTORY_PAGE_SIZE) + 1}.
-              </p>
+          <EmptyState
+            icon={<HistoryIcon />}
+            title="Nothing this far down"
+            description={`The history ends at page ${Math.floor(lastOffset / HISTORY_PAGE_SIZE) + 1}.`}
+            actions={
               <Button variant="outline" onClick={() => goTo(lastOffset)}>
                 <ChevronLeftIcon />
                 Go to the last page
               </Button>
-            </CardContent>
-          </Card>
+            }
+          />
         ) : page && page.items.length === 0 ? (
-          <EmptyState filtered={status !== undefined} />
+          status !== undefined ? (
+            <EmptyState
+              icon={<SearchXIcon />}
+              title="No interviews in this state"
+              description={`Nothing is “${STATUS_META[status].label}” right now.`}
+              actions={
+                <Button variant="outline" onClick={() => setStatus(undefined)}>
+                  Show all interviews
+                </Button>
+              }
+            />
+          ) : (
+            <EmptyState
+              illustration={<Mascot state="idle" className="w-36" />}
+              title="No interviews yet"
+              description="Interviews you run appear here with their results."
+              actions={
+                <LinkButton to="/new" variant="create">
+                  <PlusIcon />
+                  Start an interview
+                </LinkButton>
+              }
+            />
+          )
         ) : (
-          <div
-            className={cn(
-              "flex flex-col gap-3",
-              query.isPlaceholderData && "opacity-60"
-            )}
-          >
-            {page?.items.map((item) => (
-              <HistoryRow
-                key={item.id}
-                item={item}
-                onRepeat={() => repeat.mutate(item.id)}
-                repeating={repeat.isPending && repeat.variables === item.id}
-                disabled={repeat.isPending}
-              />
-            ))}
-          </div>
+          page && (
+            <div
+              className={cn(
+                "transition-opacity duration-150",
+                query.isPlaceholderData && "opacity-60"
+              )}
+              aria-busy={query.isPlaceholderData}
+            >
+              {/* Wide: a quiet table. Narrow: the same rows as cards. */}
+              <div className="hidden overflow-hidden rounded-xl border @4xl/main:block">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead className="w-[40%]">Interview</TableHead>
+                      <TableHead>Status</TableHead>
+                      <TableHead>Result</TableHead>
+                      <TableHead>Level</TableHead>
+                      <TableHead>Topics</TableHead>
+                      <TableHead>Date</TableHead>
+                      <TableHead>
+                        <span className="sr-only">Actions</span>
+                      </TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {page.items.map((item) => (
+                      <HistoryTableRow key={item.id} {...rowProps(item)} />
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+              <ul className="flex flex-col gap-3 @4xl/main:hidden">
+                {page.items.map((item) => (
+                  <HistoryCard key={item.id} {...rowProps(item)} />
+                ))}
+              </ul>
+            </div>
+          )
         )}
 
         {total > HISTORY_PAGE_SIZE && !pastEnd && (
-          <div className="flex items-center justify-between gap-2">
+          <nav
+            aria-label="Pagination"
+            className="flex items-center justify-end gap-2"
+          >
             <span className="text-sm text-muted-foreground tabular-nums">
               {from}–{to} of {total}
             </span>
-            <div className="flex gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={offset === 0}
-                onClick={() => goTo(offset - HISTORY_PAGE_SIZE)}
-              >
-                <ChevronLeftIcon />
-                Previous
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={to >= total}
-                onClick={() => goTo(offset + HISTORY_PAGE_SIZE)}
-              >
-                Next
-                <ChevronRightIcon />
-              </Button>
-            </div>
-          </div>
+            <IconButton
+              label="Previous page"
+              disabled={offset === 0}
+              onClick={() => goTo(offset - HISTORY_PAGE_SIZE)}
+            >
+              <ChevronLeftIcon />
+            </IconButton>
+            <IconButton
+              label="Next page"
+              disabled={to >= total}
+              onClick={() => goTo(offset + HISTORY_PAGE_SIZE)}
+            >
+              <ChevronRightIcon />
+            </IconButton>
+          </nav>
         )}
       </PageContainer>
     </PageShell>
   )
 }
 
-function EmptyState({ filtered }: { filtered: boolean }) {
-  return (
-    <Card>
-      <CardContent className="flex flex-col items-center gap-4 py-12 text-center">
-        <span className="flex size-12 items-center justify-center rounded-full bg-primary/10 text-primary">
-          <MicIcon className="size-6" />
-        </span>
-        <p className="text-sm text-muted-foreground">
-          {filtered
-            ? "No interviews in this state yet."
-            : "You have not run any interviews yet."}
-        </p>
-        <Button render={<Link to="/" />}>Start an interview</Button>
-      </CardContent>
-    </Card>
-  )
-}
-
-function HistoryRow({
-  item,
-  onRepeat,
-  repeating,
-  disabled,
-}: {
+interface RowProps {
   item: InterviewSummary
   onRepeat: () => void
   repeating: boolean
   disabled: boolean
-}) {
-  const meta = statusMeta(item)
-  const evaluation = item.evaluation
-  // Same traffic light as the scorecard: green once hired, otherwise red/amber
-  // by how far the score sits from a pass.
-  const hasVerdict = evaluation?.score != null && evaluation.hired !== null
-  const scoreClass =
-    evaluation && hasVerdict
-      ? evaluation.hired
-        ? "text-success"
-        : evaluation.score! < 40
-          ? "text-destructive"
-          : "text-warning"
-      : ""
+}
 
+function TitleCell({ item }: { item: InterviewSummary }) {
   return (
-    <Card>
-      <CardContent className="flex flex-col gap-4 @2xl/main:flex-row @2xl/main:items-center">
-        {evaluation && hasVerdict && (
-          <div className="flex shrink-0 items-baseline gap-1 @2xl/main:w-24">
-            <span className={cn("text-3xl leading-none font-bold", scoreClass)}>
-              {evaluation.score}
-            </span>
-            <span className="text-sm text-muted-foreground">/100</span>
-          </div>
-        )}
-
-        <div className="flex min-w-0 flex-1 flex-col gap-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <Link
-              to="/interviews/$interviewId"
-              params={{ interviewId: item.id }}
-              className="truncate text-sm font-medium hover:underline"
-            >
-              {item.title}
-            </Link>
-            <Badge variant={meta.variant}>{meta.label}</Badge>
-            {evaluation && (
-              <Badge variant={evaluation.hired ? "secondary" : "outline"}>
-                {!hasVerdict
-                  ? evaluation.evaluation_status === "insufficient"
-                    ? "Insufficient evidence"
-                    : "Partial assessment"
-                  : evaluation.hired
-                    ? "Hired"
-                    : "Not hired"}
-              </Badge>
-            )}
-            {item.repeat_of_id && (
-              <Badge variant="outline" title="A re-run of an earlier interview">
-                <RotateCcwIcon />
-                Re-run
-              </Badge>
-            )}
-          </div>
-
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1.5">
-              <ClockIcon className="size-3.5" />
-              <time dateTime={item.created_at}>
-                {dateFormat.format(new Date(item.created_at))}
-              </time>
-            </span>
-            <span className="flex items-center gap-1.5">
-              <GaugeIcon className="size-3.5" />
-              {SENIORITY_LABELS[item.seniority]}
-              {item.seniority_source === "detected" && " · auto"}
-            </span>
-            <span>
-              {durationLabel(item.interview_length, item.max_minutes)}
-            </span>
-            {item.milestones_total > 0 && (
-              <span className="flex items-center gap-1.5 tabular-nums">
-                <ListChecksIcon className="size-3.5" />
-                {item.milestones_completed}/{item.milestones_total} topics
-              </span>
-            )}
-            {item.resume_filename && (
-              <span className="truncate">{item.resume_filename}</span>
-            )}
-          </div>
-        </div>
-
-        <div className="flex shrink-0 gap-2">
-          <Button
+    <div className="flex min-w-0 flex-col gap-0.5">
+      <span className="flex min-w-0 items-center gap-2">
+        <Link
+          to="/interviews/$interviewId"
+          params={{ interviewId: item.id }}
+          className="truncate text-sm font-medium text-foreground after:absolute after:inset-0 hover:underline focus-visible:outline-offset-[-2px]"
+        >
+          {item.title}
+        </Link>
+        {item.repeat_of_id && (
+          <Badge
             variant="outline"
-            size="sm"
-            onClick={onRepeat}
-            disabled={disabled}
-            title="Plan a fresh interview for the same role and resume"
+            className="relative h-5 px-2"
+            title="A re-run of an earlier interview"
           >
-            <RotateCcwIcon />
-            {repeating ? "Planning…" : "Repeat"}
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            render={
-              <Link
-                to="/interviews/$interviewId"
-                params={{ interviewId: item.id }}
-              />
-            }
-          >
-            Open
-            <ArrowRightIcon />
-          </Button>
+            <RotateCcwIcon aria-hidden />
+            Re-run
+          </Badge>
+        )}
+      </span>
+      <span className="truncate text-xs text-muted-foreground">
+        {durationLabel(item.interview_length, item.max_minutes)}
+        {item.resume_filename && ` · ${item.resume_filename}`}
+      </span>
+    </div>
+  )
+}
+
+function RepeatButton({
+  onRepeat,
+  repeating,
+  disabled,
+}: Omit<RowProps, "item">) {
+  return (
+    <IconButton
+      label={
+        repeating
+          ? "Planning…"
+          : "Repeat — plan a fresh interview for the same role and resume"
+      }
+      size="icon-sm"
+      onClick={onRepeat}
+      disabled={disabled}
+      className="relative z-10"
+    >
+      <RotateCcwIcon className={cn(repeating && "animate-spin")} />
+    </IconButton>
+  )
+}
+
+/** The whole row opens the interview (the title link stretches over it);
+ *  the repeat action sits above that layer. */
+function HistoryTableRow({ item, ...actions }: RowProps) {
+  return (
+    <TableRow className="relative">
+      <TableCell className="max-w-0">
+        <TitleCell item={item} />
+      </TableCell>
+      <TableCell>
+        <InterviewStatusChip row={item} />
+      </TableCell>
+      <TableCell>
+        {item.evaluation ? (
+          <EvaluationSummary evaluation={item.evaluation} />
+        ) : (
+          <span className="text-xs text-muted-foreground">—</span>
+        )}
+      </TableCell>
+      <TableCell className="text-muted-foreground">
+        {SENIORITY_LABELS[item.seniority]}
+        {item.seniority_source === "detected" && " · auto"}
+      </TableCell>
+      <TableCell className="text-muted-foreground tabular-nums">
+        {item.milestones_total > 0
+          ? `${item.milestones_completed}/${item.milestones_total}`
+          : "—"}
+      </TableCell>
+      <TableCell className="text-muted-foreground">
+        <time dateTime={item.created_at}>
+          {dateFormat.format(new Date(item.created_at))}
+        </time>
+      </TableCell>
+      <TableCell className="w-12 text-right">
+        <RepeatButton {...actions} />
+      </TableCell>
+    </TableRow>
+  )
+}
+
+function HistoryCard({ item, ...actions }: RowProps) {
+  return (
+    <li className="relative flex flex-col gap-3 rounded-xl border bg-card p-4 transition-colors hover:bg-foreground/[0.03]">
+      <div className="flex items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <TitleCell item={item} />
         </div>
-      </CardContent>
-    </Card>
+        <RepeatButton {...actions} />
+      </div>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2 text-xs text-muted-foreground">
+        <InterviewStatusChip row={item} />
+        <EvaluationSummary evaluation={item.evaluation} />
+        <span>{SENIORITY_LABELS[item.seniority]}</span>
+        {item.milestones_total > 0 && (
+          <span className="tabular-nums">
+            {item.milestones_completed}/{item.milestones_total} topics
+          </span>
+        )}
+        <time dateTime={item.created_at}>
+          {dateFormat.format(new Date(item.created_at))}
+        </time>
+      </div>
+    </li>
+  )
+}
+
+function HistorySkeleton() {
+  return (
+    <div className="flex flex-col divide-y overflow-hidden rounded-xl border">
+      {Array.from({ length: 5 }, (_, i) => (
+        <div key={i} className="flex items-center gap-6 px-4 py-4">
+          <div className="flex flex-1 flex-col gap-2">
+            <Skeleton className="h-4 w-72 max-w-full" />
+            <Skeleton className="h-3 w-40" />
+          </div>
+          <Skeleton className="h-6 w-24 rounded-full" />
+          <Skeleton className="hidden h-4 w-24 @3xl/main:block" />
+        </div>
+      ))}
+    </div>
   )
 }

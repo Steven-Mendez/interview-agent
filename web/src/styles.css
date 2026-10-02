@@ -1,147 +1,360 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "@fontsource-variable/inter";
+@import "@fontsource-variable/google-sans-flex/wght.css";
+@import "@fontsource-variable/roboto";
 
-@custom-variant dark (&:is(.dark *));
+/* Dark utilities apply under the app's dark theme AND inside the live
+   interview, which is always dark (see `.session-dark` below). */
+@custom-variant dark (&:is(.dark *, .session-dark *));
+
+/* ==========================================================================
+   Design tokens — one system, two expressions.
+
+   Management screens use the light palette; the live interview uses the
+   dark palette. Both are the same token names, so every
+   primitive renders correctly in either without per-page overrides.
+   ========================================================================== */
 
 @theme inline {
-    --font-heading: var(--font-sans);
-    --font-sans: 'Inter Variable', sans-serif;
-    --color-sidebar-ring: var(--sidebar-ring);
-    --color-sidebar-border: var(--sidebar-border);
-    --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
-    --color-sidebar-accent: var(--sidebar-accent);
-    --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
-    --color-sidebar-primary: var(--sidebar-primary);
-    --color-sidebar-foreground: var(--sidebar-foreground);
-    --color-sidebar: var(--sidebar);
-    --color-chart-5: var(--chart-5);
-    --color-chart-4: var(--chart-4);
-    --color-chart-3: var(--chart-3);
-    --color-chart-2: var(--chart-2);
-    --color-chart-1: var(--chart-1);
-    --color-ring: var(--ring);
-    --color-input: var(--input);
-    --color-border: var(--border);
-    --color-destructive: var(--destructive);
-    --color-success: var(--success);
-    --color-success-foreground: var(--success-foreground);
-    --color-warning: var(--warning);
-    --color-warning-foreground: var(--warning-foreground);
-    --color-accent-foreground: var(--accent-foreground);
-    --color-accent: var(--accent);
-    --color-muted-foreground: var(--muted-foreground);
-    --color-muted: var(--muted);
-    --color-secondary-foreground: var(--secondary-foreground);
-    --color-secondary: var(--secondary);
-    --color-primary-foreground: var(--primary-foreground);
-    --color-primary: var(--primary);
-    --color-popover-foreground: var(--popover-foreground);
-    --color-popover: var(--popover);
-    --color-card-foreground: var(--card-foreground);
-    --color-card: var(--card);
-    --color-foreground: var(--foreground);
-    --color-background: var(--background);
-    --radius-sm: calc(var(--radius) * 0.6);
-    --radius-md: calc(var(--radius) * 0.8);
-    --radius-lg: var(--radius);
-    --radius-xl: calc(var(--radius) * 1.4);
-    --radius-2xl: calc(var(--radius) * 1.8);
-    --radius-3xl: calc(var(--radius) * 2.2);
-    --radius-4xl: calc(var(--radius) * 2.6);
+  /* A Google Sans–style face for titles, navigation and buttons; Roboto for
+     body text. Both ship with the app (OFL), so every platform matches. */
+  --font-heading:
+    "Google Sans Flex Variable", "Roboto Variable", ui-sans-serif, system-ui,
+    sans-serif;
+  --font-sans: "Roboto Variable", ui-sans-serif, system-ui, sans-serif;
+
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-pressed: var(--primary-pressed);
+  --color-primary-container: var(--primary-container);
+  --color-on-primary-container: var(--on-primary-container);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-surface-high: var(--surface-high);
+  --color-destructive: var(--destructive);
+  --color-destructive-container: var(--destructive-container);
+  --color-on-destructive-container: var(--on-destructive-container);
+  --color-end-call: var(--end-call);
+  --color-end-call-hover: var(--end-call-hover);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-success-container: var(--success-container);
+  --color-on-success-container: var(--on-success-container);
+  --color-create-container: var(--create-container);
+  --color-on-create-container: var(--on-create-container);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-warning-container: var(--warning-container);
+  --color-on-warning-container: var(--on-warning-container);
+  --color-disabled: var(--disabled);
+  --color-disabled-foreground: var(--disabled-foreground);
+  --color-inverse-surface: var(--inverse-surface);
+  --color-inverse-foreground: var(--inverse-foreground);
+  --color-tile: var(--tile);
+  --color-stage: var(--stage);
+  --color-avatar-self: var(--avatar-self);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  /* Shapes: small controls 8, cards/panels 12–16, dialogs 24–28. */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-2xl: 24px;
+  --radius-3xl: 28px;
+  --radius-4xl: 32px;
+
+  /* Two-layer ambient shadows. Mostly flat UI: 1 for resting
+       surfaces that need it, 2 for menus and the call bar, 3 for dialogs. */
+  --shadow-e1:
+    0 1px 2px 0 rgb(60 64 67 / 0.3), 0 1px 3px 1px rgb(60 64 67 / 0.15);
+  --shadow-e2:
+    0 1px 2px 0 rgb(60 64 67 / 0.3), 0 2px 6px 2px rgb(60 64 67 / 0.15);
+  --shadow-e3:
+    0 4px 8px 3px rgb(60 64 67 / 0.15), 0 1px 3px 0 rgb(60 64 67 / 0.3);
+
+  /* Motion explains state changes; nothing longer than 250 ms. */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --ease-emphasized: cubic-bezier(0.3, 0, 0, 1);
 }
 
 :root {
-    --background: oklch(1 0 0);
-    --foreground: oklch(0.145 0 0);
-    --card: oklch(1 0 0);
-    --card-foreground: oklch(0.145 0 0);
-    --popover: oklch(1 0 0);
-    --popover-foreground: oklch(0.145 0 0);
-    --primary: oklch(0.488 0.243 264.376);
-    --primary-foreground: oklch(0.97 0.014 254.604);
-    --secondary: oklch(0.967 0.001 286.375);
-    --secondary-foreground: oklch(0.21 0.006 285.885);
-    --muted: oklch(0.97 0 0);
-    --muted-foreground: oklch(0.556 0 0);
-    --accent: oklch(0.97 0 0);
-    --accent-foreground: oklch(0.205 0 0);
-    --destructive: oklch(0.577 0.245 27.325);
-    --success: oklch(0.596 0.145 163.225);
-    --success-foreground: oklch(0.985 0 0);
-    --warning: oklch(0.666 0.179 58.318);
-    --warning-foreground: oklch(0.145 0 0);
-    --border: oklch(0.922 0 0);
-    --input: oklch(0.922 0 0);
-    --ring: oklch(0.708 0 0);
-    --chart-1: oklch(0.809 0.105 251.813);
-    --chart-2: oklch(0.623 0.214 259.815);
-    --chart-3: oklch(0.546 0.245 262.881);
-    --chart-4: oklch(0.488 0.243 264.376);
-    --chart-5: oklch(0.424 0.199 265.638);
-    --radius: 0.625rem;
-    --sidebar: oklch(0.985 0 0);
-    --sidebar-foreground: oklch(0.145 0 0);
-    --sidebar-primary: oklch(0.546 0.245 262.881);
-    --sidebar-primary-foreground: oklch(0.97 0.014 254.604);
-    --sidebar-accent: oklch(0.97 0 0);
-    --sidebar-accent-foreground: oklch(0.205 0 0);
-    --sidebar-border: oklch(0.922 0 0);
-    --sidebar-ring: oklch(0.708 0 0);
+  /* Surfaces */
+  --background: #f8f9fa;
+  --foreground: #1f1f1f;
+  --card: #ffffff;
+  --card-foreground: #1f1f1f;
+  --popover: #ffffff;
+  --popover-foreground: #1f1f1f;
+  --surface-high: #e9eef6;
+
+  /* Primary — blue */
+  --primary: #0b57d0;
+  --primary-foreground: #ffffff;
+  --primary-pressed: #0842a0;
+  --primary-container: #d3e3fd;
+  --on-primary-container: #041e49;
+
+  /* Neutral containers */
+  --secondary: #e9eef6;
+  --secondary-foreground: #1f1f1f;
+  --muted: #f0f4f9;
+  --muted-foreground: #444746;
+  --accent: #f0f4f9;
+  --accent-foreground: #1f1f1f;
+
+  /* Semantics */
+  --destructive: #d93025;
+  --destructive-container: #fce8e6;
+  --on-destructive-container: #8c1d18;
+  --end-call: #ea4335;
+  --end-call-hover: #d33b2f;
+  --success: #137333;
+  --success-foreground: #ffffff;
+  --success-container: #e6f4ea;
+  --on-success-container: #0d652d;
+  --create-container: #c4eed0;
+  --on-create-container: #072711;
+  --warning: #8d4f00;
+  --warning-foreground: #ffffff;
+  --warning-container: #fef7e0;
+  --on-warning-container: #7a4100;
+
+  --disabled: #e8eaed;
+  --disabled-foreground: #9aa0a6;
+  --inverse-surface: #303134;
+  --inverse-foreground: #f1f3f4;
+
+  /* The Interviewer Agent character: brand constants, the same white robot
+     on the light workspace and in the dark room (components/mascot.tsx). */
+  --mascot-shell: #ffffff;
+  --mascot-shade: #e4ecf9;
+  --mascot-outline: #c6d5ee;
+  --mascot-accent: #0b57d0;
+  --mascot-accent-soft: #a8c7fa;
+  --mascot-accent-container: #d3e3fd;
+  --mascot-face: #0f1a36;
+  --mascot-eye: #eaf1fe;
+  --mascot-error-eye: #f28b82;
+  --mascot-ground: rgb(11 87 208 / 0.1);
+  --mascot-signal-success: #1e8e3e;
+  --mascot-signal-warning: #f9ab00;
+  --mascot-signal-error: #d93025;
+
+  /* Video surfaces stay dark in either theme. */
+  --tile: #3c4043;
+  --stage: #202124;
+  --avatar-self: #5f6368;
+
+  /* Lines: dividers are quiet; input outlines meet 3:1 against white. */
+  --border: #dadce0;
+  --input: #747775;
+  --ring: #0b57d0;
+
+  --chart-1: #0b57d0;
+  --chart-2: #1e8e3e;
+  --chart-3: #f9ab00;
+  --chart-4: #d93025;
+  --chart-5: #9334e6;
+}
+
+.dark,
+.session-dark {
+  --background: #202124;
+  --foreground: #e3e3e3;
+  --card: #28292c;
+  --card-foreground: #e3e3e3;
+  --popover: #303134;
+  --popover-foreground: #e3e3e3;
+  --surface-high: #3c4043;
+
+  --primary: #a8c7fa;
+  --primary-foreground: #062e6f;
+  --primary-pressed: #d3e3fd;
+  --primary-container: #004a77;
+  --on-primary-container: #c2e7ff;
+
+  --secondary: #3c4043;
+  --secondary-foreground: #e3e3e3;
+  --muted: #303134;
+  --muted-foreground: #bdc1c6;
+  --accent: #3c4043;
+  --accent-foreground: #e3e3e3;
+
+  --destructive: #f28b82;
+  --destructive-container: #601410;
+  --on-destructive-container: #f9dedc;
+  --end-call: #ea4335;
+  --end-call-hover: #d33b2f;
+  --success: #81c995;
+  --success-foreground: #0d652d;
+  --success-container: #0f5223;
+  --on-success-container: #c4eed0;
+  --create-container: #0f5223;
+  --on-create-container: #c4eed0;
+  --warning: #fdd663;
+  --warning-foreground: #3d2a00;
+  --warning-container: #4a3500;
+  --on-warning-container: #ffdf99;
+
+  --disabled: #3c4043;
+  --disabled-foreground: #80868b;
+  --inverse-surface: #e3e3e3;
+  --inverse-foreground: #1f1f1f;
+
+  --tile: #3c4043;
+  --stage: #202124;
+  --avatar-self: #5f6368;
+  --mascot-ground: rgb(0 0 0 / 0.35);
+
+  --border: #444746;
+  --input: #8e918f;
+  --ring: #a8c7fa;
+
+  --chart-1: #a8c7fa;
+  --chart-2: #81c995;
+  --chart-3: #fdd663;
+  --chart-4: #f28b82;
+  --chart-5: #d7aefb;
+}
+
+/* The live interview is a dark room whatever the app theme says; its
+   menus and tooltips portal to <body>, which carries this class while the
+   room is open. Tooltips there stay dark. */
+.session-dark {
+  /* The call room sits a step darker than the app's dark theme: a
+     near-black canvas, panels and the control bar one step up, controls one
+     step further. */
+  --background: #131314;
+  --stage: #131314;
+  --card: #1e1f20;
+  --popover: #2a2b2d;
+  --secondary: #333537;
+  --muted: #2a2b2d;
+  --inverse-surface: #3c4043;
+  --inverse-foreground: #ffffff;
+  color-scheme: dark;
 }
 
 .dark {
-    --background: oklch(0.145 0 0);
-    --foreground: oklch(0.985 0 0);
-    --card: oklch(0.205 0 0);
-    --card-foreground: oklch(0.985 0 0);
-    --popover: oklch(0.205 0 0);
-    --popover-foreground: oklch(0.985 0 0);
-    --primary: oklch(0.424 0.199 265.638);
-    --primary-foreground: oklch(0.97 0.014 254.604);
-    --secondary: oklch(0.274 0.006 286.033);
-    --secondary-foreground: oklch(0.985 0 0);
-    --muted: oklch(0.269 0 0);
-    --muted-foreground: oklch(0.708 0 0);
-    --accent: oklch(0.269 0 0);
-    --accent-foreground: oklch(0.985 0 0);
-    --destructive: oklch(0.704 0.191 22.216);
-    --success: oklch(0.696 0.17 162.48);
-    --success-foreground: oklch(0.145 0 0);
-    --warning: oklch(0.828 0.189 84.429);
-    --warning-foreground: oklch(0.145 0 0);
-    --border: oklch(1 0 0 / 10%);
-    --input: oklch(1 0 0 / 15%);
-    --ring: oklch(0.556 0 0);
-    --chart-1: oklch(0.809 0.105 251.813);
-    --chart-2: oklch(0.623 0.214 259.815);
-    --chart-3: oklch(0.546 0.245 262.881);
-    --chart-4: oklch(0.488 0.243 264.376);
-    --chart-5: oklch(0.424 0.199 265.638);
-    --sidebar: oklch(0.205 0 0);
-    --sidebar-foreground: oklch(0.985 0 0);
-    --sidebar-primary: oklch(0.623 0.214 259.815);
-    --sidebar-primary-foreground: oklch(0.97 0.014 254.604);
-    --sidebar-accent: oklch(0.269 0 0);
-    --sidebar-accent-foreground: oklch(0.985 0 0);
-    --sidebar-border: oklch(1 0 0 / 10%);
-    --sidebar-ring: oklch(0.556 0 0);
+  color-scheme: dark;
 }
 
 @layer base {
   * {
     @apply border-border outline-ring/50;
-    }
-  body {
-    @apply bg-background text-foreground;
-    }
+  }
   html {
     @apply font-sans;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  body {
+    @apply bg-background text-sm text-foreground;
+  }
+  h1,
+  h2,
+  h3,
+  h4 {
+    @apply font-heading;
+  }
+  /* A visible, consistent keyboard focus everywhere — the focus ring is
+       the primary color with a small offset. */
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 1ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 1ms !important;
     }
+  }
 }
 
-/* Shimmering text for live "…is thinking" markers (see the chat panel). */
+@layer utilities {
+  .text-display {
+    font-family: var(--font-heading);
+    font-size: 2rem;
+    line-height: 2.5rem;
+    font-weight: 400;
+    letter-spacing: 0;
+  }
+  .text-headline {
+    font-family: var(--font-heading);
+    font-size: 1.75rem;
+    line-height: 2.25rem;
+    font-weight: 400;
+  }
+  .text-title-lg {
+    font-family: var(--font-heading);
+    font-size: 1.375rem;
+    line-height: 1.75rem;
+    font-weight: 400;
+  }
+  .text-title {
+    font-family: var(--font-heading);
+    font-size: 1rem;
+    line-height: 1.5rem;
+    font-weight: 500;
+    letter-spacing: 0.00625rem;
+  }
+  .text-label {
+    font-family: var(--font-heading);
+    font-size: 0.875rem;
+    line-height: 1.25rem;
+    font-weight: 500;
+    letter-spacing: 0.00625rem;
+  }
+  .text-caption {
+    font-size: 0.75rem;
+    line-height: 1rem;
+    letter-spacing: 0.025rem;
+  }
+  .text-overline {
+    font-family: var(--font-heading);
+    font-size: 0.6875rem;
+    line-height: 1rem;
+    font-weight: 500;
+    letter-spacing: 0.05rem;
+  }
+  .shadow-e1 {
+    box-shadow: var(--shadow-e1);
+  }
+  .shadow-e2 {
+    box-shadow: var(--shadow-e2);
+  }
+  .shadow-e3 {
+    box-shadow: var(--shadow-e3);
+  }
+  .ease-standard {
+    transition-timing-function: var(--ease-standard);
+  }
+}
+
+/* Shimmering text for live "…is thinking" markers. */
 @keyframes shimmer {
   0% {
     background-position: 150% center;
@@ -163,4 +376,1646 @@
   -webkit-background-clip: text;
   color: transparent;
   animation: shimmer 1.8s linear infinite;
+}
+
+/* The speaking ring around a participant avatar: a soft halo that breathes
+   while audio is detected. Opacity only — no scale bounce. */
+@keyframes speaking-halo {
+  0%,
+  100% {
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--primary) 45%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 10px color-mix(in srgb, var(--primary) 20%, transparent);
+  }
+}
+
+.speaking-halo {
+  animation: speaking-halo 1.4s var(--ease-standard) infinite;
+}
+
+/* Indeterminate linear progress. */
+@keyframes progress-indeterminate {
+  0% {
+    transform: translateX(-100%) scaleX(0.4);
+  }
+  50% {
+    transform: translateX(30%) scaleX(0.6);
+  }
+  100% {
+    transform: translateX(110%) scaleX(0.4);
+  }
+}
+
+.progress-indeterminate {
+  animation: progress-indeterminate 1.6s var(--ease-standard) infinite;
+  transform-origin: left center;
+}
+
+/* ==========================================================================
+   The Interviewer Agent character (components/mascot.tsx).
+
+   Each moving part is its own group, choreographed per [data-state]: the
+   body floats or hops, the head tilts and nods, the eyes look around, the
+   antenna sways, the arms gesture, and the state symbol beside it moves.
+   Joints are hinged in the drawing's own coordinates (viewBox 0 0 200 200).
+
+   The character is cartoon motion, not UI motion, so it does not follow the
+   250 ms rule: it squashes before a jump and stretches into it, overshoots
+   into a new pose, and its antenna and arms trail the body a beat behind.
+   prefers-reduced-motion (base layer) settles every loop on its first frame.
+   ========================================================================== */
+
+.mascot {
+  /* Overshoots and settles: poses snap past their mark and back. */
+  --mascot-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  /* Gravity: fast off the ground, slow at the top, fast back down. */
+  --mascot-rise: cubic-bezier(0.2, 0.7, 0.4, 1);
+  --mascot-fall: cubic-bezier(0.6, 0, 0.8, 0.4);
+}
+
+/* No CSS transitions here: a state change swaps animations, which
+   transitions cannot bridge, so useStateBridge (mascot.tsx) springs each
+   part from its old pose into the new loop instead. */
+.mascot-react,
+.mascot-body,
+.mascot-head,
+.mascot-antenna,
+.mascot-eyes,
+.mascot-eyelid,
+.mascot-arm,
+.mascot-shadow {
+  transform-box: view-box;
+}
+.mascot-react,
+.mascot-body {
+  transform-origin: 100px 180px;
+}
+.mascot-head {
+  transform-origin: 100px 120px;
+}
+.mascot-antenna {
+  transform-origin: 100px 40px;
+}
+.mascot-eyes,
+.mascot-eyelid {
+  transform-origin: 100px 81px;
+}
+.mascot-shadow {
+  transform-origin: 100px 190px;
+}
+.mascot-arm-left {
+  transform-origin: 63px 134px;
+  transform: rotate(6deg);
+}
+.mascot-arm-right {
+  transform-origin: 137px 134px;
+  transform: rotate(-6deg);
+}
+
+/* Live voice: the head lifts and the antenna light swells with loudness.
+   `translate`/`scale` compose with the looping `transform`, so the level
+   rides on top of the talking choreography. */
+@media (prefers-reduced-motion: no-preference) {
+  .mascot[data-metered] .mascot-head {
+    translate: 0 calc(var(--mascot-loud, 0) * -6px);
+    transition: translate 90ms ease-out;
+  }
+  .mascot[data-metered] .mascot-antenna-light {
+    scale: calc(1 + var(--mascot-loud, 0) * 0.55);
+    transition: scale 90ms ease-out;
+  }
+}
+
+/* Shared parts ------------------------------------------------------------ */
+
+@keyframes mascot-float {
+  0%,
+  100% {
+    transform: translateY(0) scale(1.025, 0.975);
+  }
+  50% {
+    transform: translateY(-10px) scale(0.985, 1.02);
+  }
+}
+@keyframes mascot-shadow-float {
+  0%,
+  100% {
+    transform: scaleX(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scaleX(0.72);
+    opacity: 0.5;
+  }
+}
+/* One blink, then a double blink: a little less mechanical. */
+@keyframes mascot-blink {
+  0%,
+  44%,
+  50%,
+  86%,
+  100% {
+    transform: scaleY(1);
+  }
+  47% {
+    transform: scaleY(0.08);
+  }
+  89%,
+  95% {
+    transform: scaleY(0.08);
+  }
+  92% {
+    transform: scaleY(1);
+  }
+}
+.mascot-blink {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mascot-blink 7.5s infinite;
+}
+@keyframes mascot-sway {
+  0%,
+  100% {
+    transform: rotate(-15deg);
+  }
+  50% {
+    transform: rotate(15deg);
+  }
+}
+/* Eyes dart and hold, the way eyes do; the head follows a beat later. */
+@keyframes mascot-look {
+  0%,
+  20%,
+  100% {
+    transform: translate(0, 0);
+  }
+  24%,
+  42% {
+    transform: translate(-9px, 2px);
+  }
+  48%,
+  68% {
+    transform: translate(9px, -3px);
+  }
+  72%,
+  80% {
+    transform: translate(2px, -5px);
+  }
+  84% {
+    transform: translate(0, 0);
+  }
+}
+@keyframes mascot-look-head {
+  0%,
+  22%,
+  100% {
+    transform: rotate(0deg);
+  }
+  30%,
+  42% {
+    transform: rotate(-7deg);
+  }
+  54%,
+  68% {
+    transform: rotate(7deg) translateY(-1px);
+  }
+  76%,
+  82% {
+    transform: rotate(2deg) translateY(-2px);
+  }
+  90% {
+    transform: rotate(0deg);
+  }
+}
+@keyframes mascot-arm-swing-left {
+  0%,
+  100% {
+    transform: rotate(2deg);
+  }
+  50% {
+    transform: rotate(20deg);
+  }
+}
+@keyframes mascot-arm-swing-right {
+  0%,
+  100% {
+    transform: rotate(-2deg);
+  }
+  50% {
+    transform: rotate(-20deg);
+  }
+}
+@keyframes mascot-light {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.45);
+    opacity: 0.6;
+  }
+}
+.mascot-antenna-light,
+.mascot-chest {
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+/* A hop with anticipation: crouch, stretch up, hang, land and squash. */
+@keyframes mascot-hop {
+  0% {
+    transform: translateY(0) scale(1, 1);
+  }
+  10% {
+    transform: translateY(0) scale(1.12, 0.86);
+    animation-timing-function: var(--mascot-rise);
+  }
+  28% {
+    transform: translateY(-22px) scale(0.92, 1.1);
+  }
+  36% {
+    transform: translateY(-24px) scale(1, 1);
+    animation-timing-function: var(--mascot-fall);
+  }
+  48% {
+    transform: translateY(0) scale(1.14, 0.84);
+  }
+  58% {
+    transform: translateY(0) scale(0.96, 1.05);
+  }
+  66%,
+  100% {
+    transform: translateY(0) scale(1, 1);
+  }
+}
+@keyframes mascot-shadow-hop {
+  0%,
+  66%,
+  100% {
+    transform: scaleX(1);
+    opacity: 1;
+  }
+  10% {
+    transform: scaleX(1.1);
+  }
+  28%,
+  36% {
+    transform: scaleX(0.55);
+    opacity: 0.4;
+  }
+  48% {
+    transform: scaleX(1.15);
+    opacity: 1;
+  }
+}
+/* The antenna whips after a landing. */
+@keyframes mascot-whip {
+  0%,
+  100% {
+    transform: rotate(0deg);
+  }
+  12% {
+    transform: rotate(-10deg);
+  }
+  30% {
+    transform: rotate(14deg);
+  }
+  50% {
+    transform: rotate(-22deg);
+  }
+  62% {
+    transform: rotate(12deg);
+  }
+  74% {
+    transform: rotate(-5deg);
+  }
+}
+
+/* Idle: floats, looks around and turns its head to follow, swings its
+   arms a beat behind the body, the antenna trailing. */
+.mascot[data-state="idle"] .mascot-body,
+.mascot[data-state="waiting"] .mascot-body {
+  animation: mascot-float 4.3s ease-in-out infinite;
+}
+.mascot[data-state="idle"] .mascot-shadow,
+.mascot[data-state="waiting"] .mascot-shadow {
+  animation: mascot-shadow-float 4.3s ease-in-out infinite;
+}
+.mascot[data-state="idle"] .mascot-eyes {
+  animation: mascot-look 8.7s var(--ease-standard) infinite;
+}
+.mascot[data-state="idle"] .mascot-head {
+  animation: mascot-look-head 8.7s var(--mascot-spring) infinite;
+}
+.mascot[data-state="idle"] .mascot-antenna {
+  animation: mascot-sway 4.3s ease-in-out -720ms infinite;
+}
+.mascot[data-state="idle"] .mascot-arm-left {
+  animation: mascot-arm-swing-left 4.3s ease-in-out -440ms infinite;
+}
+.mascot[data-state="idle"] .mascot-arm-right {
+  animation: mascot-arm-swing-right 4.3s ease-in-out -440ms infinite;
+}
+
+/* Waiting: the same float, slower looks, the antenna light pulsing. */
+.mascot[data-state="waiting"] .mascot-eyes {
+  animation: mascot-look 11.6s var(--ease-standard) infinite;
+}
+.mascot[data-state="waiting"] .mascot-head {
+  animation: mascot-look-head 11.6s var(--mascot-spring) infinite;
+}
+.mascot[data-state="waiting"] .mascot-antenna {
+  animation: mascot-sway 4.3s ease-in-out -720ms infinite;
+}
+.mascot[data-state="waiting"] .mascot-antenna-light {
+  animation: mascot-light 2s ease-in-out infinite;
+}
+
+/* Greeting: an eager wave, the head tilting into it, a bouncy hop. */
+@keyframes mascot-wave {
+  0%,
+  100% {
+    transform: rotate(-128deg);
+  }
+  10%,
+  30%,
+  50% {
+    transform: rotate(-172deg);
+  }
+  20%,
+  40% {
+    transform: rotate(-114deg);
+  }
+  60% {
+    transform: rotate(-124deg);
+  }
+}
+@keyframes mascot-greet-head {
+  0%,
+  100% {
+    transform: rotate(-12deg);
+  }
+  50% {
+    transform: rotate(6deg);
+  }
+}
+.mascot[data-state="greeting"] .mascot-arm-right {
+  transform: rotate(-128deg);
+  animation: mascot-wave 2.9s ease-in-out infinite;
+}
+.mascot[data-state="greeting"] .mascot-head {
+  animation: mascot-greet-head 2.9s var(--mascot-spring) infinite;
+}
+.mascot[data-state="greeting"] .mascot-body {
+  animation: mascot-hop 2.9s linear infinite;
+}
+.mascot[data-state="greeting"] .mascot-shadow {
+  animation: mascot-shadow-hop 2.9s linear infinite;
+}
+.mascot[data-state="greeting"] .mascot-antenna {
+  animation: mascot-whip 2.9s ease-in-out 1.2s infinite;
+}
+.mascot[data-state="greeting"] .mascot-arm-left {
+  animation: mascot-arm-swing-left 1.4s ease-in-out infinite;
+}
+@keyframes mascot-ray {
+  0%,
+  100% {
+    opacity: 0.15;
+    transform: translateX(-5px) scale(0.6);
+  }
+  50% {
+    opacity: 1;
+    transform: translateX(3px) scale(1.15);
+  }
+}
+.mascot-ray {
+  transform-box: fill-box;
+  transform-origin: left center;
+  animation: mascot-ray 1.3s ease-in-out infinite;
+}
+
+/* Listening: leans in toward the sound and nods along, eyes wide and
+   fixed on the speaker, sound ripples into the ear. */
+@keyframes mascot-listen-head {
+  0%,
+  30%,
+  100% {
+    transform: rotate(-11deg);
+  }
+  40% {
+    transform: rotate(-8deg) translateY(6px);
+  }
+  50% {
+    transform: rotate(-12deg) translateY(-1px);
+  }
+  60% {
+    transform: rotate(-8deg) translateY(6px);
+  }
+  72% {
+    transform: rotate(-11deg);
+  }
+}
+@keyframes mascot-listen-body {
+  0%,
+  100% {
+    transform: rotate(3deg) translateY(0) scale(1.02, 0.98);
+  }
+  50% {
+    transform: rotate(4deg) translateY(-7px) scale(0.99, 1.01);
+  }
+}
+@keyframes mascot-attend {
+  0%,
+  100% {
+    transform: translate(5px, 0) scale(1.08);
+  }
+  50% {
+    transform: translate(8px, -2px) scale(1.12);
+  }
+}
+.mascot[data-state="listening"] .mascot-head {
+  transform: rotate(-11deg);
+  animation: mascot-listen-head 4.1s var(--mascot-spring) infinite;
+}
+.mascot[data-state="listening"] .mascot-eyes {
+  animation: mascot-attend 4.1s ease-in-out infinite;
+}
+.mascot[data-state="listening"] .mascot-antenna {
+  transform: rotate(12deg);
+  animation: mascot-sway 2s ease-in-out infinite;
+}
+.mascot[data-state="listening"] .mascot-antenna-light {
+  animation: mascot-light 2s ease-in-out infinite;
+}
+.mascot[data-state="listening"] .mascot-body {
+  animation: mascot-listen-body 4.1s ease-in-out infinite;
+}
+.mascot[data-state="listening"] .mascot-shadow {
+  animation: mascot-shadow-float 4.1s ease-in-out infinite;
+}
+.mascot[data-state="listening"] .mascot-arm-right {
+  transform: rotate(-38deg);
+}
+.mascot[data-state="listening"] .mascot-arm-left {
+  transform: rotate(14deg);
+}
+@keyframes mascot-wave-in {
+  0% {
+    opacity: 0;
+    transform: translateX(10px) scale(1.2);
+  }
+  35% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translateX(-6px) scale(0.8);
+  }
+}
+.mascot-wave {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mascot-wave-in 1.9s ease-out infinite;
+}
+
+/* Speaking: bounces with the words, the head bobs and turns, both hands
+   gesture out of step with each other. */
+@keyframes mascot-talk-head {
+  0%,
+  100% {
+    transform: rotate(-6deg) translateY(0);
+  }
+  25% {
+    transform: rotate(4deg) translateY(-5px);
+  }
+  50% {
+    transform: rotate(-2deg) translateY(1px);
+  }
+  75% {
+    transform: rotate(7deg) translateY(-4px);
+  }
+}
+@keyframes mascot-talk-body {
+  0%,
+  50%,
+  100% {
+    transform: translateY(0) scale(1.04, 0.96);
+  }
+  25%,
+  75% {
+    transform: translateY(-7px) scale(0.98, 1.03);
+  }
+}
+@keyframes mascot-gesture-right {
+  0%,
+  100% {
+    transform: rotate(-14deg);
+  }
+  22% {
+    transform: rotate(-84deg);
+  }
+  40% {
+    transform: rotate(-62deg);
+  }
+  62% {
+    transform: rotate(-96deg);
+  }
+  80% {
+    transform: rotate(-30deg);
+  }
+}
+@keyframes mascot-gesture-left {
+  0%,
+  100% {
+    transform: rotate(6deg);
+  }
+  35% {
+    transform: rotate(52deg);
+  }
+  55% {
+    transform: rotate(38deg);
+  }
+}
+@keyframes mascot-eyes-talk {
+  0%,
+  100% {
+    transform: translateY(0) scale(1, 1);
+  }
+  50% {
+    transform: translateY(-3px) scale(1.06, 0.9);
+  }
+}
+.mascot[data-state="speaking"] .mascot-head {
+  animation: mascot-talk-head 1.9s var(--mascot-spring) infinite;
+}
+.mascot[data-state="speaking"] .mascot-arm-right {
+  animation: mascot-gesture-right 3.2s var(--mascot-spring) infinite;
+}
+.mascot[data-state="speaking"] .mascot-arm-left {
+  animation: mascot-gesture-left 4.2s var(--mascot-spring) infinite;
+}
+.mascot[data-state="speaking"] .mascot-eyes {
+  animation: mascot-eyes-talk 940ms ease-in-out infinite;
+}
+.mascot[data-state="speaking"] .mascot-body {
+  animation: mascot-talk-body 1.9s ease-in-out infinite;
+}
+.mascot[data-state="speaking"] .mascot-shadow {
+  animation: mascot-shadow-float 940ms ease-in-out infinite;
+}
+.mascot[data-state="speaking"] .mascot-antenna {
+  animation: mascot-sway 940ms ease-in-out -220ms infinite;
+}
+.mascot[data-state="speaking"]:not([data-metered]) .mascot-chest {
+  animation: mascot-light 870ms ease-in-out infinite;
+}
+@keyframes mascot-bar {
+  0%,
+  100% {
+    transform: scaleY(0.25);
+  }
+  50% {
+    transform: scaleY(1.15);
+  }
+}
+.mascot-bar {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mascot-bar 750ms ease-in-out infinite;
+}
+
+/* Thinking: hand on the chin tapping, eyes jumping from idea to idea,
+   the head rocking slowly, dots rising one after another. */
+@keyframes mascot-think-head {
+  0%,
+  100% {
+    transform: rotate(4deg);
+  }
+  45%,
+  60% {
+    transform: rotate(14deg) translateY(-2px);
+  }
+}
+@keyframes mascot-think-body {
+  0%,
+  100% {
+    transform: rotate(-2deg) translateY(0);
+  }
+  50% {
+    transform: rotate(2deg) translateY(-5px);
+  }
+}
+@keyframes mascot-search {
+  0%,
+  22% {
+    transform: translate(-6px, -2px);
+  }
+  28%,
+  52% {
+    transform: translate(6px, -5px);
+  }
+  58%,
+  80% {
+    transform: translate(0, -7px);
+  }
+  86%,
+  100% {
+    transform: translate(-6px, -2px);
+  }
+}
+@keyframes mascot-chin-tap {
+  0%,
+  100% {
+    transform: rotate(112deg);
+  }
+  50% {
+    transform: rotate(128deg);
+  }
+}
+.mascot[data-state="thinking"] .mascot-head,
+.mascot[data-state="generating"] .mascot-head {
+  transform: rotate(6deg);
+  animation: mascot-think-head 3.8s ease-in-out infinite;
+}
+.mascot[data-state="thinking"] .mascot-body {
+  animation: mascot-think-body 3.8s ease-in-out infinite;
+}
+.mascot[data-state="thinking"] .mascot-eyes {
+  animation: mascot-search 4.6s var(--ease-standard) infinite;
+}
+.mascot[data-state="thinking"] .mascot-arm-right,
+.mascot[data-state="generating"] .mascot-arm-right {
+  transform: rotate(116deg);
+  animation: mascot-chin-tap 1s ease-in-out infinite;
+}
+.mascot[data-state="thinking"] .mascot-arm-left,
+.mascot[data-state="generating"] .mascot-arm-left {
+  transform: rotate(-24deg);
+}
+.mascot[data-state="thinking"] .mascot-antenna {
+  animation: mascot-sway 3.8s ease-in-out -580ms infinite;
+}
+.mascot[data-state="thinking"] .mascot-antenna-light {
+  animation: mascot-light 1.7s ease-in-out infinite;
+}
+@keyframes mascot-dot {
+  0%,
+  100% {
+    opacity: 0.2;
+    transform: translateY(0) scale(0.7);
+  }
+  35% {
+    opacity: 1;
+    transform: translateY(-9px) scale(1.2);
+  }
+}
+.mascot-dot {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mascot-dot 1.4s var(--mascot-spring) infinite;
+}
+
+/* Generating a follow-up: the same pose, buzzing with it — eyes darting,
+   a jittery bounce, the antenna flashing, ideas sparkling. */
+@keyframes mascot-dart {
+  0%,
+  100% {
+    transform: translate(-6px, -3px);
+  }
+  25% {
+    transform: translate(6px, -3px);
+  }
+  50% {
+    transform: translate(-3px, -6px);
+  }
+  75% {
+    transform: translate(7px, -5px);
+  }
+}
+@keyframes mascot-buzz {
+  0%,
+  100% {
+    transform: translateY(0) scale(1.03, 0.97);
+  }
+  50% {
+    transform: translateY(-5px) scale(0.98, 1.02);
+  }
+}
+.mascot[data-state="generating"] .mascot-eyes {
+  animation: mascot-dart 1.7s steps(1, end) infinite;
+}
+.mascot[data-state="generating"] .mascot-body {
+  animation: mascot-buzz 720ms ease-in-out infinite;
+}
+.mascot[data-state="generating"] .mascot-antenna {
+  animation: mascot-sway 720ms ease-in-out infinite;
+}
+.mascot[data-state="generating"] .mascot-antenna-light {
+  animation: mascot-light 720ms ease-in-out infinite;
+}
+@keyframes mascot-twinkle {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1.15) rotate(0deg);
+  }
+  50% {
+    opacity: 0.25;
+    transform: scale(0.4) rotate(90deg);
+  }
+}
+.mascot-twinkle {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mascot-twinkle 1.7s ease-in-out infinite;
+}
+
+/* Taking notes: looks down, scribbles fast, nods as it writes; the lines
+   on the pad fill in. */
+@keyframes mascot-write {
+  0%,
+  100% {
+    transform: rotate(30deg);
+  }
+  20% {
+    transform: rotate(44deg);
+  }
+  40% {
+    transform: rotate(32deg);
+  }
+  60% {
+    transform: rotate(46deg);
+  }
+  80% {
+    transform: rotate(34deg);
+  }
+}
+@keyframes mascot-note-head {
+  0%,
+  100% {
+    transform: translateY(3px) rotate(-2deg);
+  }
+  50% {
+    transform: translateY(8px) rotate(5deg);
+  }
+}
+.mascot[data-state="notes"] .mascot-arm-right {
+  transform: rotate(36deg);
+  animation: mascot-write 870ms ease-in-out infinite;
+}
+.mascot[data-state="notes"] .mascot-arm-left {
+  transform: rotate(-36deg);
+}
+.mascot[data-state="notes"] .mascot-head {
+  animation: mascot-note-head 1.7s var(--mascot-spring) infinite;
+}
+.mascot[data-state="notes"] .mascot-eyes {
+  animation: mascot-attend 1.7s ease-in-out infinite;
+}
+.mascot[data-state="notes"] .mascot-antenna {
+  animation: mascot-sway 1.7s ease-in-out -440ms infinite;
+}
+@keyframes mascot-note-line {
+  0% {
+    transform: scaleX(0);
+  }
+  60%,
+  100% {
+    transform: scaleX(1);
+  }
+}
+.mascot-note-line {
+  transform-box: fill-box;
+  transform-origin: left center;
+  animation: mascot-note-line 2.9s var(--ease-standard) infinite;
+}
+
+/* Evaluating: turns to its chart and points along it, eyes scanning the
+   bars as they build up. */
+@keyframes mascot-point {
+  0%,
+  100% {
+    transform: rotate(-92deg);
+  }
+  50% {
+    transform: rotate(-118deg);
+  }
+}
+@keyframes mascot-eval-head {
+  0%,
+  100% {
+    transform: rotate(5deg) translateX(3px);
+  }
+  50% {
+    transform: rotate(10deg) translateX(5px) translateY(-2px);
+  }
+}
+@keyframes mascot-scan {
+  0%,
+  100% {
+    transform: translate(6px, 3px);
+  }
+  50% {
+    transform: translate(9px, -3px);
+  }
+}
+.mascot[data-state="evaluating"] .mascot-arm-right {
+  transform: rotate(-100deg);
+  animation: mascot-point 1.7s var(--mascot-spring) infinite;
+}
+.mascot[data-state="evaluating"] .mascot-head {
+  animation: mascot-eval-head 3.5s ease-in-out infinite;
+}
+.mascot[data-state="evaluating"] .mascot-eyes {
+  transform: translate(7px, 0);
+  animation: mascot-scan 1.7s ease-in-out infinite;
+}
+.mascot[data-state="evaluating"] .mascot-body {
+  animation: mascot-float 3.5s ease-in-out infinite;
+}
+.mascot[data-state="evaluating"] .mascot-shadow {
+  animation: mascot-shadow-float 3.5s ease-in-out infinite;
+}
+.mascot[data-state="evaluating"] .mascot-antenna {
+  animation: mascot-sway 3.5s ease-in-out -580ms infinite;
+}
+@keyframes mascot-grow {
+  0% {
+    transform: scaleY(0.15);
+  }
+  40% {
+    transform: scaleY(1.15);
+  }
+  52%,
+  100% {
+    transform: scaleY(1);
+  }
+}
+.mascot-grow {
+  transform-box: fill-box;
+  transform-origin: bottom center;
+  animation: mascot-grow 3.5s var(--ease-emphasized) infinite;
+}
+
+/* Success: a fist pumped hard, two big hops, the check drawn in. */
+@keyframes mascot-pump {
+  0%,
+  100% {
+    transform: rotate(-140deg);
+  }
+  50% {
+    transform: rotate(-178deg);
+  }
+}
+.mascot[data-state="success"] .mascot-arm-right {
+  transform: rotate(-150deg);
+  animation: mascot-pump 650ms var(--mascot-spring) 4;
+}
+.mascot[data-state="success"] .mascot-body {
+  animation: mascot-hop 1.6s linear 2;
+}
+.mascot[data-state="success"] .mascot-shadow {
+  animation: mascot-shadow-hop 1.6s linear 2;
+}
+.mascot[data-state="success"] .mascot-antenna {
+  animation: mascot-whip 1.6s ease-in-out 650ms 2;
+}
+.mascot[data-state="success"] .mascot-head {
+  transform: rotate(-8deg);
+}
+
+/* Warning: a puzzled tilt and a jumpy double-take — the body flinches,
+   the eyes pop; the sign wiggles. */
+@keyframes mascot-concern {
+  0%,
+  64%,
+  100% {
+    transform: rotate(-8deg);
+  }
+  70% {
+    transform: rotate(9deg) translateY(-4px);
+  }
+  78% {
+    transform: rotate(-8deg);
+  }
+  84% {
+    transform: rotate(6deg) translateY(-2px);
+  }
+  90% {
+    transform: rotate(-8deg);
+  }
+}
+@keyframes mascot-flinch {
+  0%,
+  64%,
+  100% {
+    transform: translateY(0) scale(1, 1);
+  }
+  67% {
+    transform: translateY(0) scale(1.08, 0.9);
+  }
+  72% {
+    transform: translateY(-10px) scale(0.95, 1.06);
+  }
+  80% {
+    transform: translateY(0) scale(1.04, 0.96);
+  }
+  86% {
+    transform: translateY(0) scale(1, 1);
+  }
+}
+@keyframes mascot-eyes-pop {
+  0%,
+  66%,
+  100% {
+    transform: scale(1);
+  }
+  72% {
+    transform: scale(1.35);
+  }
+  82% {
+    transform: scale(1.1);
+  }
+}
+.mascot[data-state="warning"] .mascot-head {
+  transform: rotate(-8deg);
+  animation: mascot-concern 4.3s ease-in-out infinite;
+}
+.mascot[data-state="warning"] .mascot-body {
+  animation: mascot-flinch 4.3s ease-in-out infinite;
+}
+.mascot[data-state="warning"] .mascot-eyes {
+  animation: mascot-eyes-pop 4.3s var(--mascot-spring) infinite;
+}
+.mascot[data-state="warning"] .mascot-antenna {
+  animation: mascot-whip 4.3s ease-in-out 2.9s infinite;
+}
+.mascot[data-state="warning"] .mascot-arm-right {
+  transform: rotate(-40deg);
+}
+.mascot[data-state="warning"] .mascot-arm-left {
+  transform: rotate(22deg);
+}
+@keyframes mascot-wiggle {
+  0%,
+  60%,
+  100% {
+    transform: rotate(0deg) scale(1);
+  }
+  68% {
+    transform: rotate(-16deg) scale(1.12);
+  }
+  76% {
+    transform: rotate(14deg) scale(1.08);
+  }
+  84% {
+    transform: rotate(-8deg) scale(1);
+  }
+  92% {
+    transform: rotate(4deg);
+  }
+}
+.mascot-wiggle {
+  transform-box: fill-box;
+  transform-origin: center bottom;
+  animation: mascot-wiggle 4.3s ease-in-out infinite;
+}
+
+/* Error: a hard shake when it happens, then it slumps: the head droops,
+   the antenna wilts, the body sighs. The badge pulses. */
+@keyframes mascot-shake {
+  0% {
+    transform: translateX(0) rotate(0deg);
+  }
+  12%,
+  44%,
+  76% {
+    transform: translateX(-8px) rotate(-3deg);
+  }
+  28%,
+  60%,
+  90% {
+    transform: translateX(8px) rotate(3deg);
+  }
+  100% {
+    transform: translateY(3px) scale(1.04, 0.95);
+  }
+}
+@keyframes mascot-sigh {
+  0%,
+  100% {
+    transform: translateY(3px) scale(1.04, 0.95);
+  }
+  45% {
+    transform: translateY(-2px) scale(0.99, 1.01);
+  }
+}
+.mascot[data-state="error"] .mascot-body {
+  transform: translateY(3px) scale(1.04, 0.95);
+  animation:
+    mascot-shake 870ms ease-in-out 1,
+    mascot-sigh 5.8s ease-in-out 870ms infinite;
+}
+.mascot[data-state="error"] .mascot-head {
+  transform: rotate(-7deg) translateY(7px);
+}
+.mascot[data-state="error"] .mascot-antenna {
+  transform: rotate(-38deg);
+}
+.mascot[data-state="error"] .mascot-eyes {
+  transform: translateY(3px);
+}
+.mascot[data-state="error"] .mascot-arm-left {
+  transform: rotate(-2deg);
+}
+.mascot[data-state="error"] .mascot-arm-right {
+  transform: rotate(2deg);
+}
+@keyframes mascot-halo {
+  0% {
+    opacity: 0.6;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.9);
+  }
+}
+.mascot-halo {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mascot-halo 2s ease-out infinite;
+}
+
+/* Interview complete: jumping for joy, both arms up cheering out of step;
+   confetti tumbles down. */
+@keyframes mascot-cheer-right {
+  0%,
+  100% {
+    transform: rotate(-146deg);
+  }
+  50% {
+    transform: rotate(-180deg);
+  }
+}
+@keyframes mascot-cheer-left {
+  0%,
+  100% {
+    transform: rotate(180deg);
+  }
+  50% {
+    transform: rotate(146deg);
+  }
+}
+@keyframes mascot-cheer-head {
+  0%,
+  100% {
+    transform: rotate(-8deg);
+  }
+  50% {
+    transform: rotate(8deg);
+  }
+}
+.mascot[data-state="complete"] .mascot-arm-right {
+  transform: rotate(-160deg);
+  animation: mascot-cheer-right 870ms ease-in-out infinite;
+}
+.mascot[data-state="complete"] .mascot-arm-left {
+  transform: rotate(160deg);
+  animation: mascot-cheer-left 870ms ease-in-out -220ms infinite;
+}
+.mascot[data-state="complete"] .mascot-head {
+  animation: mascot-cheer-head 1.7s var(--mascot-spring) infinite;
+}
+.mascot[data-state="complete"] .mascot-body {
+  animation: mascot-hop 1.7s linear infinite;
+}
+.mascot[data-state="complete"] .mascot-shadow {
+  animation: mascot-shadow-hop 1.7s linear infinite;
+}
+.mascot[data-state="complete"] .mascot-antenna {
+  animation: mascot-whip 1.7s ease-in-out 720ms infinite;
+}
+@keyframes mascot-confetti {
+  0% {
+    opacity: 0;
+    transform: translate(0, -14px) rotate(0deg);
+  }
+  15% {
+    opacity: 1;
+  }
+  50% {
+    transform: translate(5px, 12px) rotate(200deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(-4px, 40px) rotate(420deg);
+  }
+}
+.mascot-confetti {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mascot-confetti 2.3s ease-in infinite;
+}
+
+/* Dancing: grooves side to side on the beat, bouncing between steps, the
+   head bobbing against the hips, arms pointing up in turn; notes float up. */
+@keyframes mascot-groove {
+  0%,
+  100% {
+    transform: translate(-7px, 0) rotate(-6deg) scale(1.05, 0.95);
+  }
+  25% {
+    transform: translate(0, -12px) rotate(0deg) scale(0.97, 1.04);
+  }
+  50% {
+    transform: translate(7px, 0) rotate(6deg) scale(1.05, 0.95);
+  }
+  75% {
+    transform: translate(0, -12px) rotate(0deg) scale(0.97, 1.04);
+  }
+}
+@keyframes mascot-groove-shadow {
+  0%,
+  100% {
+    transform: translateX(-7px) scaleX(1.05);
+    opacity: 1;
+  }
+  25%,
+  75% {
+    transform: translateX(0) scaleX(0.75);
+    opacity: 0.55;
+  }
+  50% {
+    transform: translateX(7px) scaleX(1.05);
+    opacity: 1;
+  }
+}
+@keyframes mascot-groove-head {
+  0%,
+  100% {
+    transform: rotate(9deg) translateY(0);
+  }
+  25%,
+  75% {
+    transform: rotate(0deg) translateY(-3px);
+  }
+  50% {
+    transform: rotate(-9deg) translateY(0);
+  }
+}
+@keyframes mascot-disco-right {
+  0%,
+  38%,
+  100% {
+    transform: rotate(-158deg);
+  }
+  50%,
+  88% {
+    transform: rotate(-24deg);
+  }
+}
+@keyframes mascot-disco-left {
+  0%,
+  38%,
+  100% {
+    transform: rotate(24deg);
+  }
+  50%,
+  88% {
+    transform: rotate(158deg);
+  }
+}
+.mascot[data-state="dancing"] .mascot-body {
+  animation: mascot-groove 2.4s ease-in-out infinite;
+}
+.mascot[data-state="dancing"] .mascot-shadow {
+  animation: mascot-groove-shadow 2.4s ease-in-out infinite;
+}
+.mascot[data-state="dancing"] .mascot-head {
+  animation: mascot-groove-head 2.4s var(--mascot-spring) infinite;
+}
+.mascot[data-state="dancing"] .mascot-arm-right {
+  transform: rotate(-158deg);
+  animation: mascot-disco-right 2.4s var(--mascot-spring) infinite;
+}
+.mascot[data-state="dancing"] .mascot-arm-left {
+  transform: rotate(24deg);
+  animation: mascot-disco-left 2.4s var(--mascot-spring) infinite;
+}
+.mascot[data-state="dancing"] .mascot-eyes {
+  animation: mascot-eyes-talk 1.2s ease-in-out infinite;
+}
+.mascot[data-state="dancing"] .mascot-antenna {
+  animation: mascot-sway 1.2s ease-in-out -0.3s infinite;
+}
+@keyframes mascot-music {
+  0% {
+    opacity: 0;
+    transform: translate(0, 8px) rotate(-12deg) scale(0.6);
+  }
+  20% {
+    opacity: 1;
+    transform: translate(3px, 0) rotate(8deg) scale(1);
+  }
+  60% {
+    transform: translate(-3px, -14px) rotate(-8deg) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translate(2px, -26px) rotate(10deg) scale(0.9);
+  }
+}
+.mascot-music {
+  transform-box: fill-box;
+  transform-origin: center;
+  opacity: 0;
+  animation: mascot-music 2.4s ease-out infinite;
+}
+
+/* Watching: idles in place while the eyes and head follow the pointer.
+   The home page writes --mascot-look-x/-y (-1..1); `translate`/`rotate`
+   compose with the looping `transform`, and ease toward each new target. */
+.mascot-eyes,
+.mascot-head {
+  transition:
+    translate 220ms var(--ease-standard),
+    rotate 220ms var(--ease-standard);
+}
+.mascot[data-state="watching"] .mascot-eyes {
+  translate: calc(var(--mascot-look-x, 0) * 11px)
+    calc(var(--mascot-look-y, 0) * 7px);
+}
+.mascot[data-state="watching"] .mascot-head {
+  rotate: calc(var(--mascot-look-x, 0) * 9deg);
+  translate: calc(var(--mascot-look-x, 0) * 3px)
+    calc(var(--mascot-look-y, 0) * 3px);
+}
+.mascot[data-state="watching"] .mascot-body {
+  animation: mascot-float 4.3s ease-in-out infinite;
+}
+.mascot[data-state="watching"] .mascot-shadow {
+  animation: mascot-shadow-float 4.3s ease-in-out infinite;
+}
+.mascot[data-state="watching"] .mascot-antenna {
+  animation: mascot-sway 4.3s ease-in-out -720ms infinite;
+}
+.mascot[data-state="watching"] .mascot-arm-left {
+  animation: mascot-arm-swing-left 4.3s ease-in-out -440ms infinite;
+}
+.mascot[data-state="watching"] .mascot-arm-right {
+  animation: mascot-arm-swing-right 4.3s ease-in-out -440ms infinite;
+}
+
+/* Recharging: slumped with its eyes shut, breathing slowly while the
+   battery fills cell by cell; the head lifts and the wilted antenna perks
+   up as the charge comes in. Plays once across 6.4 s. */
+@keyframes mascot-wake {
+  0% {
+    transform: rotate(-6deg) translateY(8px);
+  }
+  85% {
+    transform: rotate(-2deg) translateY(3px);
+  }
+  100% {
+    transform: rotate(0deg) translateY(0);
+  }
+}
+@keyframes mascot-perk {
+  0% {
+    transform: rotate(-40deg);
+  }
+  80% {
+    transform: rotate(-8deg);
+  }
+  90% {
+    transform: rotate(12deg);
+  }
+  100% {
+    transform: rotate(0deg);
+  }
+}
+@keyframes mascot-cell {
+  from {
+    opacity: 0;
+    transform: scaleY(0.2);
+  }
+  to {
+    opacity: 1;
+    transform: scaleY(1);
+  }
+}
+.mascot[data-state="charging"] .mascot-body {
+  transform: translateY(3px) scale(1.04, 0.95);
+  animation: mascot-sigh 3.2s ease-in-out infinite;
+}
+.mascot[data-state="charging"] .mascot-shadow {
+  animation: mascot-shadow-float 3.2s ease-in-out infinite;
+}
+.mascot[data-state="charging"] .mascot-head {
+  transform: rotate(-6deg) translateY(8px);
+  animation: mascot-wake 6.4s ease-in-out forwards;
+}
+.mascot[data-state="charging"] .mascot-antenna {
+  transform: rotate(-40deg);
+  animation: mascot-perk 6.4s ease-in-out forwards;
+}
+.mascot[data-state="charging"] .mascot-antenna-light,
+.mascot[data-state="charging"] .mascot-chest {
+  animation: mascot-light 1.2s ease-in-out infinite;
+}
+.mascot[data-state="charging"] .mascot-arm-left {
+  transform: rotate(0deg);
+}
+.mascot[data-state="charging"] .mascot-arm-right {
+  transform: rotate(0deg);
+}
+.mascot-cell {
+  transform-box: fill-box;
+  transform-origin: bottom center;
+  animation: mascot-cell 420ms var(--mascot-spring) both;
+}
+.mascot-bolt {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mascot-light 900ms ease-in-out infinite;
+}
+
+/* Tickled: squirming with laughter, eyes squeezed shut, one hand on its
+   belly and the other flapping; "ha"s bubble up around it. */
+@keyframes mascot-giggle {
+  0%,
+  100% {
+    transform: translate(0, 0) rotate(0deg) scale(1.04, 0.96);
+  }
+  25% {
+    transform: translate(-3px, -5px) rotate(-5deg) scale(0.97, 1.04);
+  }
+  50% {
+    transform: translate(0, 0) rotate(0deg) scale(1.05, 0.95);
+  }
+  75% {
+    transform: translate(3px, -5px) rotate(5deg) scale(0.97, 1.04);
+  }
+}
+@keyframes mascot-giggle-head {
+  0%,
+  100% {
+    transform: rotate(-7deg) translateY(1px);
+  }
+  50% {
+    transform: rotate(7deg) translateY(-3px);
+  }
+}
+@keyframes mascot-flap {
+  0%,
+  100% {
+    transform: rotate(48deg);
+  }
+  50% {
+    transform: rotate(86deg);
+  }
+}
+@keyframes mascot-belly {
+  0%,
+  100% {
+    transform: rotate(34deg);
+  }
+  50% {
+    transform: rotate(46deg);
+  }
+}
+@keyframes mascot-haha {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.5) rotate(-12deg);
+  }
+  30% {
+    opacity: 1;
+    transform: translateY(0) scale(1.1) rotate(6deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-14px) scale(0.9) rotate(-4deg);
+  }
+}
+.mascot[data-state="tickled"] .mascot-body {
+  animation: mascot-giggle 480ms ease-in-out infinite;
+}
+.mascot[data-state="tickled"] .mascot-shadow {
+  animation: mascot-shadow-float 480ms ease-in-out infinite;
+}
+.mascot[data-state="tickled"] .mascot-head {
+  animation: mascot-giggle-head 240ms ease-in-out infinite;
+}
+.mascot[data-state="tickled"] .mascot-arm-left {
+  transform: rotate(48deg);
+  animation: mascot-flap 300ms ease-in-out infinite;
+}
+.mascot[data-state="tickled"] .mascot-arm-right {
+  transform: rotate(34deg);
+  animation: mascot-belly 240ms ease-in-out infinite;
+}
+.mascot[data-state="tickled"] .mascot-antenna {
+  animation: mascot-sway 300ms ease-in-out infinite;
+}
+.mascot-haha {
+  transform-box: fill-box;
+  transform-origin: center;
+  opacity: 0;
+  animation: mascot-haha 900ms ease-out infinite;
+}
+
+/* Angry: the screen flushes red, it stomps and trembles with clenched
+   fists, the antenna light burns red; an anger mark throbs and steam puffs
+   from its ears. */
+@keyframes mascot-stomp {
+  0%,
+  100% {
+    transform: translateY(0) scale(1.07, 0.92);
+  }
+  25% {
+    transform: translateY(-7px) scale(0.97, 1.04);
+    animation-timing-function: var(--mascot-fall);
+  }
+  45% {
+    transform: translateY(0) scale(1.1, 0.88);
+  }
+  55% {
+    transform: translateX(-2px) scale(1.07, 0.92);
+  }
+  65% {
+    transform: translateX(2px) scale(1.07, 0.92);
+  }
+  75% {
+    transform: translateX(0) scale(1.07, 0.92);
+  }
+}
+@keyframes mascot-fume {
+  0%,
+  100% {
+    transform: rotate(-2.5deg) translateY(4px);
+  }
+  50% {
+    transform: rotate(2.5deg) translateY(4px);
+  }
+}
+@keyframes mascot-fist-left {
+  0%,
+  100% {
+    transform: rotate(22deg);
+  }
+  50% {
+    transform: rotate(12deg);
+  }
+}
+@keyframes mascot-fist-right {
+  0%,
+  100% {
+    transform: rotate(-22deg);
+  }
+  50% {
+    transform: rotate(-12deg);
+  }
+}
+@keyframes mascot-tremble {
+  0%,
+  100% {
+    transform: rotate(-4deg);
+  }
+  50% {
+    transform: rotate(4deg);
+  }
+}
+@keyframes mascot-throb {
+  0%,
+  100% {
+    transform: scale(0.85);
+  }
+  50% {
+    transform: scale(1.2);
+  }
+}
+@keyframes mascot-steam {
+  0% {
+    opacity: 0;
+    transform: translate(0, 0) scale(0.4);
+  }
+  25% {
+    opacity: 0.95;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(var(--steam-x, 0), -24px) scale(1.5);
+  }
+}
+.mascot-flush {
+  opacity: 0;
+  transition: opacity 400ms var(--ease-standard);
+}
+.mascot[data-state="angry"] .mascot-flush {
+  opacity: 0.4;
+}
+.mascot[data-state="angry"] .mascot-body {
+  animation: mascot-stomp 700ms ease-out infinite;
+}
+.mascot[data-state="angry"] .mascot-shadow {
+  animation: mascot-shadow-float 700ms ease-out infinite;
+}
+.mascot[data-state="angry"] .mascot-head {
+  transform: translateY(4px);
+  animation: mascot-fume 110ms linear infinite;
+}
+.mascot[data-state="angry"] .mascot-arm-left {
+  transform: rotate(22deg);
+  animation: mascot-fist-left 350ms ease-in-out infinite;
+}
+.mascot[data-state="angry"] .mascot-arm-right {
+  transform: rotate(-22deg);
+  animation: mascot-fist-right 350ms ease-in-out infinite;
+}
+.mascot[data-state="angry"] .mascot-antenna {
+  animation: mascot-tremble 90ms linear infinite;
+}
+.mascot[data-state="angry"] .mascot-antenna-light {
+  fill: var(--mascot-signal-error);
+}
+.mascot-vein {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mascot-throb 500ms ease-in-out infinite;
+}
+.mascot-steam {
+  transform-box: fill-box;
+  transform-origin: center;
+  opacity: 0;
+  animation: mascot-steam 1.05s ease-out infinite;
+}
+
+/* Each state's symbol eases in beside the character. */
+@keyframes mascot-symbol-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.mascot-symbol {
+  animation: mascot-symbol-in 400ms var(--ease-standard) both;
+}
+
+/* A state symbol arriving. */
+@keyframes mascot-pop {
+  0% {
+    opacity: 0;
+    transform: scale(0.3) rotate(-20deg);
+  }
+  60% {
+    opacity: 1;
+    transform: scale(1.2) rotate(6deg);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1) rotate(0deg);
+  }
+}
+.mascot-pop {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mascot-pop 420ms var(--ease-standard) both;
+}
+@keyframes mascot-draw {
+  from {
+    stroke-dashoffset: 1;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.mascot-draw {
+  stroke-dasharray: 1;
+  animation: mascot-draw 400ms 250ms var(--ease-standard) both;
+}
+
+/* Reduced motion: loops settle on their first frame; these would settle
+   faded out, so they hold still instead. */
+@media (prefers-reduced-motion: reduce) {
+  .mascot-wave,
+  .mascot-ray,
+  .mascot-dot,
+  .mascot-confetti {
+    animation: none !important;
+  }
+  .mascot-music,
+  .mascot-haha {
+    animation: none !important;
+    opacity: 1;
+  }
+  .mascot-steam {
+    animation: none !important;
+  }
 }

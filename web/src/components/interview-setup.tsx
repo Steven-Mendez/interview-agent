@@ -3,7 +3,13 @@ import { useNavigate } from "@tanstack/react-router"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { useForm } from "@tanstack/react-form"
 import * as z from "zod"
-import { ArrowLeftIcon, CheckCircle2Icon, UploadIcon } from "lucide-react"
+import {
+  AlertCircleIcon,
+  ArrowLeftIcon,
+  CheckIcon,
+  FileTextIcon,
+  UploadIcon,
+} from "lucide-react"
 
 import {
   ApiError,
@@ -22,14 +28,6 @@ import { log } from "@/lib/log"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card"
-import {
   Field,
   FieldDescription,
   FieldError,
@@ -46,8 +44,8 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { Spinner } from "@/components/ui/spinner"
-import { PageContainer, PageShell } from "@/components/ui/page"
+import { LinearProgress, Spinner } from "@/components/ui/spinner"
+import { PageContainer, PageHeader, PageShell } from "@/components/ui/page"
 
 function optionalInteger(min: number, max: number) {
   return z
@@ -214,24 +212,80 @@ const OPTION_LABELS: Record<string, string> = Object.fromEntries(
   [...SENIORITY_OPTIONS, ...LENGTH_OPTIONS].map((o) => [o.value, o.label])
 )
 
-function StepProgress({ current }: { current: number }) {
+/** Where the wizard is: a vertical list of steps on wide screens, a compact
+ *  "Step n of m" with a bar on narrow ones. */
+function Stepper({
+  current,
+  onSelect,
+  disabled,
+}: {
+  current: number
+  onSelect: (step: number) => void
+  disabled: boolean
+}) {
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex gap-1.5" aria-hidden>
-        {STEPS.map((step, i) => (
-          <span
-            key={step.id}
-            className={cn(
-              "h-1 flex-1 rounded-full transition-colors",
-              i <= current ? "bg-primary" : "bg-muted"
-            )}
-          />
-        ))}
+    <>
+      <div className="flex flex-col gap-2 @3xl/main:hidden">
+        <span className="text-xs text-muted-foreground">
+          Step {current + 1} of {STEPS.length} · {STEPS[current].title}
+        </span>
+        <div className="flex gap-1.5" aria-hidden>
+          {STEPS.map((step, i) => (
+            <span
+              key={step.id}
+              className={cn(
+                "h-1 flex-1 rounded-full transition-colors duration-200",
+                i <= current ? "bg-primary" : "bg-surface-high"
+              )}
+            />
+          ))}
+        </div>
       </div>
-      <span className="text-xs text-muted-foreground">
-        Step {current + 1} of {STEPS.length} · {STEPS[current].title}
-      </span>
-    </div>
+      <nav aria-label="Steps" className="hidden @3xl/main:block">
+        <ol className="flex flex-col gap-1">
+          {STEPS.map((step, i) => {
+            const done = i < current
+            const active = i === current
+            return (
+              <li key={step.id}>
+                <button
+                  type="button"
+                  // Only completed steps can be revisited; later ones open
+                  // through Continue, which validates on the way.
+                  disabled={!done || disabled}
+                  onClick={() => onSelect(i)}
+                  aria-current={active ? "step" : undefined}
+                  className={cn(
+                    "flex w-full items-center gap-3 rounded-full py-2 pr-4 pl-2 text-left text-sm transition-colors",
+                    active && "bg-primary-container text-on-primary-container",
+                    done && "hover:bg-foreground/[0.06]",
+                    !done && !active && "text-muted-foreground"
+                  )}
+                >
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "flex size-7 shrink-0 items-center justify-center rounded-full font-heading text-xs font-medium",
+                      active && "bg-primary text-primary-foreground",
+                      done && "bg-success-container text-success",
+                      !done && !active && "border border-border"
+                    )}
+                  >
+                    {done ? (
+                      <CheckIcon className="size-4" strokeWidth={3} />
+                    ) : (
+                      i + 1
+                    )}
+                  </span>
+                  <span className="font-heading font-medium">{step.title}</span>
+                  {done && <span className="sr-only">(done)</span>}
+                </button>
+              </li>
+            )
+          })}
+        </ol>
+      </nav>
+    </>
   )
 }
 
@@ -253,11 +307,16 @@ function FilledRow({
   disabled?: boolean
 }) {
   return (
-    <div className="flex items-center gap-3 rounded-lg border border-input px-3 py-2.5">
-      <CheckCircle2Icon className="size-4 shrink-0 text-success" />
-      <div className="flex min-w-0 flex-1 items-baseline gap-2">
+    <div className="flex items-center gap-3 rounded-xl bg-muted py-2 pr-2 pl-3">
+      <span
+        aria-hidden
+        className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-card text-primary"
+      >
+        <FileTextIcon className="size-5" />
+      </span>
+      <div className="flex min-w-0 flex-1 flex-col">
         <span className="truncate text-sm font-medium">{label}</span>
-        <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+        <span className="text-xs text-muted-foreground tabular-nums">
           {detail}
         </span>
       </div>
@@ -425,15 +484,17 @@ export function UploadPage() {
 
   return (
     <PageShell>
-      <PageContainer variant="narrow">
-        <Card>
-          <CardHeader>
-            <CardTitle>New interview</CardTitle>
-            <CardDescription>{STEPS[step].description}</CardDescription>
-            <div className="pt-2">
-              <StepProgress current={step} />
-            </div>
-          </CardHeader>
+      <PageContainer variant="wide" className="flex flex-col gap-8">
+        <PageHeader
+          title="New interview"
+          description="Four short steps, planned from your resume and the job offer."
+        />
+        <div className="grid gap-8 @3xl/main:grid-cols-[14rem_minmax(0,1fr)] @3xl/main:gap-12">
+          <Stepper
+            current={step}
+            onSelect={setStep}
+            disabled={mutation.isPending || resumePreview.pending}
+          />
           <form
             onSubmit={(event) => {
               event.preventDefault()
@@ -444,10 +505,16 @@ export function UploadPage() {
               }
               form.handleSubmit()
             }}
-            className="flex flex-col gap-(--card-spacing)"
+            className="flex max-w-2xl min-w-0 flex-col gap-8"
           >
-            <CardContent>
-              <FieldGroup>
+            <div className="flex flex-col gap-1">
+              <h2 className="text-title-lg">{STEPS[step].title}</h2>
+              <p className="text-sm text-muted-foreground">
+                {STEPS[step].description}
+              </p>
+            </div>
+            <div>
+              <FieldGroup className="gap-6">
                 {STEPS[step].id === "role" && (
                   <>
                     <form.Field
@@ -479,18 +546,23 @@ export function UploadPage() {
                               <FieldLabel
                                 htmlFor={field.name}
                                 className={cn(
-                                  "flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-input px-4 py-6 text-center transition-colors hover:bg-muted/50 has-[:disabled]:pointer-events-none has-[:disabled]:opacity-50",
-                                  isInvalid && "border-destructive/60"
+                                  "flex w-full cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-input/60 px-4 py-8 text-center transition-colors hover:border-primary hover:bg-primary-container/30 has-[:disabled]:pointer-events-none has-[:disabled]:opacity-50",
+                                  isInvalid && "border-destructive"
                                 )}
                               >
-                                <span className="flex size-9 items-center justify-center rounded-full bg-muted text-muted-foreground">
-                                  <UploadIcon className="size-4" />
+                                <span className="flex size-12 items-center justify-center rounded-full bg-primary-container text-on-primary-container">
+                                  <UploadIcon className="size-5" />
                                 </span>
-                                <span className="text-sm text-muted-foreground">
-                                  <span className="font-medium text-foreground">
-                                    Click to upload
-                                  </span>{" "}
-                                  your resume
+                                <span className="flex flex-col gap-0.5 text-sm text-muted-foreground">
+                                  <span>
+                                    <span className="font-medium text-primary">
+                                      Click to upload
+                                    </span>{" "}
+                                    your resume
+                                  </span>
+                                  <span className="text-xs">
+                                    PDF, up to 10 MB
+                                  </span>
                                 </span>
                               </FieldLabel>
                             )}
@@ -790,7 +862,8 @@ export function UploadPage() {
                     </form.Subscribe>
 
                     {settingsQuery.isError && (
-                      <Alert variant="destructive">
+                      <Alert variant="warning">
+                        <AlertCircleIcon />
                         <AlertDescription>
                           Could not load your saved settings —{" "}
                           {errorMessage(settingsQuery.error)}. The interview
@@ -1011,10 +1084,18 @@ export function UploadPage() {
                 )}
 
                 {mutation.isPending && (
-                  <FieldDescription className="flex items-center gap-2">
-                    <Spinner />
-                    Planning from the reviewed resume… (can take ~1 min)
-                  </FieldDescription>
+                  <div
+                    role="status"
+                    className="flex flex-col gap-3 rounded-xl bg-primary-container/40 px-4 py-4"
+                  >
+                    <span className="text-sm font-medium">
+                      Planning from the reviewed resume… (can take ~1 min)
+                    </span>
+                    <LinearProgress label="Planning the interview" />
+                    <span className="text-xs text-muted-foreground">
+                      The preparation room opens when the plan is ready.
+                    </span>
+                  </div>
                 )}
 
                 {resumePreview.pending && (
@@ -1025,6 +1106,7 @@ export function UploadPage() {
                 )}
                 {resumePreview.error && (
                   <Alert variant="destructive">
+                    <AlertCircleIcon />
                     <AlertDescription>
                       {errorMessage(resumePreview.error)}
                     </AlertDescription>
@@ -1033,14 +1115,15 @@ export function UploadPage() {
 
                 {mutation.isError && (
                   <Alert variant="destructive">
+                    <AlertCircleIcon />
                     <AlertDescription>
                       {errorMessage(mutation.error)}
                     </AlertDescription>
                   </Alert>
                 )}
               </FieldGroup>
-            </CardContent>
-            <CardFooter className="justify-between gap-2">
+            </div>
+            <div className="flex items-center justify-between gap-2 border-t pt-6">
               {step > 0 ? (
                 <Button
                   type="button"
@@ -1078,12 +1161,12 @@ export function UploadPage() {
                   disabled={mutation.isPending}
                   onClick={() => form.handleSubmit()}
                 >
-                  {mutation.isPending ? "Planning…" : "Start interview"}
+                  {mutation.isPending ? "Planning…" : "Prepare interview"}
                 </Button>
               )}
-            </CardFooter>
+            </div>
           </form>
-        </Card>
+        </div>
       </PageContainer>
     </PageShell>
   )

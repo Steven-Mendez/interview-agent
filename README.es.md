@@ -36,7 +36,7 @@ docker compose up -d --build
 
 Eso levanta todo el stack: Postgres, la API + frontend y el worker de LiveKit (las migraciones corren automáticamente). El currículum se guarda como texto en Postgres; los tres agentes lo reciben directamente, sin embeddings ni base de datos vectorial.
 
-Abre <http://localhost:8000>: sube un currículum en PDF, pega la oferta de trabajo, espera el plan (~30–60 s) y empieza la entrevista por voz. Al terminar, la evaluación aparece en la misma página.
+Abre <http://localhost:8000> y elige **New interview**: sube un currículum en PDF, pega la oferta de trabajo y espera el plan (~30–60 s). La sala de preparación te permite revisar el micrófono y la cámara antes de empezar la entrevista por voz. Al terminar, los resultados se abren en la aplicación en cuanto la evaluación está lista.
 
 La pantalla **History** lista todas las entrevistas que corriste, de la más reciente a la más antigua, con su puntaje, su veredicto y hasta dónde llegaron los temas — y se puede filtrar por estado. Al abrir una ves su scorecard y, plegada, la transcripción completa. **Repeat** vuelve a correr el mismo puesto: una entrevista nueva a partir del currículum y la oferta ya guardados, al mismo nivel y duración, con preguntas planificadas de cero. La original no se toca, y cada repetición queda agrupada bajo ella.
 

@@ -42,6 +42,8 @@ export interface StartOptions {
    *  published — the moment for the pre-join check to let go of the device.
    *  Anything that fails before this leaves the check untouched. */
   beforePublish?: () => void
+  /** Join with the microphone published but muted — the pre-join choice. */
+  startMuted?: boolean
   /** Runs when start() fails AFTER beforePublish ran: the microphone was let
    *  go of for nothing, so the check can take it back. */
   onPublishFailed?: () => void
@@ -433,6 +435,10 @@ export function useInterviewSession(interviewId: string): InterviewSession {
             !farewellRef.current.isFinished
           ) {
             await r.localParticipant.setMicrophoneEnabled(true)
+            // Muted in the pre-join check: published, so unmuting in the
+            // room is instant, but silent until the candidate says so.
+            if (options?.startMuted)
+              await r.localParticipant.setMicrophoneEnabled(false)
           }
           if (link.lost) {
             throw new Error(

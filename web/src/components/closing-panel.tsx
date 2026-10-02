@@ -1,10 +1,10 @@
 import * as React from "react"
-import { Link } from "@tanstack/react-router"
+import { HistoryIcon, InfoIcon } from "lucide-react"
 
+import { PostCallFrame } from "@/components/session/finalizing"
 import { Alert, AlertDescription } from "@/components/ui/alert"
-import { Button } from "@/components/ui/button"
-import { PageContainer, PageShell } from "@/components/ui/page"
-import { Spinner } from "@/components/ui/spinner"
+import { LinkButton } from "@/components/ui/link-button"
+import { LinearProgress } from "@/components/ui/spinner"
 import type { Interview } from "@/lib/api"
 
 // Initial closing lease plus two sweep intervals, as in the live supervision.
@@ -38,32 +38,35 @@ export function ClosingPanel({ interview }: { interview: Interview }) {
   }, [remaining])
 
   return (
-    <PageShell center>
-      <PageContainer
-        variant="narrow"
-        className="flex flex-col items-center gap-4 text-center"
-      >
+    <PostCallFrame
+      title="Wrapping up"
+      description="The farewell is not replayed after a reload. Results appear only once the transcript is saved."
+    >
+      <div className="flex flex-col items-center gap-6">
         {pending ? (
-          <Alert className="w-full text-left">
+          <Alert variant="info">
+            <InfoIcon />
             <AlertDescription>
               Closing recovery is pending. The server keeps saving the interview
               without this page; you can check the saved interview later.
             </AlertDescription>
           </Alert>
         ) : (
-          <p className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Spinner />
-            Closing the interview and saving the transcript…
-          </p>
+          <div className="flex w-full flex-col gap-3">
+            <LinearProgress label="Saving the transcript" />
+            <p
+              role="status"
+              className="text-center text-sm text-muted-foreground"
+            >
+              Closing the interview and saving the transcript…
+            </p>
+          </div>
         )}
-        <p className="text-sm text-muted-foreground">
-          The farewell is not replayed after a reload. Results appear only once
-          the transcript is saved.
-        </p>
-        <Button variant="outline" render={<Link to="/interviews" />}>
+        <LinkButton variant="outline" to="/interviews">
+          <HistoryIcon />
           View saved interviews
-        </Button>
-      </PageContainer>
-    </PageShell>
+        </LinkButton>
+      </div>
+    </PostCallFrame>
   )
 }

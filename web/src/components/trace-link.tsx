@@ -1,5 +1,7 @@
 import { ExternalLinkIcon } from "lucide-react"
 
+import { AnchorButton } from "@/components/ui/link-button"
+
 /** Opens the interview's LangSmith trace and its voice sessions. The API only
  *  sends URLs while the traces exist, so there is never a dead link. */
 export function TraceLink({
@@ -21,21 +23,26 @@ export function TraceLink({
     })),
   ]
   return (
-    <p className="text-xs text-muted-foreground">
-      {links.map(({ href, label }) => (
-        <a
-          key={href}
-          href={href}
-          target="_blank"
-          rel="noreferrer"
-          className="mr-3 inline-flex items-center gap-1 underline underline-offset-2"
-        >
-          <ExternalLinkIcon className="size-3" />
-          {label}
-        </a>
-      ))}
-      — includes the resume, offer, answers, evaluation and audio; deleted from
-      LangSmith when local detail expires.
-    </p>
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap gap-2">
+        {links.map(({ href, label }) => (
+          <AnchorButton
+            key={href}
+            variant="outline"
+            size="sm"
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+          >
+            <ExternalLinkIcon />
+            {label}
+          </AnchorButton>
+        ))}
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Includes the resume, offer, answers, evaluation and audio; deleted from
+        LangSmith when local detail expires.
+      </p>
+    </div>
   )
 }

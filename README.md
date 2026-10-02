@@ -36,7 +36,7 @@ docker compose up -d --build
 
 That starts the whole stack: Postgres, the API + frontend, and the LiveKit worker (migrations run automatically). The resume is stored as text in Postgres; all three agents receive it directly, without embeddings or a vector database.
 
-Open <http://localhost:8000>: upload a resume PDF, paste the job offer, wait for the plan (~30–60 s), then start the voice interview. When it ends, the evaluation appears on the same page.
+Open <http://localhost:8000> and choose **New interview**: upload a resume PDF, paste the job offer and wait for the plan (~30–60 s). The preparation room lets you check your microphone and camera before you start the voice interview. When it ends, the results open in the app as soon as the evaluation is ready.
 
 The **History** screen lists every interview you have run, newest first, with its score, verdict and how far the topics got — filterable by state. Opening one shows its scorecard and, folded away, the full transcript. **Repeat** runs the same role again: a brand-new interview off the stored resume and job offer, at the same level and length, with freshly planned questions. The original is left untouched, and every re-run stays grouped under it.
 

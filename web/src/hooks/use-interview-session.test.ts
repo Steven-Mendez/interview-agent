@@ -146,6 +146,18 @@ async function connected() {
 }
 
 describe("interview transcription lifecycle", () => {
+  it("joins muted when the pre-join check muted the microphone", async () => {
+    const hook = renderHook(() => useInterviewSession("test"))
+    await act(async () => {
+      hook.result.current.start({ startMuted: true })
+      await flush()
+    })
+    const mic = mocks.rooms[0].localParticipant.setMicrophoneEnabled
+    expect(mic.mock.calls).toEqual([[true], [false]])
+    expect(hook.result.current.phase).toBe("live")
+    hook.unmount()
+  })
+
   it("offers answer-again or end only while the technical notice is active", async () => {
     const { room, result, unmount } = await connected()
     const changed = (attributes: Record<string, string>) =>

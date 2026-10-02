@@ -1,3 +1,5 @@
+import { InfoIcon } from "lucide-react"
+
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import type { Interview } from "@/lib/api"
 
@@ -34,12 +36,13 @@ export function InterviewEnding({ interview }: { interview: Interview }) {
   if (!reason && !farewellNote) return null
   return (
     <Alert className="text-left">
+      <InfoIcon />
       <AlertTitle>How this interview ended</AlertTitle>
       <AlertDescription>
         {reason && <p>{reason}</p>}
         {farewellNote && <p>{farewellNote}</p>}
         {interview.farewell_text && (
-          <blockquote className="mt-2 border-l-2 pl-3 italic">
+          <blockquote className="mt-2 border-l-2 border-primary pl-3 italic">
             {interview.farewell_text}
           </blockquote>
         )}

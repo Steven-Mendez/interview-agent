@@ -12,12 +12,22 @@ import { cn } from "@/lib/utils"
 
 // Signing in is a room of its own: no top bar, no navigation — the
 // Interviewer Agent on one side, the card on the other (stacked on narrow
-// screens). The character reacts to the form: it waves on arrival, watches
-// the username being typed, politely waits through the password, thinks
-// while the account is checked, and is pleased (or upset) with the result.
+// screens). The character reacts to the form: it waves on arrival, follows
+// the caret along the field being typed in, covers its eyes while the
+// password is shown, thinks while the account is checked, and is pleased
+// (or upset) with the result.
 
 /** What the sign-in form tells the page, for the character to react to. */
-export type SignInActivity = "username" | "password" | "submitting" | "failed"
+export type SignInActivity =
+  | "username"
+  | "password"
+  | "password-shown"
+  | "password-hidden"
+  | "submitting"
+  | "failed"
+
+/** The form's fields the character can follow. */
+export type SignInField = "username" | "password"
 
 export const GREETING_MS = 2000
 export const ERROR_MS = 2500
@@ -26,12 +36,16 @@ export const TICKLE_MS = 1500
 
 interface SignInReactions {
   react: (activity: SignInActivity) => void
+  /** The caret moved in `field`: `ratio` is where it sits along the field,
+   *  0 at its start and 1 at its end. The character's eyes go there. */
+  follow: (ratio: number, field: SignInField) => void
   /** Shows the character pleased, resolving when the moment has passed. */
   celebrate: () => Promise<void>
 }
 
 const SignInReactionsContext = React.createContext<SignInReactions>({
   react: () => {},
+  follow: () => {},
   celebrate: () => Promise.resolve(),
 })
 
@@ -41,9 +55,24 @@ export function useSignInReactions(): SignInReactions {
   return React.useContext(SignInReactionsContext)
 }
 
+/** Where the character looks for a caret at either end of a field, as the
+ *  `--mascot-look-x/-y` its watching pose reads (-1..1). Side by side (the
+ *  md layout) the card is to its right and a little below; stacked, it is
+ *  right below. Wider than the true angles, so the eyes visibly travel. */
+const SIDE_BY_SIDE = "(min-width: 48rem)"
+const GAZE = {
+  side: { start: 0.2, end: 1, y: { username: 0.2, password: 0.4 } },
+  stacked: { start: -0.55, end: 0.55, y: { username: 0.7, password: 0.85 } },
+} as const
+
+function clamp01(value: number) {
+  return Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0
+}
+
 /** The character's state: a resting state the form sets (idle, watching,
- *  waiting, thinking) under a passing one that times out (greeting, error,
- *  tickled) — or success, which lasts until the page is left. */
+ *  covering, thinking) under a passing one that times out (greeting, error,
+ *  tickled) — or success, which lasts until the page is left. While the
+ *  password is shown it covers its eyes instead of watching. */
 function useSignInMascot(resting: MascotState) {
   const [base, setBase] = React.useState<MascotState>(resting)
   const [passing, setPassing] = React.useState<MascotState | null>("greeting")
@@ -51,6 +80,31 @@ function useSignInMascot(resting: MascotState) {
   const successTimer = React.useRef(0)
   const celebrating = React.useRef(false)
   const alive = React.useRef(true)
+  const passwordShown = React.useRef(false)
+  // Where it looks is written straight onto the element, not rendered:
+  // the eyes follow every keystroke without a render for each.
+  const lookRef = React.useRef<HTMLButtonElement>(null)
+  // The last caret it followed, to aim again when the layout flips between
+  // side by side and stacked (a turned tablet, a resized window).
+  const caret = React.useRef<{ ratio: number; field: SignInField } | null>(null)
+
+  const look = React.useCallback(() => {
+    const el = lookRef.current
+    if (!el || !caret.current) return
+    const { ratio, field } = caret.current
+    const gaze = window.matchMedia(SIDE_BY_SIDE).matches
+      ? GAZE.side
+      : GAZE.stacked
+    const x = gaze.start + (gaze.end - gaze.start) * clamp01(ratio)
+    el.style.setProperty("--mascot-look-x", x.toFixed(3))
+    el.style.setProperty("--mascot-look-y", gaze.y[field].toFixed(3))
+  }, [])
+
+  React.useEffect(() => {
+    const layout = window.matchMedia(SIDE_BY_SIDE)
+    layout.addEventListener("change", look)
+    return () => layout.removeEventListener("change", look)
+  }, [look])
 
   const pass = React.useCallback((state: MascotState | null, ms?: number) => {
     if (!alive.current) return
@@ -78,19 +132,33 @@ function useSignInMascot(resting: MascotState) {
       setBase(state)
       pass(null)
     }
+    const attentive = () => (passwordShown.current ? "covering" : "watching")
     return {
       react: (activity) => {
         switch (activity) {
           case "username":
-            return settle("watching")
           case "password":
-            return settle("waiting")
+            return settle(attentive())
+          case "password-shown":
+            passwordShown.current = true
+            return settle("covering")
+          case "password-hidden":
+            // Hiding it (or the form going away with it shown) uncovers the
+            // eyes, without cutting short an error or a giggle on screen.
+            passwordShown.current = false
+            return setBase((state) =>
+              state === "covering" ? "watching" : state
+            )
           case "submitting":
             return settle("thinking")
           case "failed":
-            settle("watching")
+            settle(attentive())
             return pass("error", ERROR_MS)
         }
+      },
+      follow: (ratio, field) => {
+        caret.current = { ratio, field }
+        look()
       },
       celebrate: () =>
         new Promise<void>((resolve) => {
@@ -101,14 +169,14 @@ function useSignInMascot(resting: MascotState) {
           successTimer.current = window.setTimeout(resolve, SUCCESS_MS)
         }),
     }
-  }, [pass])
+  }, [pass, look])
 
   // Easter egg: it giggles when poked — unless it is busy being pleased.
   const tickle = React.useCallback(() => {
     if (!celebrating.current) pass("tickled", TICKLE_MS)
   }, [pass])
 
-  return { state: passing ?? base, reactions, tickle }
+  return { state: passing ?? base, reactions, tickle, lookRef }
 }
 
 /** The whole-screen sign-in layout every view of /auth/$pathname uses.
@@ -130,6 +198,7 @@ export function SignInPage({
         <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col items-center gap-6 px-4 pt-2 pb-10 md:grid md:grid-cols-2 md:items-center md:gap-10 md:px-8 md:py-10">
           <div className="flex flex-col items-center gap-2 text-center md:gap-6">
             <button
+              ref={mascot.lookRef}
               type="button"
               aria-label="Say hi to the interviewer"
               data-mascot-state={mascot.state}

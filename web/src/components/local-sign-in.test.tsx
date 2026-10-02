@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type * as Router from "@tanstack/react-router"
 import type * as LocalAuth from "@/lib/local-auth"
-import { LocalSignInForm } from "./local-sign-in"
+import { LocalSignInForm, caretRatio } from "./local-sign-in"
 
 const mocks = vi.hoisted(() => ({
   navigate: vi.fn(),
@@ -25,6 +25,7 @@ vi.mock("@/lib/local-auth", async (original) => ({
 afterEach(() => {
   cleanup()
   vi.resetAllMocks()
+  vi.restoreAllMocks()
 })
 
 function fillIn(username: string, password: string) {
@@ -164,6 +165,107 @@ describe("LocalSignInForm", () => {
     fireEvent.click(toggle)
     expect(password.type).toBe("password")
     expect(toggle.getAttribute("aria-pressed")).toBe("false")
+  })
+
+  it("reports showing and hiding the password, and where the caret is", () => {
+    const onActivity = vi.fn()
+    const onCaret = vi.fn()
+    render(<LocalSignInForm onActivity={onActivity} onCaret={onCaret} />)
+    fireEvent.change(screen.getByLabelText("Username"), {
+      target: { value: "gu" },
+    })
+    expect(onCaret).toHaveBeenLastCalledWith(2 / 30, "username")
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "secret" },
+    })
+    expect(onCaret).toHaveBeenLastCalledWith(6 / 30, "password")
+
+    const toggle = screen.getByRole("button", { name: "Show password" })
+    fireEvent.click(toggle)
+    expect(onActivity).toHaveBeenLastCalledWith("password-shown")
+    fireEvent.click(toggle)
+    expect(onActivity).toHaveBeenLastCalledWith("password-hidden")
+  })
+
+  it("works without anyone listening", () => {
+    render(<LocalSignInForm />)
+    const toggle = screen.getByRole("button", { name: "Show password" })
+    expect(() => {
+      fireEvent.change(screen.getByLabelText("Username"), {
+        target: { value: "guest" },
+      })
+      fireEvent.click(toggle)
+      fireEvent.change(screen.getByLabelText("Password"), {
+        target: { value: "secret" },
+      })
+      fireEvent.click(toggle)
+    }).not.toThrow()
+    expect(screen.getByLabelText<HTMLInputElement>("Password").value).toBe(
+      "secret"
+    )
+  })
+
+  it("places the caret between the field's start and end", () => {
+    const input = document.createElement("input")
+    document.body.append(input)
+    expect(caretRatio(input)).toBe(0)
+    input.value = "abcdef"
+    input.setSelectionRange(3, 3)
+    expect(caretRatio(input)).toBe(0.1)
+    input.value = "a".repeat(80)
+    expect(caretRatio(input)).toBe(1)
+    input.remove()
+  })
+
+  it("measures the text before the caret where there is layout", () => {
+    const input = document.createElement("input")
+    document.body.append(input)
+    // A 200px field with 12px of padding at the start and 48px (the
+    // show-password button) at the end: 140px of content.
+    Object.defineProperty(input, "clientWidth", { value: 200 })
+    let scrolled = 0
+    Object.defineProperty(input, "scrollLeft", { get: () => scrolled })
+    vi.spyOn(window, "getComputedStyle").mockReturnValue({
+      paddingLeft: "12px",
+      paddingRight: "48px",
+      font: "500 14px Inter",
+    } as CSSStyleDeclaration)
+    const fonts: string[] = []
+    const measured: string[] = []
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      set font(font: string) {
+        fonts.push(font)
+      },
+      // 7px a character, 10px a dot.
+      measureText: (text: string) => {
+        measured.push(text)
+        return { width: [...text].length * (text.includes("\u2022") ? 10 : 7) }
+      },
+    } as unknown as CanvasRenderingContext2D)
+
+    input.value = "abcdefghij"
+    input.setSelectionRange(10, 10)
+    expect(caretRatio(input)).toBe(0.5)
+    expect(fonts.at(-1)).toBe("500 14px Inter")
+    // Scrolled along: what scrolled out of view no longer counts.
+    scrolled = 35
+    expect(caretRatio(input)).toBe(0.25)
+    // The caret scrolled out of view to the left: the field's start.
+    input.setSelectionRange(2, 2)
+    expect(caretRatio(input)).toBe(0)
+    // A long text without scrolling stops at the end.
+    scrolled = 0
+    input.value = "a".repeat(40)
+    input.setSelectionRange(40, 40)
+    expect(caretRatio(input)).toBe(1)
+
+    // A hidden password is measured as the dots it shows, not its letters.
+    input.type = "password"
+    input.value = "secret"
+    input.setSelectionRange(6, 6)
+    expect(caretRatio(input)).toBe(60 / 140)
+    expect(measured.at(-1)).toBe("\u2022".repeat(6))
+    input.remove()
   })
 
   it("reports what the visitor does and waits before leaving", async () => {

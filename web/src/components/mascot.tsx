@@ -26,6 +26,7 @@ export type MascotState =
   | "charging"
   | "tickled"
   | "angry"
+  | "covering"
 
 export const MASCOT_STATE_LABELS: Record<MascotState, string> = {
   idle: "Ready",
@@ -46,6 +47,7 @@ export const MASCOT_STATE_LABELS: Record<MascotState, string> = {
   charging: "Recharging",
   tickled: "Giggling",
   angry: "Grumpy",
+  covering: "Not looking",
 }
 
 type Eyes =
@@ -70,6 +72,8 @@ const EYES: Record<MascotState, Eyes> = {
   charging: "down",
   tickled: "laugh",
   angry: "angry",
+  // Shut behind the hands, so nothing peeks out between the fingers.
+  covering: "down",
 }
 
 const BAR_SHAPE = [0.55, 1, 0.7]
@@ -133,19 +137,7 @@ export function Mascot({
 
       <g className="mascot-react">
         <g className="mascot-body">
-          <g className="mascot-arm mascot-arm-left">
-            <rect
-              x="56"
-              y="130"
-              width="14"
-              height="34"
-              rx="7"
-              fill={shell}
-              stroke="var(--mascot-outline)"
-              strokeWidth="1.5"
-            />
-            <circle cx="63" cy="166" r="8.5" fill="var(--mascot-accent)" />
-          </g>
+          <MascotArm side="left" layer="back" fill={shell} />
 
           {/* Torso, collar and chest light */}
           <rect
@@ -296,20 +288,10 @@ export function Mascot({
             </g>
           </g>
 
+          {/* The left arm again, in front of the face, for covering the eyes */}
+          <MascotArm side="left" layer="front" fill={shell} />
           {/* Right arm last, so a raised hand passes in front */}
-          <g className="mascot-arm mascot-arm-right">
-            <rect
-              x="130"
-              y="130"
-              width="14"
-              height="34"
-              rx="7"
-              fill={shell}
-              stroke="var(--mascot-outline)"
-              strokeWidth="1.5"
-            />
-            <circle cx="137" cy="166" r="8.5" fill="var(--mascot-accent)" />
-          </g>
+          <MascotArm side="right" fill={shell} />
         </g>
       </g>
 
@@ -317,6 +299,52 @@ export function Mascot({
         <StateSymbol state={state} level={metered ? loud : undefined} />
       </g>
     </svg>
+  )
+}
+
+/** One arm, hinged at the shoulder (styles.css), with its hand.
+ *
+ *  The left arm lives behind the head, which keeps every pose that swings it
+ *  up tucked behind the face. Covering the eyes needs it in front, so it is
+ *  drawn twice: `back` where it lives and `front` over the face. Both copies
+ *  share the arm's classes, so they always hold the same pose; styles.css
+ *  shows the front one only while covering (and through the way back down). */
+function MascotArm({
+  side,
+  layer,
+  fill,
+}: {
+  side: "left" | "right"
+  layer?: "back" | "front"
+  fill: string
+}) {
+  const x = side === "left" ? 63 : 137
+  return (
+    <g
+      className={cn(
+        "mascot-arm",
+        side === "left" ? "mascot-arm-left" : "mascot-arm-right",
+        layer && `mascot-arm-${layer}`
+      )}
+    >
+      <rect
+        x={x - 7}
+        y="130"
+        width="14"
+        height="34"
+        rx="7"
+        fill={fill}
+        stroke="var(--mascot-outline)"
+        strokeWidth="1.5"
+      />
+      <circle
+        cx={x}
+        cy="166"
+        r="8.5"
+        fill="var(--mascot-accent)"
+        className="mascot-hand"
+      />
+    </g>
   )
 }
 

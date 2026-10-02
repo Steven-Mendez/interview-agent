@@ -126,6 +126,7 @@ export function LocalSignIn({ redirectTo }: { redirectTo?: string }) {
       <LocalSignInForm
         redirectTo={redirectTo}
         onActivity={mascot.react}
+        onCaret={mascot.follow}
         beforeRedirect={mascot.celebrate}
       />
     </>

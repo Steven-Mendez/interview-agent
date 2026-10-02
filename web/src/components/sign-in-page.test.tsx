@@ -195,12 +195,12 @@ describe("the local sign-in", () => {
     expect(mascotState()).toBe("idle")
   })
 
-  it("watches the username and waits through the password", async () => {
+  it("watches the username and the hidden password being typed", async () => {
     mount(<LocalSignIn />)
     fireEvent.focus(screen.getByLabelText("Username"))
     expect(mascotState()).toBe("watching")
     fireEvent.focus(screen.getByLabelText("Password"))
-    expect(mascotState()).toBe("waiting")
+    expect(mascotState()).toBe("watching")
     fireEvent.change(screen.getByLabelText("Username"), {
       target: { value: "gu" },
     })
@@ -208,6 +208,157 @@ describe("the local sign-in", () => {
     // The greeting's end does not undo it.
     await advance(GREETING_MS)
     expect(mascotState()).toBe("watching")
+  })
+
+  it("looks where the caret is, from the field's start to its end", () => {
+    mount(<LocalSignIn />)
+    const look = () => [
+      mascot().style.getPropertyValue("--mascot-look-x"),
+      mascot().style.getPropertyValue("--mascot-look-y"),
+    ]
+    const username = screen.getByLabelText("Username")
+    // Nothing typed: the start of the field (side by side, the card is to
+    // its right). jsdom has no layout, so the caret is guessed from the
+    // number of characters, 30 to a field.
+    fireEvent.focus(username)
+    expect(look()).toEqual(["0.200", "0.200"])
+    fireEvent.change(username, { target: { value: "abc" } })
+    expect(look()).toEqual(["0.280", "0.200"])
+    // Past the end, it stops at the end.
+    fireEvent.change(username, { target: { value: "a".repeat(45) } })
+    expect(look()).toEqual(["1.000", "0.200"])
+    // The caret moved back without typing.
+    const input = username as HTMLInputElement
+    input.focus()
+    input.setSelectionRange(0, 0)
+    fireEvent.keyUp(input, { key: "Home" })
+    expect(look()).toEqual(["0.200", "0.200"])
+    // The password sits lower in the card.
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "secret" },
+    })
+    expect(look()).toEqual(["0.360", "0.400"])
+    expect(mascotState()).toBe("watching")
+  })
+
+  it("covers its eyes while the password is shown", async () => {
+    mount(<LocalSignIn />)
+    const toggle = screen.getByRole("button", { name: "Show password" })
+    fireEvent.click(toggle)
+    expect(mascotState()).toBe("covering")
+    // The greeting's end and typing either field keep them covered.
+    await advance(GREETING_MS)
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "secret" },
+    })
+    fireEvent.focus(screen.getByLabelText("Username"))
+    expect(mascotState()).toBe("covering")
+
+    fireEvent.click(toggle)
+    expect(mascotState()).toBe("watching")
+    fireEvent.change(screen.getByLabelText("Password"), {
+      target: { value: "secrets" },
+    })
+    expect(mascotState()).toBe("watching")
+  })
+
+  it("giggles when poked while covering, then covers again", async () => {
+    mount(<LocalSignIn />)
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }))
+    fireEvent.click(mascot())
+    expect(mascotState()).toBe("tickled")
+    await advance(TICKLE_MS)
+    expect(mascotState()).toBe("covering")
+  })
+
+  it("thinks and is upset through a shown password, then covers again", async () => {
+    const { LocalSignInError } = await import("@/lib/local-auth")
+    let refuse: (error: Error) => void = () => {}
+    mocks.signIn.mockReturnValue(
+      new Promise<void>((_, reject) => {
+        refuse = reject
+      })
+    )
+    mount(<LocalSignIn />)
+    fillIn("guest", "wrong")
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }))
+    expect(mascotState()).toBe("covering")
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }))
+    expect(mascotState()).toBe("thinking")
+
+    await act(async () => refuse(new LocalSignInError("Invalid password")))
+    expect(mascotState()).toBe("error")
+    await advance(ERROR_MS)
+    expect(mascotState()).toBe("covering")
+  })
+
+  it("uncovers its eyes when the form goes away with the password shown", async () => {
+    const { LocalSignInError } = await import("@/lib/local-auth")
+    // The API now signs in another way: the form gives way to Neon Auth.
+    mocks.signIn.mockRejectedValue(new LocalSignInError("Use Neon", true))
+    const client = new QueryClient()
+    const page = (card: React.ReactNode) => (
+      <QueryClientProvider client={client}>
+        <SignInPage>{card}</SignInPage>
+      </QueryClientProvider>
+    )
+    const view = render(page(<LocalSignIn />))
+    fillIn("guest", "secret")
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }))
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }))
+    await advance(0)
+    expect(mocks.resetAuthMode).toHaveBeenCalled()
+    expect(mascotState()).toBe("error")
+
+    view.rerender(page(<p>Loading…</p>))
+    // The upset look plays out, then no hands over a page without a password.
+    expect(mascotState()).toBe("error")
+    await advance(ERROR_MS)
+    expect(mascotState()).toBe("watching")
+  })
+
+  it("aims again when the layout flips between side by side and stacked", () => {
+    let sideBySide = true
+    const listeners = new Set<() => void>()
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query === "(min-width: 48rem)" ? sideBySide : true,
+      media: query,
+      addEventListener: (_: string, listener: () => void) =>
+        listeners.add(listener),
+      removeEventListener: (_: string, listener: () => void) =>
+        listeners.delete(listener),
+    }))
+    const view = mount(<LocalSignIn />)
+    const look = () => [
+      mascot().style.getPropertyValue("--mascot-look-x"),
+      mascot().style.getPropertyValue("--mascot-look-y"),
+    ]
+    fireEvent.change(screen.getByLabelText("Username"), {
+      target: { value: "a".repeat(15) },
+    })
+    expect(look()).toEqual(["0.600", "0.200"])
+
+    // A tablet turned to portrait: the form is now below the character.
+    sideBySide = false
+    act(() => listeners.forEach((listener) => listener()))
+    expect(look()).toEqual(["0.000", "0.700"])
+
+    view.unmount()
+    expect(listeners.size).toBe(0)
+  })
+
+  it("is pleased through a shown password before leaving", async () => {
+    mocks.signIn.mockResolvedValue(undefined)
+    mocks.navigate.mockResolvedValue(undefined)
+    mount(<LocalSignIn />)
+    fillIn("guest", "secret")
+    fireEvent.click(screen.getByRole("button", { name: "Show password" }))
+    expect(mascotState()).toBe("covering")
+    fireEvent.click(screen.getByRole("button", { name: "Sign in" }))
+    await advance(0)
+    expect(mascotState()).toBe("success")
+    await advance(SUCCESS_MS)
+    expect(mocks.navigate).toHaveBeenCalledWith({ href: "/", replace: true })
   })
 
   it("thinks while checking, is upset by a refusal, then watches again", async () => {

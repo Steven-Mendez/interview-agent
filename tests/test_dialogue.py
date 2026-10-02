@@ -1315,6 +1315,10 @@ async def test_traced_turn_nests_the_decide_model_call_under_its_root(
         run = runs[run["parent_run_id"]]
         ancestors.append(run["name"])
     assert ancestors[-2:] == ["decide", "dialogue_turn"]
+    # Every edge run carries its function's name, none shows as unnamed.
+    names = {run["name"] for run in runs.values()}
+    assert {"after_load", "after_decide", "after_validate", "after_persist"} <= names
+    assert not names & {"<lambda>", "Unnamed"}
     metadata = model_run["extra"]["metadata"]
     assert metadata["thread_id"] == str(graph.conversation_id)
     assert metadata["turn_id"] == "traced-turn"

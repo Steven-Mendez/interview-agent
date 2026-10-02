@@ -233,6 +233,23 @@ Persona and topic preferences: {
 """
 
 
+# Named, not lambdas: LangSmith shows each edge run under its function name.
+def after_load(state: DialogueState) -> str:
+    return END if state.get("replayed") else "decide"
+
+
+def after_decide(state: DialogueState) -> str:
+    return "load" if state.get("reload_required") else "validate"
+
+
+def after_validate(state: DialogueState) -> str:
+    return "decide" if state.get("error") else "persist"
+
+
+def after_persist(state: DialogueState) -> str:
+    return "load" if state.get("stale") else END
+
+
 class DialogueController:
     def __init__(
         self,
@@ -267,14 +284,10 @@ class DialogueController:
         ):
             builder.add_node(name, self._timed(name, function))
         builder.add_edge(START, "load")
-        builder.add_conditional_edges("load", lambda s: END if s.get("replayed") else "decide")
-        builder.add_conditional_edges(
-            "decide", lambda s: "load" if s.get("reload_required") else "validate"
-        )
-        builder.add_conditional_edges(
-            "validate", lambda s: "decide" if s.get("error") else "persist"
-        )
-        builder.add_conditional_edges("persist", lambda s: "load" if s.get("stale") else END)
+        builder.add_conditional_edges("load", after_load)
+        builder.add_conditional_edges("decide", after_decide)
+        builder.add_conditional_edges("validate", after_validate)
+        builder.add_conditional_edges("persist", after_persist)
         self.graph = builder.compile()
 
     def _timed(self, name, function):

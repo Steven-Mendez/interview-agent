@@ -3,12 +3,27 @@ import { Link, useRouterState } from "@tanstack/react-router"
 import {
   HistoryIcon,
   HomeIcon,
+  LogInIcon,
+  LogOutIcon,
   MenuIcon,
   PlusIcon,
   SettingsIcon,
+  UserIcon,
+  UsersIcon,
 } from "lucide-react"
 
 import { BrandLink } from "@/components/brand"
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
+import { Button } from "@/components/ui/button"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuLinkItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { IconButton, IconLink } from "@/components/ui/icon-button"
 import { LinkButton } from "@/components/ui/link-button"
 import {
@@ -17,6 +32,10 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
+import { useMe } from "@/hooks/use-me"
+import { useSignOut } from "@/hooks/use-sign-out"
+import { safeRedirectPath, useAuth, useAuthMode } from "@/lib/auth"
+import type { AuthUser } from "@/lib/auth"
 import { cn } from "@/lib/utils"
 
 // ---- Immersive mode ---------------------------------------------------------
@@ -201,7 +220,145 @@ function NavDrawer({
   )
 }
 
-/** Identity on the left; the create action and settings on the right. */
+// ---- Account ------------------------------------------------------------------
+
+function useMounted() {
+  const [mounted, setMounted] = React.useState(false)
+  React.useEffect(() => setMounted(true), [])
+  return mounted
+}
+
+function initials(user: AuthUser): string {
+  const source = user.name ?? user.email ?? ""
+  const words = source.split(/[\s@._-]+/).filter(Boolean)
+  return (
+    words
+      .slice(0, 2)
+      .map((word) => word[0].toUpperCase())
+      .join("") || "?"
+  )
+}
+
+/** The account's pages: its profile, and the user list for an admin (the
+ *  API has the last word on who is one). */
+function AccountLinks() {
+  const me = useMe()
+  return (
+    <>
+      <DropdownMenuLinkItem render={<Link to="/profile" />}>
+        <UserIcon />
+        Profile
+      </DropdownMenuLinkItem>
+      {me.data?.is_admin && (
+        <DropdownMenuLinkItem render={<Link to="/admin/users" />}>
+          <UsersIcon />
+          Users
+        </DropdownMenuLinkItem>
+      )}
+    </>
+  )
+}
+
+/** Sign in, or the signed-in account with its pages and sign-out; without
+ *  sign-in (mode none), the local developer's pages. Nothing until mounted
+ *  and the mode is known: the prerendered shell has no session. */
+function AccountControls() {
+  const mounted = useMounted()
+  const mode = useAuthMode()
+  const { user, isPending } = useAuth()
+  const href = useRouterState({ select: (s) => s.location.href })
+  const signOut = useSignOut()
+
+  if (!mounted || mode === undefined) return null
+
+  if (mode === "none") {
+    return (
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button
+              variant="quiet"
+              size="icon"
+              aria-label="Account: Local developer"
+            >
+              <Avatar>
+                <AvatarFallback>LD</AvatarFallback>
+              </Avatar>
+            </Button>
+          }
+        />
+        <DropdownMenuContent align="end" className="max-w-72">
+          <DropdownMenuGroup>
+            <DropdownMenuLabel>
+              <span className="truncate font-medium">Local developer</span>
+            </DropdownMenuLabel>
+          </DropdownMenuGroup>
+          <AccountLinks />
+        </DropdownMenuContent>
+      </DropdownMenu>
+    )
+  }
+
+  if (isPending) return null
+
+  if (!user) {
+    return (
+      <LinkButton
+        to="/auth/$pathname"
+        params={{ pathname: "sign-in" }}
+        search={{ redirectTo: safeRedirectPath(href) }}
+        variant="outline"
+      >
+        <LogInIcon />
+        Sign in
+      </LinkButton>
+    )
+  }
+
+  const label = user.name ?? user.email ?? "Your account"
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        render={
+          <Button variant="quiet" size="icon" aria-label={`Account: ${label}`}>
+            <Avatar>
+              {user.image && (
+                <AvatarImage
+                  src={user.image}
+                  alt=""
+                  referrerPolicy="no-referrer"
+                />
+              )}
+              <AvatarFallback>{initials(user)}</AvatarFallback>
+            </Avatar>
+          </Button>
+        }
+      />
+      <DropdownMenuContent align="end" className="max-w-72">
+        <DropdownMenuGroup>
+          <DropdownMenuLabel className="flex flex-col">
+            {user.name && (
+              <span className="truncate font-medium">{user.name}</span>
+            )}
+            {user.email && (
+              <span className="truncate text-xs text-muted-foreground">
+                {user.email}
+              </span>
+            )}
+          </DropdownMenuLabel>
+        </DropdownMenuGroup>
+        <AccountLinks />
+        <DropdownMenuItem onClick={() => void signOut(user.id)}>
+          <LogOutIcon />
+          Sign out
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+/** Identity on the left; the create action, settings and the account on
+ *  the right. */
 function TopBar({ onMenu }: { onMenu: () => void }) {
   return (
     <header className="flex h-16 shrink-0 items-center gap-2 px-2 md:px-4">
@@ -234,6 +391,7 @@ function TopBar({ onMenu }: { onMenu: () => void }) {
         <IconLink label="Settings" to="/settings">
           <SettingsIcon />
         </IconLink>
+        <AccountControls />
       </div>
     </header>
   )
@@ -247,11 +405,21 @@ function AppShell({
   children: React.ReactNode
 }) {
   const [drawerOpen, setDrawerOpen] = React.useState(false)
+  // The chrome is for someone allowed in: without sign-in, or signed in.
+  // Until that is known (the prerendered page, a visit's first moments) and
+  // while a guard sends a visitor to sign in, the page has none — so no top
+  // bar or navigation shows on the way to the sign-in page.
+  const mode = useAuthMode()
+  const { user } = useAuth()
+  const allowed =
+    mode === "none" || ((mode === "local" || mode === "neon") && user !== null)
+  const chrome = !immersive && allowed
   // The children always sit at the same position in this tree whatever the
   // mode; only the chrome around them comes and goes.
   return (
     <div
       data-immersive={immersive}
+      data-chrome={chrome}
       className="flex min-h-svh flex-col bg-background"
     >
       <a
@@ -260,23 +428,21 @@ function AppShell({
       >
         Skip to content
       </a>
-      {!immersive && <TopBar onMenu={() => setDrawerOpen(true)} />}
+      {chrome && <TopBar onMenu={() => setDrawerOpen(true)} />}
       <div className="flex min-h-0 flex-1">
-        {!immersive && <SideNav />}
+        {chrome && <SideNav />}
         <main
           id="main"
           className={cn(
             "@container/main flex min-w-0 flex-1 flex-col",
-            !immersive &&
+            chrome &&
               "md:mr-4 md:mb-4 md:rounded-2xl md:bg-card md:shadow-[inset_0_0_0_1px_var(--border)] dark:md:bg-card"
           )}
         >
           {children}
         </main>
       </div>
-      {!immersive && (
-        <NavDrawer open={drawerOpen} onOpenChange={setDrawerOpen} />
-      )}
+      {chrome && <NavDrawer open={drawerOpen} onOpenChange={setDrawerOpen} />}
     </div>
   )
 }

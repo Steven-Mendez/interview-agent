@@ -16,11 +16,13 @@ import type { Interview } from "@/lib/api"
 import { shouldShowInterviewResults } from "@/lib/evaluation"
 import { interviewQueryOptions } from "@/lib/queries"
 import { pageHead } from "@/lib/head"
+import { requireSession } from "@/lib/route-guards"
 
 // The interviewId lives in the URL so deep links / refresh work: the loader
 // warms the query cache (which also drives the polling in
 // interviewQueryOptions) before the component renders.
 export const Route = createFileRoute("/interviews/$interviewId")({
+  beforeLoad: ({ location }) => requireSession(location),
   loader: ({ context, params }) =>
     context.queryClient.ensureQueryData(
       interviewQueryOptions(params.interviewId)

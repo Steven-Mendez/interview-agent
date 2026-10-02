@@ -44,6 +44,13 @@ function Lab() {
         <Mascot state="speaking" level={level} className="w-40" />
         <span>metered</span>
       </div>
+      <div className="flex flex-col items-center">
+        <Mascot
+          state={cycle % 2 === 0 ? "watching" : "covering"}
+          className="w-40"
+        />
+        <span>covering in and out</span>
+      </div>
     </div>
   )
 }

@@ -5,6 +5,7 @@ import {
   ArrowRightIcon,
   ChevronRightIcon,
   HistoryIcon,
+  LogInIcon,
   MicIcon,
   PlayIcon,
   PlusIcon,
@@ -24,10 +25,20 @@ import { PageContainer, PageShell, Section } from "@/components/ui/page"
 import { Skeleton } from "@/components/ui/skeleton"
 import { ApiError, SENIORITY_LABELS, durationLabel } from "@/lib/api"
 import type { InterviewSummary } from "@/lib/api"
+import {
+  resolveAuthMode,
+  useAuth,
+  useAuthMode,
+  useAuthModeError,
+  useCanCallApi,
+} from "@/lib/auth"
 import { recentInterviewsQueryOptions } from "@/lib/queries"
+import { requireSession } from "@/lib/route-guards"
 import { pageHead } from "@/lib/head"
 
 export const Route = createFileRoute("/")({
+  // Like every page of the app: with sign-in on, the sign-in page first.
+  beforeLoad: ({ location }) => requireSession(location),
   head: () => pageHead(),
   component: HomePage,
 })
@@ -47,13 +58,31 @@ function errorMessage(error: unknown): string {
 }
 
 function HomePage() {
-  const recent = useQuery(recentInterviewsQueryOptions({ limit: RECENT_LIMIT }))
-  const planned = useQuery(
-    recentInterviewsQueryOptions({ limit: 5, status: "planned" })
-  )
-  const interviewing = useQuery(
-    recentInterviewsQueryOptions({ limit: 5, status: "interviewing" })
-  )
+  // With sign-in on, only a signed-in visitor gets here (the route's guard);
+  // "signed out" is the moment a sign-out takes before the guard runs again.
+  // Until the mode and the session are known — the whole prerender — it
+  // looks the same as loading.
+  const mode = useAuthMode()
+  // An API that cannot say how to sign in cannot list interviews either:
+  // say so instead of loading for as long as it stays silent.
+  const modeError = useAuthModeError()
+  const unreachable = mode === undefined ? modeError : null
+  const { user, isPending: sessionPending } = useAuth()
+  const signedOut =
+    (mode === "local" || mode === "neon") && !sessionPending && user === null
+  const enabled = useCanCallApi()
+  const recent = useQuery({
+    ...recentInterviewsQueryOptions({ limit: RECENT_LIMIT }),
+    enabled,
+  })
+  const planned = useQuery({
+    ...recentInterviewsQueryOptions({ limit: 5, status: "planned" }),
+    enabled,
+  })
+  const interviewing = useQuery({
+    ...recentInterviewsQueryOptions({ limit: 5, status: "interviewing" }),
+    enabled,
+  })
 
   // Ready = planned and never started, or left mid-call with the room still
   // waiting. An `interviewing` row past its window cannot be joined.
@@ -80,11 +109,24 @@ function HomePage() {
               on every answer.
             </p>
             <div className="flex flex-wrap items-center gap-3">
-              <LinkButton to="/new" size="lg" variant="create">
-                <PlusIcon />
-                New interview
-              </LinkButton>
-              {continueRow ? (
+              {signedOut ? (
+                <LinkButton
+                  to="/auth/$pathname"
+                  params={{ pathname: "sign-in" }}
+                  search={{ redirectTo: "/new" }}
+                  size="lg"
+                  variant="create"
+                >
+                  <LogInIcon />
+                  Sign in to start
+                </LinkButton>
+              ) : (
+                <LinkButton to="/new" size="lg" variant="create">
+                  <PlusIcon />
+                  New interview
+                </LinkButton>
+              )}
+              {signedOut ? null : continueRow ? (
                 <LinkButton
                   to="/interviews/$interviewId"
                   params={{ interviewId: continueRow.id }}
@@ -113,7 +155,25 @@ function HomePage() {
           </div>
         </section>
 
-        {recent.isError && (
+        {unreachable ? (
+          <Alert variant="destructive">
+            <AlertCircleIcon />
+            <AlertDescription>
+              Your interviews could not be loaded — {unreachable.message}
+            </AlertDescription>
+            <AlertAction>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void resolveAuthMode().catch(() => {})}
+              >
+                Try again
+              </Button>
+            </AlertAction>
+          </Alert>
+        ) : null}
+
+        {!signedOut && recent.isError && (
           <Alert variant="destructive">
             <AlertCircleIcon />
             <AlertDescription>
@@ -131,7 +191,7 @@ function HomePage() {
           </Alert>
         )}
 
-        {ready.length > 0 && (
+        {!signedOut && ready.length > 0 && (
           <Section title="Ready to start">
             <ul className="divide-y overflow-hidden rounded-xl border">
               {ready.map((row) => (
@@ -141,7 +201,7 @@ function HomePage() {
           </Section>
         )}
 
-        {recent.isPending ? (
+        {signedOut || unreachable ? null : recent.isPending ? (
           <Section title="Recent interviews">
             <RowsSkeleton />
           </Section>

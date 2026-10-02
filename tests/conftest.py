@@ -17,6 +17,25 @@ os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
 # in-memory reader (the recorded_metrics fixture).
 os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = ""
 os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = ""
+# Nor to the developer's Sentry project; error reporting tests capture events
+# with their own in-memory transport.
+os.environ["SENTRY_DSN"] = ""
+os.environ["SENTRY_ENVIRONMENT"] = "development"
+# Nor on the developer's accounts setup: no JWKS fetch, no admins, no shared
+# secret and no CORS unless a test configures them itself.
+os.environ["AUTH_MODE"] = "local"
+os.environ["LOCAL_ACCOUNTS"] = ""
+# A local database, so AUTH_MODE=local passes the API's startup guard even when
+# the developer's .env points at a remote one (tests use their own anyway).
+os.environ["DATABASE_URL"] = "postgresql+asyncpg://interview:interview@localhost:5432/interview"
+# A URL without a host connects to PGHOST, which the guard checks instead.
+os.environ.pop("PGHOST", None)
+os.environ["NEON_AUTH_URL"] = ""
+os.environ["INTERNAL_API_TOKEN"] = ""
+os.environ["ADMIN_USER_IDS"] = ""
+os.environ["CORS_ALLOWED_ORIGINS"] = ""
+os.environ["LIFETIME_INTERVIEWS_PER_USER"] = "3"
+os.environ["GUEST_INTERVIEWS_PER_MONTH"] = "2"
 
 from unittest.mock import Mock
 
@@ -115,6 +134,13 @@ def recorded_metrics():
         yield points
     finally:
         otel_metrics.shutdown()
+
+
+@pytest.fixture(autouse=True)
+def metric_snapshots_stay_private(monkeypatch):
+    """Gauge values a test publishes (the API lifespan's account metrics
+    included) are gone for the next one."""
+    monkeypatch.setattr(otel_metrics, "_snapshots", {})
 
 
 @pytest.fixture(autouse=True)

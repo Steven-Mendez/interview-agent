@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { afterEach, expect, it, vi } from "vitest"
 import type * as Router from "@tanstack/react-router"
+import type * as Auth from "@/lib/auth"
 import type * as Api from "@/lib/api"
 import { getInterview, getEvaluationHistory, getSealHistory } from "@/lib/api"
 import type { Interview } from "@/lib/api"
@@ -26,11 +27,31 @@ vi.mock("@tanstack/react-router", async (original) => ({
     React.ComponentPropsWithoutRef<"a"> & { to: string }
   >(({ to, ...props }, ref) => <a href={to} {...props} ref={ref} />),
 }))
+// GET /me goes out as it would without sign-in (mode none).
+vi.mock("@/lib/auth", async (original) => ({
+  ...(await original<typeof Auth>()),
+  useCanCallApi: () => true,
+}))
 vi.mock("@/lib/api", async (original) => ({
   ...(await original<typeof Api>()),
   getInterview: vi.fn(),
   getEvaluationHistory: vi.fn(),
   getSealHistory: vi.fn(),
+  getMe: vi.fn(() =>
+    Promise.resolve({
+      id: "user",
+      email: null,
+      name: null,
+      is_admin: false,
+      interviews_used: 1,
+      interview_limit: 3,
+      interviews_remaining: 2,
+      demo_capacity_available: true,
+      auth_provider: "local",
+      created_at: "2026-09-01T10:00:00+00:00",
+      last_seen_at: null,
+    })
+  ),
 }))
 afterEach(() => {
   cleanup()
@@ -85,7 +106,12 @@ async function mount(interview: Interview) {
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   })
   client.setQueryData(interviewQueryOptions(interview.id).queryKey, interview)
-  const Page = Route.options.component as React.ComponentType
+  const Page = Route.options.component as React.ComponentType & {
+    preload?: () => Promise<void>
+  }
+  // The route component is code-split: load it before the clock starts, so
+  // a busy test run does not spend findBy's timeout importing it.
+  await Page.preload?.()
   await act(async () => {
     render(
       <QueryClientProvider client={client}>

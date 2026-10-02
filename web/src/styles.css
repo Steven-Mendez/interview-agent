@@ -1,4 +1,11 @@
+/* Neon Auth's stylesheet puts its own reset (borders, outlines, body text)
+   in a `neon-auth` layer, which would otherwise rank above the utilities —
+   every `border-*` and focus ring would lose to it. Below `base`, the app's
+   reset and every utility win. */
+@layer properties, theme, neon-auth, base, components, utilities;
+
 @import "tailwindcss";
+@import "@neondatabase/auth-ui/tailwind";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
 @import "@fontsource-variable/google-sans-flex/wght.css";
@@ -257,6 +264,12 @@
 
 .dark {
   color-scheme: dark;
+}
+
+/* NeonAuthUIProvider mounts a second, unstyled toaster: every toast would
+   show twice. The app's own (components/ui/sonner) is the one that stays. */
+[data-sonner-toaster]:not(.toaster) {
+  display: none;
 }
 
 @layer base {
@@ -1670,6 +1683,81 @@
   animation: mascot-arm-swing-right 4.3s ease-in-out -440ms infinite;
 }
 
+/* Covering: it will not look. Both hands come up across the chest and
+   over the eyes, which shut behind them; the head dips into the hands and
+   the body keeps breathing. The arms stay hinged at the shoulders, on the
+   torso, like every other pose: they swing up and inward and stretch to
+   reach the eyes (scaleY along the arm), while the hands grow back round
+   and a little larger, so the palms cover the eyes whole.
+
+   The left arm lives behind the head, so for this pose its front copy
+   (mascot.tsx) takes its place: shown at once on the way in. On the way
+   out the back copy returns at once underneath it, in the same pose, and
+   the front copy fades once the bridge (560 ms, useStateBridge) has
+   carried the hand below the chin; a hand that ends against the torso
+   (thinking) sinks behind it instead of vanishing. */
+@keyframes mascot-breathe {
+  0%,
+  100% {
+    transform: translateY(0) scale(1.01, 0.99);
+  }
+  50% {
+    transform: translateY(-3px) scale(0.995, 1.01);
+  }
+}
+@keyframes mascot-shadow-breathe {
+  0%,
+  100% {
+    transform: scaleX(1);
+  }
+  50% {
+    transform: scaleX(0.93);
+  }
+}
+.mascot-hand {
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: scale 420ms var(--mascot-spring);
+}
+.mascot-arm-front {
+  visibility: hidden;
+  opacity: 0;
+  transition:
+    opacity 300ms ease-in 220ms,
+    visibility 0s linear 520ms;
+}
+.mascot[data-state="covering"] .mascot-arm-front {
+  visibility: visible;
+  opacity: 1;
+  transition: none;
+}
+.mascot[data-state="covering"] .mascot-arm-back {
+  visibility: hidden;
+}
+/* Shoulder (63, 134) to the dipped left eye (82, 85): 52.5 units, so the
+   32-unit arm stretches 1.64 times; the hand undoes that stretch. */
+.mascot[data-state="covering"] .mascot-arm-left {
+  transform: rotate(-158.8deg) scaleY(1.64);
+}
+.mascot[data-state="covering"] .mascot-arm-right {
+  transform: rotate(158.8deg) scaleY(1.64);
+}
+.mascot[data-state="covering"] .mascot-hand {
+  scale: 1.45 0.884;
+}
+.mascot[data-state="covering"] .mascot-head {
+  transform: translateY(4px);
+}
+.mascot[data-state="covering"] .mascot-body {
+  animation: mascot-breathe 3.6s ease-in-out infinite;
+}
+.mascot[data-state="covering"] .mascot-shadow {
+  animation: mascot-shadow-breathe 3.6s ease-in-out infinite;
+}
+.mascot[data-state="covering"] .mascot-antenna {
+  animation: mascot-sway 7.2s ease-in-out -1.8s infinite;
+}
+
 /* Recharging: slumped with its eyes shut, breathing slowly while the
    battery fills cell by cell; the head lifts and the wilted antenna perks
    up as the charge comes in. Plays once across 6.4 s. */
@@ -2017,5 +2105,11 @@
   }
   .mascot-steam {
     animation: none !important;
+  }
+  /* No bridge to wait for: the arms are already down, and the hands take
+     their size at once. */
+  .mascot-arm-front,
+  .mascot-hand {
+    transition: none;
   }
 }

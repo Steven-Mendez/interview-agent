@@ -1,9 +1,14 @@
 // Typed fetch wrappers for the backend contract (see
-// interview_agent/server/routes.py). Every endpoint lives under the `/api`
-// prefix — the dev proxy (vite.config.ts) and the prod SPA fallback both
-// key off that single prefix.
+// interview_agent/server/routes.py), all under API_BASE (lib/api-base).
 
-const API_BASE = "/api"
+import { API_BASE } from "@/lib/api-base"
+import {
+  forgetRefusedToken,
+  getAccessToken,
+  refreshAccessToken,
+  resetAuthMode,
+} from "@/lib/auth"
+import { redirectsSuppressed } from "@/lib/redirect-suppression"
 
 // ---- Shapes -----------------------------------------------------------------
 
@@ -334,9 +339,50 @@ async function toApiError(res: Response): Promise<ApiError> {
   return new ApiError(res.status, detail, retryAfter)
 }
 
+/** What a 401 on a signed-in request does — the router sends the user to
+ *  sign in. Until one is registered, nothing: the error still throws. */
+let unauthorizedHandler: () => void = () => {}
+
+export function setUnauthorizedHandler(handler: () => void): void {
+  unauthorizedHandler = handler
+}
+
+export { suppressUnauthorizedRedirect } from "@/lib/redirect-suppression"
+
+/** The only fetch. Adds the user's JWT unless the caller brought its own
+ *  credential (the closing routes carry the LiveKit participant token). */
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, init)
-  if (!res.ok) throw await toApiError(res)
+  const ownCredential = new Headers(init?.headers).has("Authorization")
+  const send = (token: string | null) => {
+    const headers = new Headers(init?.headers)
+    if (token) headers.set("Authorization", `Bearer ${token}`)
+    return fetch(`${API_BASE}${path}`, { ...init, headers })
+  }
+  let token = ownCredential ? null : await getAccessToken()
+  let res = await send(token)
+  if (res.status === 401 && token) {
+    // The JWT may only be stale (renewed elsewhere, minted by a clock ahead
+    // of the API's): once more, with one fresh from the auth server. A
+    // local account has none to offer.
+    const fresh = await refreshAccessToken()
+    if (fresh) {
+      token = fresh
+      res = await send(fresh)
+    }
+  }
+  if (!res.ok) {
+    // Our session was refused (expired, revoked, never there): sign in
+    // again. A refused participant token is the room's business, not the
+    // account's; a 503 is the API's, and the session stays. The API may
+    // also have changed how it signs in (restarted with other settings):
+    // the sign-in page asks it again.
+    if (res.status === 401 && !ownCredential && !redirectsSuppressed()) {
+      if (token) forgetRefusedToken(token)
+      resetAuthMode()
+      unauthorizedHandler()
+    }
+    throw await toApiError(res)
+  }
   return (await res.json()) as T
 }
 
@@ -406,6 +452,121 @@ export function getClosingState(
     headers: { Authorization: `Bearer ${participantToken}` },
     signal,
   })
+}
+
+// ---- Account --------------------------------------------------------------------
+
+/** GET /me: who is signed in and what is left of their interviews. Admins
+ *  have no limit (null) and the monthly demo capacity never holds them back. */
+export interface Me {
+  id: string
+  email: string | null
+  name: string | null
+  is_admin: boolean
+  interviews_used: number
+  interview_limit: number | null
+  interviews_remaining: number | null
+  demo_capacity_available: boolean
+  /** How the account signs in: Neon Auth, or a local (development) one. */
+  auth_provider: SignInMethod
+  /** ISO-8601, UTC: when the API first saw the account. */
+  created_at: string
+  /** ISO-8601, UTC: this visit, which /me records before answering (null
+   *  only for an account the admin list shows but that was never seen). */
+  last_seen_at: string | null
+}
+
+export type SignInMethod = "neon" | "local"
+
+export function getMe(): Promise<Me> {
+  return request<Me>("/me")
+}
+
+/** One account of GET /admin/users: its profile, its quota, and how many
+ *  of its interviews are still in the history. */
+export interface AdminUser {
+  id: string
+  name: string | null
+  email: string | null
+  auth_provider: SignInMethod
+  is_admin: boolean
+  created_at: string
+  last_seen_at: string | null
+  interviews_used: number
+  /** Null for admins: no limit. */
+  interview_limit: number | null
+  interviews_stored: number
+  last_interview_at: string | null
+}
+
+export interface AdminUserPage {
+  total: number
+  items: AdminUser[]
+}
+
+/** Everyone who has signed in, most recently seen first. Admins only: a
+ *  403 for anyone else. */
+export function getAdminUsers(params?: {
+  limit?: number
+  offset?: number
+}): Promise<AdminUserPage> {
+  const query = new URLSearchParams()
+  if (params?.limit !== undefined) query.set("limit", String(params.limit))
+  if (params?.offset !== undefined) query.set("offset", String(params.offset))
+  const qs = query.toString()
+  return request<AdminUserPage>(`/admin/users${qs ? `?${qs}` : ""}`)
+}
+
+/** The two 429 details of POST /interviews and POST .../repeat. */
+export const LIFETIME_LIMIT_REACHED = "lifetime_interview_limit_reached"
+export const MONTHLY_CAPACITY_REACHED = "monthly_demo_capacity_reached"
+
+const DEFAULT_INTERVIEW_LIMIT = 3
+
+// The capacity resets at 00:00 UTC on the 1st: that is the day to name.
+const retryDateFormat = new Intl.DateTimeFormat("en", {
+  month: "long",
+  day: "numeric",
+  timeZone: "UTC",
+})
+
+export function lifetimeLimitMessage(limit?: number | null): string {
+  return `You've used your ${limit ?? DEFAULT_INTERVIEW_LIMIT} free interviews.`
+}
+
+const HALF_DAY_MS = 12 * 60 * 60 * 1000
+
+/** `retryAfter`: seconds until the capacity resets (the 429's Retry-After);
+ *  without it, the 1st of next month (UTC), when the server resets it.
+ *
+ * Retry-After counts to exactly 00:00 on the 1st by the database's clock,
+ * so added to this one it can land a few seconds either side of midnight:
+ * the reset is the next 1st after half a day before that instant. */
+export function monthlyCapacityMessage(retryAfter?: number | null): string {
+  const now = Date.now()
+  const around =
+    retryAfter === null || retryAfter === undefined
+      ? new Date(now)
+      : new Date(now + retryAfter * 1000 - HALF_DAY_MS)
+  const reset = new Date(
+    Date.UTC(around.getUTCFullYear(), around.getUTCMonth() + 1, 1)
+  )
+  return `The demo has reached its interview limit for this month. Try again on ${retryDateFormat.format(reset)}.`
+}
+
+/** A quota refusal in words, or null for any other error. */
+export function quotaErrorMessage(
+  error: unknown,
+  limit?: number | null
+): string | null {
+  if (!(error instanceof ApiError) || error.status !== 429) return null
+  if (error.message === LIFETIME_LIMIT_REACHED) {
+    return lifetimeLimitMessage(limit)
+  }
+  if (error.message === MONTHLY_CAPACITY_REACHED) {
+    return monthlyCapacityMessage(error.retryAfter)
+  }
+  return null
 }
 
 // ---- Settings -----------------------------------------------------------------

@@ -97,6 +97,26 @@ function DropdownMenuItem({
   )
 }
 
+/** A menu entry that navigates: an `<a>` (pass a router Link as `render`)
+ *  styled like DropdownMenuItem, closing the menu when followed. */
+function DropdownMenuLinkItem({
+  className,
+  closeOnClick = true,
+  ...props
+}: MenuPrimitive.LinkItem.Props) {
+  return (
+    <MenuPrimitive.LinkItem
+      data-slot="dropdown-menu-item"
+      closeOnClick={closeOnClick}
+      className={cn(
+        "group/dropdown-menu-item relative flex min-h-10 cursor-default items-center gap-3 px-4 py-2 text-sm outline-hidden select-none data-highlighted:bg-foreground/8 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg]:text-muted-foreground [&_svg:not([class*='size-'])]:size-5",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
 function DropdownMenuSub({ ...props }: MenuPrimitive.SubmenuRoot.Props) {
   return <MenuPrimitive.SubmenuRoot data-slot="dropdown-menu-sub" {...props} />
 }
@@ -253,6 +273,7 @@ export {
   DropdownMenuGroup,
   DropdownMenuLabel,
   DropdownMenuItem,
+  DropdownMenuLinkItem,
   DropdownMenuCheckboxItem,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,

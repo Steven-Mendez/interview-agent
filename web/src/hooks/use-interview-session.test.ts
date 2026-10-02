@@ -53,7 +53,10 @@ const mocks = vi.hoisted(() => {
     }
   }
 
-  return { rooms, Room: MockRoom }
+  // Holds of suppressUnauthorizedRedirect() not released yet.
+  const redirectHolds = { count: 0 }
+
+  return { rooms, Room: MockRoom, redirectHolds }
 })
 
 vi.mock("livekit-client", async (original) => ({
@@ -69,6 +72,14 @@ vi.mock("@/lib/api", () => ({
     room: "test",
   }),
   ApiError: class extends Error {},
+  suppressUnauthorizedRedirect: () => {
+    mocks.redirectHolds.count += 1
+    let released = false
+    return () => {
+      if (!released) mocks.redirectHolds.count -= 1
+      released = true
+    }
+  },
 }))
 
 // A controllable stream with the installed SDK's public reader contract.
@@ -156,6 +167,43 @@ describe("interview transcription lifecycle", () => {
     expect(mic.mock.calls).toEqual([[true], [false]])
     expect(hook.result.current.phase).toBe("live")
     hook.unmount()
+  })
+
+  it("holds sign-in redirects back while the interview is in the room", async () => {
+    const hook = renderHook(() => useInterviewSession("test"))
+    expect(mocks.redirectHolds.count).toBe(0)
+    await act(async () => {
+      hook.result.current.start()
+      await flush()
+    })
+    expect(hook.result.current.phase).toBe("live")
+    expect(mocks.redirectHolds.count).toBe(1)
+    await act(async () => {
+      hook.result.current.requestEnd()
+      await flush()
+    })
+    expect(hook.result.current.phase).toBe("closing")
+    expect(mocks.redirectHolds.count).toBe(1)
+    await act(async () => {
+      hook.result.current.syncClosingState(
+        "completed",
+        null,
+        "not_possible",
+        true
+      )
+      await flush()
+    })
+    expect(hook.result.current.phase).toBe("ended")
+    expect(mocks.redirectHolds.count).toBe(0)
+    hook.unmount()
+  })
+
+  it("releases the redirect hold when the page goes away mid-interview", async () => {
+    const { result, unmount } = await connected()
+    expect(result.current.phase).toBe("live")
+    expect(mocks.redirectHolds.count).toBe(1)
+    unmount()
+    expect(mocks.redirectHolds.count).toBe(0)
   })
 
   it("offers answer-again or end only while the technical notice is active", async () => {

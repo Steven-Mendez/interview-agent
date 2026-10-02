@@ -4,7 +4,10 @@ Every measurement keeps its (component, name). A known value is a sample of the
 exponential histogram `interview_agent.<component>.<name>`; a missing one (None,
 NaN or infinite) adds one to the counter `interview_agent.<component>.<name>.unknown`,
 so absent data is never averaged in as zero. Attributes are categories our own
-code produces (DIMENSIONS): never a trace, interview or turn ID, nor content.
+code produces (DIMENSIONS): never a trace, interview, turn or user ID, nor content.
+
+A state rather than an event (how many users there are) is a gauge: the latest
+values set_snapshot() published, reported again at every export.
 
 Without an endpoint nothing is configured and recording is a no-op. The provider
 is private to this module: livekit.agents.telemetry installs the global one for
@@ -19,9 +22,10 @@ import logging
 import math
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.metrics import CallbackOptions, Observation
 from opentelemetry.sdk.metrics import AlwaysOffExemplarFilter, Histogram, MeterProvider
 from opentelemetry.sdk.metrics.export import MetricReader, PeriodicExportingMetricReader
 from opentelemetry.sdk.metrics.view import ExponentialBucketHistogramAggregation, View
@@ -55,6 +59,13 @@ DIMENSIONS = frozenset(
         "source",
         "action",
         "audio_output",
+        # Accounts and sign-ins: fixed categories, never who.
+        "role",
+        "limit",
+        "window",
+        "reason",
+        "result",
+        "auth_provider",
     }
 )
 
@@ -68,6 +79,17 @@ def safe_dimensions(dimensions: dict) -> dict:
     }
 
 
+# Each gauge's latest values, by metric name: one (attributes, value) pair per
+# label set. set_snapshot replaces a gauge's tuple whole, so a collection reads
+# either the old values or the new ones, never a mix. Kept across configure()
+# and shutdown(): the values describe the database, not the provider.
+_snapshots: dict[str, tuple[tuple[dict, float], ...]] = {}
+
+
+def _observe(metric: str, options: CallbackOptions) -> Iterable[Observation]:
+    return [Observation(value, attributes) for attributes, value in _snapshots.get(metric, ())]
+
+
 class _Process:
     """This process's provider and its instruments, created once per name."""
 
@@ -76,6 +98,13 @@ class _Process:
         self.provider = provider
         self.histogram = functools.cache(meter.create_histogram)
         self.counter = functools.cache(meter.create_counter)
+        # Asynchronous: a synchronous gauge exports a value once, after which
+        # the series would go stale until the next change.
+        self.gauge = functools.cache(
+            lambda metric: meter.create_observable_gauge(
+                metric, callbacks=[functools.partial(_observe, metric)]
+            )
+        )
 
 
 _process: _Process | None = None
@@ -118,6 +147,9 @@ def configure(settings: Settings, service_name: str, *, reader: MetricReader | N
         shutdown_on_exit=False,
     )
     _process = _Process(provider)
+    # Snapshots published before this configuration keep being reported.
+    for metric in list(_snapshots):
+        _process.gauge(metric)
     return True
 
 
@@ -133,6 +165,28 @@ def record(component: str, name: str, value: float | None, dimensions: dict | No
             process.counter(metric + ".unknown").add(1, attributes)
         else:
             process.histogram(metric).record(value, attributes)
+    except Exception as exc:
+        logger.warning("Metric not recorded: %s", type(exc).__name__)
+
+
+def set_snapshot(
+    component: str, name: str, values: Mapping[tuple[tuple[str, str], ...], float]
+) -> None:
+    """Replace what the gauge `interview_agent.<component>.<name>` reports, by
+    label set: {(("role", "guest"),): 3, (("role", "admin"),): 1}, or {(): 5}
+    without labels. A label set left out is no longer reported, so callers
+    list every one, zeros included. Labels outside DIMENSIONS are dropped.
+    Kept while recording is unconfigured; never raises."""
+    try:
+        metric = f"interview_agent.{component}.{name}"
+        _snapshots[metric] = tuple(
+            (safe_dimensions(dict(labels)), value)
+            for labels, value in values.items()
+            if math.isfinite(value)
+        )
+        process = _process
+        if process is not None:
+            process.gauge(metric)
     except Exception as exc:
         logger.warning("Metric not recorded: %s", type(exc).__name__)
 

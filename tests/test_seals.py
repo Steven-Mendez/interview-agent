@@ -11,6 +11,9 @@ from test_routes import (
     _settled,
 )
 from test_routes import (
+    acting_user as acting_user,
+)
+from test_routes import (
     client_and_sessionmaker as client_and_sessionmaker,
 )
 

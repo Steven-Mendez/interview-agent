@@ -127,6 +127,18 @@ export function PreJoinRoom({
               `${verb} interview`
             )}
           </Button>
+          {/* The worker may be waking up: say so, or the wait reads as a
+              hang. */}
+          {connecting && (
+            <div role="status" className="flex flex-col gap-1">
+              <p className="text-sm font-medium">
+                Connecting to the interviewer…
+              </p>
+              <p className="text-xs text-muted-foreground">
+                The first connection can take 10–20 seconds.
+              </p>
+            </div>
+          )}
           {rejoin &&
             rejoinUntil !== null &&
             Number.isFinite(rejoinDeadline) && (

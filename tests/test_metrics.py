@@ -83,6 +83,184 @@ async def test_samples_never_carry_the_current_span_as_an_exemplar(recorded_metr
     assert not sample.exemplars and not unknown.exemplars
 
 
+def gauge(points) -> dict[tuple, float]:
+    """A gauge's values by attribute set, the attributes as sorted (key, value) pairs."""
+    return {tuple(sorted(dict(point.attributes).items())): point.value for point in points}
+
+
+async def test_a_snapshot_gauge_reports_its_latest_values_at_every_collection(recorded_metrics):
+    otel_metrics.set_snapshot(
+        "accounts",
+        "users",
+        {
+            (("role", "guest"),): 3,
+            (("role", "admin"),): 0,
+            # Labels outside DIMENSIONS never reach the export.
+            (("role", "admin"), ("owner_id", "user-synthetic"), ("email", "a@example.com")): 9,
+        },
+    )
+    expected = {(("role", "guest"),): 3, (("role", "admin"),): 9}
+    # Unlike a synchronous gauge, the value is exported again, not once.
+    assert gauge(recorded_metrics("interview_agent.accounts.users")) == expected
+    assert gauge(recorded_metrics("interview_agent.accounts.users")) == expected
+    # A new snapshot replaces the old one whole.
+    otel_metrics.set_snapshot("accounts", "users", {(("role", "guest"),): 4})
+    assert gauge(recorded_metrics("interview_agent.accounts.users")) == {(("role", "guest"),): 4}
+    otel_metrics.set_snapshot("accounts", "guest_interviews_monthly_limit", {(): 2})
+    (limit,) = recorded_metrics("interview_agent.accounts.guest_interviews_monthly_limit")
+    assert (limit.value, dict(limit.attributes)) == (2, {})
+
+
+def test_snapshots_outlive_a_reconfiguration_and_cost_nothing_unconfigured():
+    # Unconfigured: kept, nothing built.
+    otel_metrics.set_snapshot("accounts", "guests_out_of_interviews", {(): 1})
+    reader = InMemoryMetricReader()
+    try:
+        otel_metrics.configure(Settings(_env_file=None), "interview-agent-test", reader=reader)
+        for _ in range(2):
+            (point,) = [
+                point
+                for resource in reader.get_metrics_data().resource_metrics
+                for scope in resource.scope_metrics
+                for metric in scope.metrics
+                if metric.name == "interview_agent.accounts.guests_out_of_interviews"
+                for point in metric.data.data_points
+            ]
+            assert point.value == 1
+    finally:
+        otel_metrics.shutdown()
+    # Shut down: the next snapshot is kept for the next configuration only.
+    otel_metrics.set_snapshot("accounts", "guests_out_of_interviews", {(): 2})
+    assert otel_metrics._snapshots["interview_agent.accounts.guests_out_of_interviews"] == (
+        ({}, 2),
+    )
+
+
+async def test_account_gauges_count_users_activity_and_quotas(
+    postgres_sessionmaker, recorded_metrics, monkeypatch
+):
+    from datetime import UTC, date, timedelta
+
+    from sqlalchemy import delete, func
+
+    from interview_agent.interview import db
+    from interview_agent.server import account_metrics
+
+    settings = Settings(
+        _env_file=None,
+        ADMIN_USER_IDS="local-dev,user-admin",
+        LIFETIME_INTERVIEWS_PER_USER=3,
+        GUEST_INTERVIEWS_PER_MONTH=40,
+    )
+    async with postgres_sessionmaker() as session:
+        now = await session.scalar(func.now().select())
+        for owner_id, seen_days_ago in (
+            ("local-dev", 0),
+            ("user-admin", None),
+            ("user-today", 0.5),
+            ("user-week", 3),
+            ("user-month", 20),
+            ("user-gone", 45),
+            ("user-never", None),
+        ):
+            session.add(
+                db.UserProfile(
+                    owner_id=owner_id,
+                    auth_provider="local" if owner_id == "local-dev" else "neon",
+                    last_seen_at=None
+                    if seen_days_ago is None
+                    else now - timedelta(days=seen_days_ago),
+                )
+            )
+        session.add_all(
+            [
+                db.UserInterviewQuota(owner_id="user-today", interviews_used=3),
+                db.UserInterviewQuota(owner_id="user-week", interviews_used=2),
+                db.UserInterviewQuota(owner_id="user-gone", interviews_used=4),
+                # An admin's count never runs out.
+                db.UserInterviewQuota(owner_id="user-admin", interviews_used=5),
+            ]
+        )
+        this_month = now.astimezone(UTC).date().replace(day=1)
+        session.add_all(
+            [
+                db.GuestInterviewMonth(month=this_month, interviews_started=7),
+                db.GuestInterviewMonth(month=date(2001, 1, 1), interviews_started=30),
+            ]
+        )
+        await session.commit()
+
+    loop_sleeps = []
+
+    async def one_cycle(seconds):
+        loop_sleeps.append(seconds)
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(asyncio, "sleep", one_cycle)
+    with pytest.raises(asyncio.CancelledError):
+        await account_metrics.account_metrics_loop(postgres_sessionmaker, settings)
+    assert loop_sleeps == [account_metrics.ACCOUNT_METRICS_INTERVAL_SECONDS]
+    expected = {
+        "users": {(("role", "admin"),): 2, (("role", "guest"),): 5},
+        "active_users": {
+            (("window", "1d"),): 2,
+            (("window", "7d"),): 3,
+            (("window", "30d"),): 4,
+        },
+        "guests_out_of_interviews": {(): 2},
+        "guest_interviews_this_month": {(): 7},
+        "guest_interviews_monthly_limit": {(): 40},
+    }
+    # Reported again at the next collection, without another recount.
+    for _ in range(2):
+        assert {
+            name: gauge(recorded_metrics(f"interview_agent.accounts.{name}")) for name in expected
+        } == expected
+
+    # A month nobody started an interview in, and no users at all: zeros,
+    # every label set included.
+    async with postgres_sessionmaker() as session:
+        for model in (db.UserProfile, db.UserInterviewQuota, db.GuestInterviewMonth):
+            await session.execute(delete(model))
+        await session.commit()
+    await account_metrics.publish_account_metrics(postgres_sessionmaker, settings)
+    assert gauge(recorded_metrics("interview_agent.accounts.users")) == {
+        (("role", "admin"),): 0,
+        (("role", "guest"),): 0,
+    }
+    assert gauge(recorded_metrics("interview_agent.accounts.active_users")) == {
+        (("window", window),): 0 for window in ("1d", "7d", "30d")
+    }
+    assert gauge(recorded_metrics("interview_agent.accounts.guest_interviews_this_month")) == {
+        (): 0
+    }
+
+
+async def test_a_failed_recount_keeps_the_loop_and_logs_only_its_template(
+    recorded_metrics, monkeypatch, caplog
+):
+    from interview_agent.log_templates import SAFE_LOG_TEMPLATES
+    from interview_agent.server import account_metrics
+
+    async def broken(sessionmaker, settings):
+        raise RuntimeError("SENSITIVE_DATABASE_ERROR")
+
+    cycles = []
+
+    async def sleep(seconds):
+        cycles.append(seconds)
+        if len(cycles) == 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(account_metrics, "account_snapshot", broken)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    with caplog.at_level("ERROR", logger="interview_agent"), pytest.raises(asyncio.CancelledError):
+        await account_metrics.account_metrics_loop(None, Settings(_env_file=None))
+    template = "account metrics failed; retrying next cycle"
+    assert [record.msg for record in caplog.records] == [template, template]
+    assert template in SAFE_LOG_TEMPLATES
+
+
 def test_without_an_endpoint_nothing_is_built_and_recording_is_a_no_op(monkeypatch):
     reader = InMemoryMetricReader()
     assert otel_metrics.configure(Settings(_env_file=None), "interview-agent-test", reader=reader)

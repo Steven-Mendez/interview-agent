@@ -2,7 +2,11 @@ import * as React from "react"
 import { Room, RoomEvent, RpcError } from "livekit-client"
 import type { TextStreamHandler } from "livekit-client"
 
-import { getInterviewToken, ApiError } from "@/lib/api"
+import {
+  getInterviewToken,
+  ApiError,
+  suppressUnauthorizedRedirect,
+} from "@/lib/api"
 import { log } from "@/lib/log"
 import { FarewellPlayback } from "@/lib/farewell"
 import { requestInterviewEnd } from "@/lib/closing-request"
@@ -535,6 +539,15 @@ export function useInterviewSession(interviewId: string): InterviewSession {
     },
     []
   )
+
+  // A refused session mid-interview must not navigate away from the room:
+  // its requests fail on their own, and the interview goes on.
+  const inRoom =
+    phase === "connecting" || phase === "live" || phase === "closing"
+  React.useEffect(() => {
+    if (!inRoom) return
+    return suppressUnauthorizedRedirect()
+  }, [inRoom])
 
   // Tear the room down on real unmount (navigation away). start() is
   // click-driven, so StrictMode's mount/unmount/mount cycle runs before any

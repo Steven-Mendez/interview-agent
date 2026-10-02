@@ -19,7 +19,7 @@ from sqlalchemy import text
 from interview_agent.interview import db
 from interview_agent.llm import build_chat_model, close_chat_model
 
-EXPECTED_REVISION = "2d4e8adaf02e"
+EXPECTED_REVISION = "9c3d5e7f1a20"
 ROOT = Path(__file__).resolve().parents[1]
 FIELDS = (
     "planner_model",

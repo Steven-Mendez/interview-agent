@@ -1,6 +1,12 @@
 import { queryOptions } from "@tanstack/react-query"
 
-import { getInterview, getTranscript, listInterviews } from "@/lib/api"
+import {
+  ApiError,
+  getAdminUsers,
+  getInterview,
+  getTranscript,
+  listInterviews,
+} from "@/lib/api"
 import type { Interview, InterviewStatus } from "@/lib/api"
 
 type InterviewStatusValue = Interview["status"]
@@ -85,6 +91,20 @@ export function interviewCountQueryOptions(status?: InterviewStatus) {
     queryKey: ["interviews", "count", status ?? null] as const,
     queryFn: () => listInterviews({ limit: 1, status }),
     select: (page) => page.total,
+    staleTime: 10_000,
+  })
+}
+
+export const ADMIN_USERS_PAGE_SIZE = 50
+
+/** One page of GET /admin/users. A 403 (not an admin) is the answer, not a
+ *  hiccup: no retries. */
+export function adminUsersQueryOptions(offset: number) {
+  return queryOptions({
+    queryKey: ["admin", "users", { offset }] as const,
+    queryFn: () => getAdminUsers({ limit: ADMIN_USERS_PAGE_SIZE, offset }),
+    retry: (failureCount, error) =>
+      !(error instanceof ApiError && error.status === 403) && failureCount < 3,
     staleTime: 10_000,
   })
 }

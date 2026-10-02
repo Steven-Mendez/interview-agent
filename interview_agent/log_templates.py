@@ -6,6 +6,7 @@ Never add candidate or generated content to this catalog.
 
 SAFE_LOG_TEMPLATES = frozenset(
     (
+        "AUTH_MODE=local is for development only",
         "Closing background task failed: %s",
         "Completion publication failed; persistent state remains available",
         "Could not persist evaluation failure",
@@ -27,6 +28,7 @@ SAFE_LOG_TEMPLATES = frozenset(
         "Metrics export did not complete",
         "Metrics export failed: %s",
         "Metrics flush did not complete",
+        "Neon Auth JWKS fetch failed",
         "Question recovery failed; delivery remains uncertain",
         "Shutdown cleanup failed: %s",
         "Technical notice attribute could not be published",
@@ -37,6 +39,7 @@ SAFE_LOG_TEMPLATES = frozenset(
         "Worker engine disposal did not complete",
         "Worker shutdown exceeded its total cleanup budget",
         "Worker shutdown failed",
+        "account metrics failed; retrying next cycle",
         "auto-evaluation triggered: HTTP %s",
         "capacity reached: %s active interviews, rejecting %s",
         "closing an orphaned interview for evaluation",
@@ -62,6 +65,7 @@ SAFE_LOG_TEMPLATES = frozenset(
         "healthz failed: %s",
         "idle timeout for %s",
         "interview planned",
+        "interview quota reached",
         "invalid interview source context for %s",
         "job for room %r carries no conversation id; skipping",
         (
@@ -69,6 +73,7 @@ SAFE_LOG_TEMPLATES = frozenset(
             "deduplication requires provider audio boundaries"
         ),
         "kept stt final: matching text but different audio boundaries",
+        "local sign-in rejected",
         "milestone status refresh failed for %s",
         "planning failed for %s",
         "refusing stale reconnect",

@@ -9,6 +9,15 @@ GET /interviews/{id} (poll until evaluated / evaluation_failed).
 Past interviews are browsable through GET /interviews (paginated history) and
 GET /interviews/{id}/transcript, and re-runnable through
 POST /interviews/{id}/repeat.
+
+GET /me records who signed in (the user's profile); admins list everyone
+through GET /admin/users.
+
+Every interview belongs to the user who created it (server.auth): anyone
+else, admins included, gets a 404. The closing routes are the exception: the
+browser authenticates them with its LiveKit participant token, after the
+interview. Creating or repeating an interview spends one of the user's
+lifetime interviews and one of the month's shared ones; admins spend neither.
 """
 
 from __future__ import annotations
@@ -19,10 +28,10 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 from hashlib import sha256
-from typing import Any
+from typing import Annotated, Any
 
 import anyio.to_thread
-from fastapi import APIRouter, Form, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, UploadFile
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from livekit import api
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -49,7 +58,19 @@ from interview_agent.observability import (
 from interview_agent.playback import PlaybackAck, acknowledge_playback, closing_state
 from interview_agent.prompts import DEFAULT_SENIORITY, fit_length, followup_budget, length_for
 from interview_agent.server import evaluations
-from interview_agent.server.reconciliation import reconcile_interview
+from interview_agent.server.account_metrics import publish_account_metrics
+from interview_agent.server.auth import (
+    CurrentUser,
+    User,
+    auth_provider,
+    current_user,
+    internal_caller,
+    internal_caller_or_user,
+    is_admin,
+    require_admin,
+)
+from interview_agent.server.reconciliation import LifecycleSweeper, reconcile_interview
+from interview_agent.server.retention import purge_expired
 from interview_agent.voices import (
     DEFAULT_AGENT_NAME,
     SUPPORTED_LANGUAGES,
@@ -246,7 +267,7 @@ def _default_voice_for(language: str, like: str | None = None) -> str:
 
 
 def _resolve_interviewer(
-    app_settings: db.AppSettings, overrides: dict[str, Any] | None
+    app_settings: db.AppSettings | db.UserSettings, overrides: dict[str, Any] | None
 ) -> dict[str, Any]:
     """Who conducts THIS interview: the global settings with the per-interview
     overrides applied, voice already resolved to a concrete TTS pair.
@@ -347,7 +368,7 @@ async def healthz(request: Request):
 
 
 class SettingsUpdate(BaseModel):
-    """PUT /settings body: the global agent configuration."""
+    """PUT /settings body: the user's agent configuration."""
 
     agent_name: str = DEFAULT_AGENT_NAME
     language: str
@@ -385,7 +406,7 @@ class SettingsUpdate(BaseModel):
         return self
 
 
-def _serialize_settings(app_settings: db.AppSettings) -> dict[str, Any]:
+def _serialize_settings(app_settings: db.AppSettings | db.UserSettings) -> dict[str, Any]:
     return {
         "agent_name": app_settings.agent_name,
         "language": app_settings.language,
@@ -398,16 +419,16 @@ def _serialize_settings(app_settings: db.AppSettings) -> dict[str, Any]:
 
 
 @router.get("/settings")
-async def get_settings(request: Request):
+async def get_settings(request: Request, user: CurrentUser):
     async with _sessionmaker(request)() as session:
-        app_settings = await db.get_app_settings(session)
+        app_settings = await db.get_user_settings(session, user.id)
         return _serialize_settings(app_settings)
 
 
 @router.put("/settings")
-async def update_settings(request: Request, body: SettingsUpdate):
+async def update_settings(request: Request, user: CurrentUser, body: SettingsUpdate):
     async with _sessionmaker(request)() as session:
-        app_settings = await db.upsert_app_settings(session, body.model_dump())
+        app_settings = await db.upsert_user_settings(session, user.id, body.model_dump())
         logger.info(
             "settings updated",
             extra={"language": app_settings.language, "voice": app_settings.voice},
@@ -641,6 +662,17 @@ async def _load_or_404(session: AsyncSession, interview_id: uuid.UUID) -> db.Con
     return conversation
 
 
+async def _load_owned_or_404(
+    session: AsyncSession, interview_id: uuid.UUID, user: User
+) -> db.Conversation:
+    """The interview if `user` owns it. Someone else's, or nobody's (from
+    before accounts), is the same 404 as a missing one: no existence leak."""
+    conversation = await db.get_conversation(session, interview_id)
+    if conversation is None or conversation.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    return conversation
+
+
 class ResumeReview(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -685,7 +717,7 @@ async def _extract_resume(data: bytes, filename: str | None) -> str:
     return resume_markdown
 
 
-@router.post("/resumes/preview")
+@router.post("/resumes/preview", dependencies=[Depends(current_user)])
 async def preview_resume(resume: UploadFile):
     """Extract without planning or persisting; the user reviews the actual input."""
     data = await _read_resume(resume)
@@ -701,6 +733,7 @@ async def preview_resume(resume: UploadFile):
 @router.post("/interviews")
 async def create_interview(
     request: Request,
+    user: CurrentUser,
     resume: UploadFile,
     job_offer: str = Form(),
     # Depth axis. "auto" (the default) means the planner classifies the role
@@ -746,6 +779,7 @@ async def create_interview(
 
     return await _plan_and_persist(
         request,
+        user,
         job_offer=job_offer,
         resume_markdown=resume_markdown,
         resume_filename=resume.filename,
@@ -762,6 +796,7 @@ async def create_interview(
 
 async def _plan_and_persist(
     request: Request,
+    user: User,
     *,
     job_offer: str,
     resume_markdown: str,
@@ -785,7 +820,11 @@ async def _plan_and_persist(
     "auto") instead of masquerading as a level the user just picked.
 
     `interviewer_overrides` follows the convention in `_resolve_interviewer`:
-    None inherits the global settings, a value wins for this interview only.
+    None inherits the user's settings, a value wins for this interview only.
+
+    The interview is the user's, and counts against their quota once every
+    input is validated: a rejected request costs nothing, while a planner run
+    that started counts even if it fails (it was spent).
     """
     _validate_sources(resume_markdown, job_offer)
     conversation_id = uuid.uuid4()
@@ -805,8 +844,9 @@ async def _plan_and_persist(
     async with _sessionmaker(request)() as session:
         # Snapshot the interviewer NOW: this interview keeps this
         # persona/language/voice even if the settings change later.
-        app_settings = await db.get_app_settings(session)
+        app_settings = await db.get_user_settings(session, user.id)
         interviewer = _resolve_interviewer(app_settings, interviewer_overrides)
+        await _reserve_interview(session, user)
         agent_settings = {
             key: interviewer[key]
             for key in ("agent_name", "language", "voice", "tts_model", "tts_voice")
@@ -827,6 +867,7 @@ async def _plan_and_persist(
         session.add(
             db.Conversation(
                 id=conversation_id,
+                owner_id=user.id,
                 status="created",
                 job_offer=job_offer,
                 resume_markdown=resume_markdown,
@@ -975,7 +1016,121 @@ async def _plan_and_persist(
         )
 
 
-@router.get("/runtime")
+async def _reserve_interview(session: AsyncSession, user: User) -> None:
+    """Spend one interview of the user's quota, or answer 429. Admins are not
+    counted. The detail is a string, which the web client shows as the reason.
+
+    The reservation ends the session's transaction (commit or rollback), so
+    nothing loaded before it may be read after it."""
+    if is_admin(user):
+        otel_metrics.record("accounts", "interview_reserved", 1, {"role": "admin"})
+        return
+    outcome = await db.reserve_interview_slot(
+        session,
+        user.id,
+        lifetime_limit=settings.lifetime_interviews_per_user,
+        monthly_limit=settings.guest_interviews_per_month,
+    )
+    if outcome == "ok":
+        otel_metrics.record("accounts", "interview_reserved", 1, {"role": "guest"})
+        return
+    logger.info("interview quota reached", extra={"limit": outcome})
+    otel_metrics.record("accounts", "quota_rejected", 1, {"limit": outcome})
+    if outcome == "lifetime":
+        # Permanent: no retry time to offer.
+        raise HTTPException(status_code=429, detail="lifetime_interview_limit_reached")
+    raise HTTPException(
+        status_code=429,
+        detail="monthly_demo_capacity_reached",
+        headers={"Retry-After": str(await db.seconds_until_next_month(session))},
+    )
+
+
+def _isoformat(moment: datetime | None) -> str | None:
+    return moment.isoformat() if moment is not None else None
+
+
+@router.get("/me")
+async def get_me(request: Request, user: CurrentUser):
+    """The signed-in user and what is left of their interviews. Admins have no
+    limit (null) and are never held back by the monthly capacity.
+
+    The one place profiles are written: the web asks on every page, so this
+    is when a user is seen (at most one write every few minutes)."""
+    admin = is_admin(user)
+    provider = auth_provider(user)
+    async with _sessionmaker(request)() as session:
+        profile, new = await db.touch_user_profile(
+            session, user.id, auth_provider=provider, email=user.email, name=user.name
+        )
+        quota = await db.interview_quota_status(
+            session, user.id, monthly_limit=settings.guest_interviews_per_month
+        )
+    if new:
+        otel_metrics.record("accounts", "new_user", 1, {"auth_provider": provider})
+    limit = None if admin else settings.lifetime_interviews_per_user
+    return {
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "is_admin": admin,
+        "auth_provider": profile.auth_provider,
+        "created_at": profile.created_at.isoformat(),
+        "last_seen_at": _isoformat(profile.last_seen_at),
+        "interviews_used": quota.interviews_used,
+        "interview_limit": limit,
+        "interviews_remaining": None if limit is None else max(0, limit - quota.interviews_used),
+        "demo_capacity_available": admin or quota.monthly_capacity_available,
+    }
+
+
+@router.get("/admin/users", dependencies=[Depends(require_admin)])
+async def list_users(
+    request: Request,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    """Everyone who signed in, most recently seen first: their profile, their
+    quota, and how many of their interviews the retention purge left."""
+    async with _sessionmaker(request)() as session:
+        users, total = await db.list_user_profiles(session, limit=limit, offset=offset)
+    items = []
+    for summary in users:
+        profile = summary.profile
+        admin = profile.owner_id in settings.admin_user_ids
+        items.append(
+            {
+                "id": profile.owner_id,
+                "name": profile.name,
+                "email": profile.email,
+                "auth_provider": profile.auth_provider,
+                "is_admin": admin,
+                "created_at": profile.created_at.isoformat(),
+                "last_seen_at": _isoformat(profile.last_seen_at),
+                "interviews_used": summary.interviews_used,
+                "interview_limit": None if admin else settings.lifetime_interviews_per_user,
+                "interviews_stored": summary.interviews_stored,
+                "last_interview_at": _isoformat(summary.last_interview_at),
+            }
+        )
+    return {"total": total, "items": items}
+
+
+@router.post("/internal/maintenance", dependencies=[Depends(internal_caller)])
+async def run_maintenance(request: Request):
+    """The retention purge and one lifecycle sweep, for a scheduler that wakes
+    an otherwise idle (scaled to zero) API. Counts only."""
+    sessionmaker = _sessionmaker(request)
+    deleted = await purge_expired(sessionmaker, settings)
+    reconciled, failures = await LifecycleSweeper(
+        sessionmaker, settings, request.app.state.evaluations
+    ).once()
+    # Fresh counts for Grafana before an idle API scales back to zero.
+    await publish_account_metrics(sessionmaker, settings)
+    return {"deleted_interviews": deleted, "reconciled": reconciled, "failures": failures}
+
+
+@router.get("/runtime", dependencies=[Depends(require_admin)])
 async def get_runtime_manifest(request: Request):
     manifest = getattr(request.app.state, "runtime_manifest", None)
     if manifest is None:
@@ -999,12 +1154,14 @@ _HISTORY_STATUSES = (
 @router.get("/interviews")
 async def list_interviews(
     request: Request,
+    user: CurrentUser,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     status: str | None = Query(None),
 ):
-    """Paginated history, newest first. `status` narrows it to one state;
-    empty (a form's "all" option) is the same as absent."""
+    """Paginated history of the user's interviews, newest first. `status`
+    narrows it to one state; empty (a form's "all" option) is the same as
+    absent."""
     status = status or None
     if status is not None and status not in _HISTORY_STATUSES:
         raise HTTPException(
@@ -1012,7 +1169,7 @@ async def list_interviews(
         )
     async with _sessionmaker(request)() as session:
         conversations, total = await db.list_conversations(
-            session, limit=limit, offset=offset, status=status
+            session, limit=limit, offset=offset, status=status, owner_id=user.id
         )
         now = await session.scalar(select(func.clock_timestamp()))
         return {
@@ -1033,9 +1190,9 @@ async def list_interviews(
 
 
 @router.get("/interviews/{interview_id}")
-async def get_interview(request: Request, interview_id: uuid.UUID):
+async def get_interview(request: Request, user: CurrentUser, interview_id: uuid.UUID):
     async with _sessionmaker(request)() as session:
-        conversation = await _load_or_404(session, interview_id)
+        conversation = await _load_owned_or_404(session, interview_id, user)
         if conversation.status in ("interviewing", "closing"):
             await reconcile_interview(session, interview_id, settings)
             await session.refresh(conversation)
@@ -1051,9 +1208,9 @@ async def get_interview(request: Request, interview_id: uuid.UUID):
 
 
 @router.get("/interviews/{interview_id}/evaluations")
-async def get_evaluation_history(request: Request, interview_id: uuid.UUID):
+async def get_evaluation_history(request: Request, user: CurrentUser, interview_id: uuid.UUID):
     async with _sessionmaker(request)() as session:
-        conversation = await _load_or_404(session, interview_id)
+        conversation = await _load_owned_or_404(session, interview_id, user)
         requests = list(
             await session.scalars(
                 select(db.EvaluationRequest)
@@ -1124,11 +1281,11 @@ async def get_evaluation_history(request: Request, interview_id: uuid.UUID):
 
 
 @router.get("/interviews/{interview_id}/question")
-async def get_question(request: Request, interview_id: uuid.UUID):
+async def get_question(request: Request, user: CurrentUser, interview_id: uuid.UUID):
     from interview_agent.interview.delivery import answered, latest_question
 
     async with _sessionmaker(request)() as session:
-        conversation = await _load_or_404(session, interview_id)
+        conversation = await _load_owned_or_404(session, interview_id, user)
         question = await latest_question(session, interview_id)
         if (
             question is None
@@ -1158,11 +1315,13 @@ class QuestionReplay(BaseModel):
 
 
 @router.post("/interviews/{interview_id}/question/replay", status_code=202)
-async def replay_question(request: Request, interview_id: uuid.UUID, body: QuestionReplay):
+async def replay_question(
+    request: Request, user: CurrentUser, interview_id: uuid.UUID, body: QuestionReplay
+):
     from interview_agent.interview.delivery import request_replay
 
     async with _sessionmaker(request)() as session:
-        await _load_or_404(session, interview_id)
+        await _load_owned_or_404(session, interview_id, user)
         try:
             request_id = await request_replay(
                 session, interview_id, body.question_id, body.request_id
@@ -1182,12 +1341,16 @@ class IncidentReviewRequest(BaseModel):
 
 @router.post("/interviews/{interview_id}/incidents/{incident_id}/review")
 async def review_capture_incident(
-    request: Request, interview_id: uuid.UUID, incident_id: uuid.UUID, body: IncidentReviewRequest
+    request: Request,
+    user: CurrentUser,
+    interview_id: uuid.UUID,
+    incident_id: uuid.UUID,
+    body: IncidentReviewRequest,
 ):
     from interview_agent.interview.seals import review_incident
 
     async with _sessionmaker(request)() as session:
-        await _load_or_404(session, interview_id)
+        await _load_owned_or_404(session, interview_id, user)
         try:
             reviewed = await review_incident(
                 session, interview_id, incident_id, **body.model_dump()
@@ -1209,12 +1372,12 @@ class SuccessorSealRequest(BaseModel):
 
 @router.post("/interviews/{interview_id}/seals", status_code=201)
 async def create_reviewed_snapshot(
-    request: Request, interview_id: uuid.UUID, body: SuccessorSealRequest
+    request: Request, user: CurrentUser, interview_id: uuid.UUID, body: SuccessorSealRequest
 ):
     from interview_agent.interview.seals import create_successor
 
     async with _sessionmaker(request)() as session:
-        await _load_or_404(session, interview_id)
+        await _load_owned_or_404(session, interview_id, user)
         try:
             seal = await create_successor(session, interview_id, **body.model_dump())
         except ValueError as exc:
@@ -1223,9 +1386,9 @@ async def create_reviewed_snapshot(
 
 
 @router.get("/interviews/{interview_id}/seals")
-async def get_seal_history(request: Request, interview_id: uuid.UUID):
+async def get_seal_history(request: Request, user: CurrentUser, interview_id: uuid.UUID):
     async with _sessionmaker(request)() as session:
-        conversation = await _load_or_404(session, interview_id)
+        conversation = await _load_owned_or_404(session, interview_id, user)
         seals = list(
             await session.scalars(
                 select(db.TranscriptSeal)
@@ -1285,14 +1448,14 @@ async def get_seal_history(request: Request, interview_id: uuid.UUID):
 
 
 @router.get("/interviews/{interview_id}/transcript")
-async def get_transcript(request: Request, interview_id: uuid.UUID):
+async def get_transcript(request: Request, user: CurrentUser, interview_id: uuid.UUID):
     """The stored turns of a past interview, in turn order.
 
     Kept off /interviews/{id} on purpose: that one is polled every 2s while an
     interview runs, and the transcript grows without bound.
     """
     async with _sessionmaker(request)() as session:
-        conversation = await _load_or_404(session, interview_id)
+        conversation = await _load_owned_or_404(session, interview_id, user)
         messages = await db.get_messages(session, interview_id)
         versions = list(
             await session.scalars(
@@ -1361,7 +1524,7 @@ class RepeatRequest(BudgetOverrides):
 
 @router.post("/interviews/{interview_id}/repeat")
 async def repeat_interview(
-    request: Request, interview_id: uuid.UUID, body: RepeatRequest | None = None
+    request: Request, user: CurrentUser, interview_id: uuid.UUID, body: RepeatRequest | None = None
 ):
     """Run the same role again: a NEW interview off the stored resume and offer.
 
@@ -1372,7 +1535,7 @@ async def repeat_interview(
     """
     body = body or RepeatRequest()
     async with _sessionmaker(request)() as session:
-        source = await _load_or_404(session, interview_id)
+        source = await _load_owned_or_404(session, interview_id, user)
         job_offer = source.job_offer
         resume_markdown = source.resume_markdown
         resume_filename = source.resume_filename
@@ -1425,6 +1588,7 @@ async def repeat_interview(
     )
     return await _plan_and_persist(
         request,
+        user,
         job_offer=job_offer,
         resume_markdown=resume_markdown,
         resume_filename=resume_filename,
@@ -1439,9 +1603,9 @@ async def repeat_interview(
 
 
 @router.get("/interviews/{interview_id}/token")
-async def get_token(request: Request, interview_id: uuid.UUID):
+async def get_token(request: Request, user: CurrentUser, interview_id: uuid.UUID):
     async with _sessionmaker(request)() as session:
-        conversation = await _load_or_404(session, interview_id)
+        conversation = await _load_owned_or_404(session, interview_id, user)
         if conversation.status not in ("planned", "interviewing", "closing"):
             raise HTTPException(
                 status_code=409,
@@ -1521,6 +1685,7 @@ async def get_token(request: Request, interview_id: uuid.UUID):
 @router.post("/interviews/{interview_id}/evaluate", status_code=202)
 async def evaluate_interview(
     request: Request,
+    caller: Annotated[User | None, Depends(internal_caller_or_user)],
     interview_id: uuid.UUID,
     automatic: bool = Query(default=False),
     request_id: uuid.UUID | None = None,
@@ -1534,9 +1699,15 @@ async def evaluate_interview(
     is claimed again, which is what the UI's Retry does once its own clock,
     anchored on the same heartbeat, runs out. Poll GET /interviews/{id} for
     the outcome.
+
+    Callable by the worker (X-Internal-Token, no user) or by the owner.
     """
     async with _sessionmaker(request)() as session:
-        conversation = await _load_or_404(session, interview_id)
+        conversation = (
+            await _load_or_404(session, interview_id)
+            if caller is None
+            else await _load_owned_or_404(session, interview_id, caller)
+        )
         if conversation.status in ("interviewing", "closing"):
             # A live interview must never be evaluated: it would score half a
             # transcript. A row past its reconnect window is not live (the

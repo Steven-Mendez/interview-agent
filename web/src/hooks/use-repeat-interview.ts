@@ -1,6 +1,7 @@
 import { useNavigate } from "@tanstack/react-router"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
 
+import { refreshMeAfter } from "@/hooks/use-me"
 import { repeatInterview } from "@/lib/api"
 import type { RepeatRequest } from "@/lib/api"
 import { interviewQueryOptions } from "@/lib/queries"
@@ -20,6 +21,7 @@ export function useRepeatInterview(interviewId: string) {
       // moment ago stays fresh for 10 s and would come back without it.
       queryClient.setQueryData(interviewQueryOptions(next.id).queryKey, next)
       void queryClient.invalidateQueries({ queryKey: ["interviews"] })
+      refreshMeAfter(queryClient)
       void navigate({
         to: "/interviews/$interviewId",
         params: { interviewId: next.id },
@@ -27,6 +29,7 @@ export function useRepeatInterview(interviewId: string) {
     },
     onError: (error) => {
       console.error("[app] repeat failed:", error)
+      refreshMeAfter(queryClient, error)
     },
   })
 }

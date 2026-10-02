@@ -31,6 +31,8 @@ dependencies = [
     "pyjwt[crypto]>=2.13.0",
     # Error reports without interview content (2.x; 3.x is an OTel-based alpha)
     "sentry-sdk>=2.71,<3",
+    # CA bundle asyncpg verifies Neon against (config.default_ssl_root_cert)
+    "certifi>=2026.6.17",
 ]
 
 [project.scripts]

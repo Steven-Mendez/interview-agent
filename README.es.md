@@ -90,6 +90,8 @@ cd web && pnpm install && pnpm dev
 
 Abre <http://localhost:3000> para el frontend de desarrollo. (El uvicorn en :8000 sirve el último `pnpm build`, si existe — el comportamiento de producción.)
 
+Para desarrollo local define `AUTH_MODE=local` en el `.env` (`.env.example` ya lo hace; el stack de Docker Compose lo usa por defecto): no hay login y cada petición es el usuario `local-dev`, admin si figura en `ADMIN_USER_IDS`. Las entrevistas creadas antes de que existieran las cuentas no tienen dueño y quedan ocultas hasta que las asignes: `uv run python scripts/claim_interviews.py --owner local-dev`.
+
 Los tests solo necesitan Docker en marcha: `uv run pytest` levanta un Postgres 16 desechable para la sesión y lo elimina al terminar (sin `.env` ni base de datos levantada). Para usar una base existente, define `TEST_DATABASE_URL` con una cuyo nombre termine en `_test` (CI lo hace con su contenedor de servicio).
 
 > **Nota sobre el idioma y la voz:** el idioma de la entrevista, el nombre del agente y su voz se configuran en la pantalla Settings de la app (no en el `.env`). El reconocimiento y la síntesis de voz quedan fijados al idioma configurado; el catálogo de voces vive en `interview_agent/voices.py`.

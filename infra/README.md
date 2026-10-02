@@ -36,9 +36,10 @@ DATABASE_URL="$(terraform -chdir=infra/neon output -raw database_url)" \
 at the direct host, not the pooler: the app keeps its own pool and asyncpg's
 prepared statements break behind PgBouncer. It asks for `ssl=verify-full`, so
 asyncpg checks Neon's certificate and host name against the CA bundle in
-`PGSSLROOTCERT` and refuses to connect without one. The app defaults it to
-certifi's bundle (`interview_agent/config.py`), so nothing needs exporting;
-asyncpg does not use the system store, and `sslrootcert` cannot go in this URL.
+`PGSSLROOTCERT` and refuses to connect without one. For a `verify-ca` or
+`verify-full` URL the app defaults it to certifi's bundle
+(`interview_agent/config.py`), so nothing needs exporting; asyncpg does not use
+the system store, and `sslrootcert` cannot go in this URL.
 
 ### Neon Auth
 

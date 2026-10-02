@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+from collections.abc import MutableMapping
 from typing import Annotated, Literal
+from urllib.parse import parse_qs, urlsplit
 
 import certifi
 import langsmith
@@ -125,8 +127,20 @@ class Settings(BaseSettings):
         default=[], alias="CORS_ALLOWED_ORIGINS"
     )
 
-    def require_keys(self) -> Settings:
-        """Fail fast with a clear message if any required API key is missing."""
+    def require_keys(self, role: Literal["api", "worker"]) -> Settings:
+        """Fail fast with a clear message if any required API key is missing.
+
+        In neon mode the API verifies JWTs against NEON_AUTH_URL; both the API
+        and the worker (which sends it to /evaluate) need INTERNAL_API_TOKEN.
+        """
+        auth_keys = (
+            (
+                *((("NEON_AUTH_URL", self.neon_auth_url),) if role == "api" else ()),
+                ("INTERNAL_API_TOKEN", self.internal_api_token),
+            )
+            if self.auth_mode == "neon"
+            else ()
+        )
         missing = [
             name
             for name, value in (
@@ -135,19 +149,17 @@ class Settings(BaseSettings):
                 ("LIVEKIT_API_SECRET", self.livekit_api_secret),
                 ("LIVEKIT_URL", self.livekit_url),
                 ("DATABASE_URL", self.database_url),
-                *(
-                    (
-                        ("NEON_AUTH_URL", self.neon_auth_url),
-                        ("INTERNAL_API_TOKEN", self.internal_api_token),
-                    )
-                    if self.auth_mode == "neon"
-                    else ()
-                ),
+                *auth_keys,
             )
             if not value
         ]
         if missing:
-            raise RuntimeError(f"Missing variables in .env: {', '.join(missing)}.")
+            hint = (
+                " (for local development set AUTH_MODE=local)"
+                if any(name in missing for name, _ in auth_keys)
+                else ""
+            )
+            raise RuntimeError(f"Missing variables in .env: {', '.join(missing)}{hint}.")
         return self
 
     @field_validator("stt_model")
@@ -213,11 +225,24 @@ for _name, _value in _mirrored.items():
     if _value and not os.environ.get(_name):
         os.environ[_name] = _value
 
-# asyncpg verifies the server for ssl=verify-full (infra/neon's DATABASE_URL)
-# only against PGSSLROOTCERT, never the system store, and refuses to connect
-# without one. certifi's bundle is there on every host (API, worker image, CI);
-# looser modes such as the local Postgres's never read it.
-os.environ.setdefault("PGSSLROOTCERT", certifi.where())
+
+def default_ssl_root_cert(database_url: str, environ: MutableMapping[str, str]) -> None:
+    """Point PGSSLROOTCERT at certifi's bundle when the URL verifies the server.
+
+    asyncpg verifies the server for ssl=verify-ca/verify-full (infra/neon's
+    DATABASE_URL is verify-full) only against PGSSLROOTCERT, never the system
+    store, and refuses to connect without one; certifi's bundle is there on
+    every host (API, worker image, CI). Only then: ssl=require reads
+    PGSSLROOTCERT too and would start verifying against it. An explicit
+    PGSSLROOTCERT always wins.
+    """
+    query = parse_qs(urlsplit(database_url).query)
+    modes = (value.lower() for key in ("ssl", "sslmode") for value in query.get(key, ()))
+    if any(mode in ("verify-ca", "verify-full") for mode in modes):
+        environ.setdefault("PGSSLROOTCERT", certifi.where())
+
+
+default_ssl_root_cert(settings.database_url, os.environ)
 
 # The only tracing switch: it overrides LANGSMITH_TRACING, so without a key
 # nothing is traced even if the environment asks for it.

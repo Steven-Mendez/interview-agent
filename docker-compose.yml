@@ -18,6 +18,9 @@ x-app-env: &app-env
     APP_BASE_URL: http://app:8000
     OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4318
     OTEL_EXPORTER_OTLP_HEADERS: ""
+    # Development only: no login unless the shell or .env asks for neon.
+    AUTH_MODE: ${AUTH_MODE:-local}
+    ADMIN_USER_IDS: ${ADMIN_USER_IDS:-local-dev}
 
 services:
   # One-shot: applies the schema before app/worker start, and exactly once

@@ -7,12 +7,17 @@ import type * as Api from "@/lib/api"
 // token of its own. Each test imports a fresh api module, so the build-time
 // env (VITE_API_BASE_URL) and the auth mode are read again.
 
-const auth = vi.hoisted(() => ({ enabled: true, token: vi.fn() }))
+const auth = vi.hoisted(() => ({
+  enabled: true,
+  token: vi.fn(),
+  refresh: vi.fn(),
+}))
 vi.mock("@/lib/auth", () => ({
   get authEnabled() {
     return auth.enabled
   },
   getAccessToken: auth.token,
+  refreshAccessToken: auth.refresh,
 }))
 
 const ME = {
@@ -39,14 +44,24 @@ async function loadApi(): Promise<typeof Api> {
   return import("@/lib/api")
 }
 
-function sent(): { url: string; headers: Headers } {
-  const [url, init] = fetchMock.mock.calls[0]
+/** One response per call, in order. */
+function respondInTurn(...replies: [status: number, body: unknown][]) {
+  for (const [status, body] of replies) {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify(body), { status })
+    )
+  }
+}
+
+function sent(call = 0): { url: string; headers: Headers } {
+  const [url, init] = fetchMock.mock.calls[call]
   return { url: String(url), headers: new Headers(init?.headers) }
 }
 
 beforeEach(() => {
   auth.enabled = true
   auth.token.mockResolvedValue("user.jwt.token")
+  auth.refresh.mockResolvedValue(null)
   vi.stubGlobal("fetch", fetchMock)
   respond(200, ME)
 })
@@ -75,6 +90,7 @@ describe("request", () => {
       "Bearer livekit.participant.token"
     )
     expect(auth.token).not.toHaveBeenCalled()
+    expect(auth.refresh).not.toHaveBeenCalled()
     expect(handler).not.toHaveBeenCalled()
   })
 
@@ -90,6 +106,66 @@ describe("request", () => {
     expect(handler).toHaveBeenCalledTimes(1)
   })
 
+  it("retries a refused JWT once with a fresh one before signing out", async () => {
+    auth.refresh.mockResolvedValue("fresh.jwt.token")
+    const api = await loadApi()
+    const handler = vi.fn()
+    api.setUnauthorizedHandler(handler)
+    respondInTurn(
+      [401, { detail: "Authentication required" }],
+      [401, { detail: "Authentication required" }]
+    )
+    await expect(api.getMe()).rejects.toMatchObject({ status: 401 })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(sent(0).headers.get("Authorization")).toBe("Bearer user.jwt.token")
+    expect(sent(1).headers.get("Authorization")).toBe("Bearer fresh.jwt.token")
+    expect(auth.refresh).toHaveBeenCalledTimes(1)
+    expect(handler).toHaveBeenCalledTimes(1)
+  })
+
+  it("stays signed in when the fresh JWT is accepted", async () => {
+    auth.refresh.mockResolvedValue("fresh.jwt.token")
+    const api = await loadApi()
+    const handler = vi.fn()
+    api.setUnauthorizedHandler(handler)
+    respondInTurn([401, { detail: "Authentication required" }], [200, ME])
+    expect(await api.getMe()).toEqual(ME)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(handler).not.toHaveBeenCalled()
+  })
+
+  it("never signs out on a 503", async () => {
+    const api = await loadApi()
+    const handler = vi.fn()
+    api.setUnauthorizedHandler(handler)
+    respond(503, { detail: "Authentication is temporarily unavailable" })
+    await expect(api.getMe()).rejects.toMatchObject({
+      status: 503,
+      message: "Authentication is temporarily unavailable",
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(auth.refresh).not.toHaveBeenCalled()
+    expect(handler).not.toHaveBeenCalled()
+  })
+
+  it("only throws on a 401 while a redirect is suppressed", async () => {
+    const api = await loadApi()
+    const handler = vi.fn()
+    api.setUnauthorizedHandler(handler)
+    respond(401, { detail: "Authentication required" })
+    const first = api.suppressUnauthorizedRedirect()
+    const second = api.suppressUnauthorizedRedirect()
+    await expect(api.getMe()).rejects.toMatchObject({ status: 401 })
+    // Releasing one hold twice leaves the other in place.
+    first()
+    first()
+    await expect(api.getMe()).rejects.toMatchObject({ status: 401 })
+    expect(handler).not.toHaveBeenCalled()
+    second()
+    await expect(api.getMe()).rejects.toMatchObject({ status: 401 })
+    expect(handler).toHaveBeenCalledTimes(1)
+  })
+
   it("treats a 401 without any token as signed out too", async () => {
     auth.token.mockResolvedValue(null)
     const api = await loadApi()
@@ -98,6 +174,7 @@ describe("request", () => {
     respond(401, { detail: "Authentication required" })
     await expect(api.getMe()).rejects.toMatchObject({ status: 401 })
     expect(sent().headers.has("Authorization")).toBe(false)
+    expect(auth.refresh).not.toHaveBeenCalled()
     expect(handler).toHaveBeenCalledTimes(1)
   })
 

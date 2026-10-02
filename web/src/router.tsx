@@ -30,8 +30,9 @@ export function getRouter() {
   // `QueryClientProvider` — the documented TanStack Start + Query convention.
   setupRouterSsrQueryIntegration({ router, queryClient })
 
-  // The API refused the session (expired, revoked): sign in again, then
-  // come back to the page that asked.
+  // The API refused the session (expired, revoked) even with a token fresh
+  // from the auth server: sign in again, then come back to the page that
+  // asked. Never called while an interview is in progress (api.ts).
   setUnauthorizedHandler(() => {
     const { pathname, href } = router.state.location
     if (pathname.startsWith("/auth/")) return

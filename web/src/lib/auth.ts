@@ -23,8 +23,8 @@ const adapter = AUTH_URL ? BetterAuthReactAdapter()(AUTH_URL) : null
 export const authClient = adapter?.getBetterAuthInstance() ?? null
 
 // The SDK hands out its cached JWT until 10 s before `exp`; the API allows
-// no leeway, so a slow upload or a slow clock would arrive with it expired.
-// A minute before, ask for a fresh one instead.
+// only 30 s of clock skew, so a slow upload or a slow clock could arrive with
+// it expired. A minute before, ask for a fresh one instead.
 const FRESH_FOR_MS = 60_000
 
 /** The JWT's `exp` in milliseconds, or null when it cannot be read. */
@@ -79,6 +79,21 @@ export async function getAccessToken(): Promise<string | null> {
     // request goes out without one and the API's 401 sends the user to
     // sign in.
     return token
+  }
+}
+
+/** A JWT fresh from the auth server, for one the API refused (a session
+ *  renewed elsewhere, a clock ahead of the API's). Null when signed out, in
+ *  local mode, or when the auth server cannot be reached. */
+export async function refreshAccessToken(): Promise<string | null> {
+  if (!adapter) return null
+  refreshing ??= fetchFreshToken().finally(() => {
+    refreshing = null
+  })
+  try {
+    return await refreshing
+  } catch {
+    return null
   }
 }
 

@@ -16,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 from jwt.algorithms import OKPAlgorithm
 
 from interview_agent.config import settings
+from interview_agent.log_templates import SAFE_LOG_TEMPLATES
 from interview_agent.server import auth
 
 NEON_AUTH_URL = "https://ep-synthetic.neonauth.us-east-2.aws.neon.tech/neondb/auth"
@@ -159,14 +160,114 @@ async def test_a_missing_bearer_token_is_401(neon_auth, client, headers):
     assert isinstance(response.json()["detail"], str)
 
 
-async def test_an_unreachable_jwks_is_401_without_its_error(neon_auth, client, monkeypatch):
+def unreachable_jwks(monkeypatch) -> list[str]:
+    """Every later JWKS fetch fails. Returns the list of attempts."""
+    attempts = []
+
     def unreachable(client):
+        attempts.append(client.uri)
         raise jwt.PyJWKClientConnectionError("SENSITIVE_JWKS_FAILURE")
 
     monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", unreachable)
-    response = await client.get("/whoami", headers=bearer(token()))
-    assert response.status_code == 401
+    return attempts
+
+
+async def test_an_unreachable_jwks_is_503_without_its_error(neon_auth, client, monkeypatch, caplog):
+    # Never fetched yet: nothing can verify the token, but nothing says it is
+    # invalid either, so the browser keeps its session.
+    attempts = unreachable_jwks(monkeypatch)
+    with caplog.at_level("WARNING", logger="interview_agent"):
+        response = await client.get("/whoami", headers=bearer(token()))
+        # No request waits on another fetch within the minute...
+        assert (await client.get("/whoami", headers=bearer(token()))).status_code == 503
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Authentication is temporarily unavailable"}
+    assert "www-authenticate" not in response.headers
     assert "SENSITIVE_JWKS_FAILURE" not in response.text
+    assert len(attempts) == 1
+    assert [record.msg for record in caplog.records] == ["Neon Auth JWKS fetch failed"]
+    assert "Neon Auth JWKS fetch failed" in SAFE_LOG_TEMPLATES
+    assert "SENSITIVE_JWKS_FAILURE" not in caplog.text
+    # ...and a minute later the JWKS is tried again.
+    auth._jwks_failed_at -= auth._JWKS_REFRESH_SECONDS + 1
+    assert (await client.get("/whoami", headers=bearer(token()))).status_code == 503
+    assert len(attempts) == 2
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [TimeoutError("SENSITIVE_JWKS_FAILURE"), jwt.PyJWKClientError("no signing keys")],
+    ids=["timeout", "no-keys"],
+)
+async def test_any_failure_obtaining_the_keys_is_503(neon_auth, client, monkeypatch, failure):
+    def failing(client):
+        raise failure
+
+    monkeypatch.setattr(jwt.PyJWKClient, "fetch_data", failing)
+    assert (await client.get("/whoami", headers=bearer(token()))).status_code == 503
+
+
+def expire_jwks_cache() -> None:
+    """PyJWKClient's copy of the keys outlives its lifespan."""
+    cached = auth._jwks_client.jwk_set_cache.jwk_set_with_timestamp
+    cached.timestamp -= auth._jwks_client.jwk_set_cache.lifespan + 1
+
+
+async def test_known_keys_outlive_a_failed_refresh(neon_auth, client, monkeypatch):
+    assert (await client.get("/whoami", headers=bearer(token()))).status_code == 200
+    attempts = unreachable_jwks(monkeypatch)
+    expire_jwks_cache()
+    # The cache's lifespan is over and the refetch fails: the keys fetched
+    # earlier still verify the token.
+    assert (await client.get("/whoami", headers=bearer(token()))).status_code == 200
+    assert len(attempts) == 1
+    # Meanwhile no request waits on another fetch within the minute...
+    assert (await client.get("/whoami", headers=bearer(token()))).status_code == 200
+    assert len(attempts) == 1
+    # ...an unknown key cannot be told apart from a rotated one, refreshed
+    # (and failing) at most once a minute...
+    for kid in ("kid-rotated", "kid-other"):
+        response = await client.get("/whoami", headers=bearer(foreign_kid_token(kid)))
+        assert response.status_code == 503
+    assert len(attempts) == 2
+    # ...and a minute later the JWKS is tried again.
+    auth._jwks_failed_at -= auth._JWKS_REFRESH_SECONDS + 1
+    assert (await client.get("/whoami", headers=bearer(token()))).status_code == 200
+    assert len(attempts) == 3
+
+
+async def test_known_keys_serve_while_another_request_fetches(neon_auth, client, monkeypatch):
+    assert (await client.get("/whoami", headers=bearer(token()))).status_code == 200
+    attempts = unreachable_jwks(monkeypatch)
+    expire_jwks_cache()
+    # A fetch already under way (and possibly hanging): no second one.
+    with auth._jwks_fetch_lock:
+        assert (await client.get("/whoami", headers=bearer(token()))).status_code == 200
+    assert attempts == []
+
+
+async def test_a_failed_refresh_for_an_unknown_key_is_503(neon_auth, client, monkeypatch):
+    assert (await client.get("/whoami", headers=bearer(token()))).status_code == 200
+    unreachable_jwks(monkeypatch)
+    # The rotated key may be in the JWKS that could not be fetched.
+    response = await client.get("/whoami", headers=bearer(foreign_kid_token("kid-rotated")))
+    assert response.status_code == 503
+    # The known key still works.
+    assert (await client.get("/whoami", headers=bearer(token()))).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [{"iat": int(time.time()) + 20}, {"exp": int(time.time()) - 20}],
+    ids=["issued-ahead", "just-expired"],
+)
+async def test_clock_skew_within_the_leeway_is_accepted(neon_auth, client, claims):
+    assert (await client.get("/whoami", headers=bearer(token(**claims)))).status_code == 200
+
+
+async def test_clock_skew_beyond_the_leeway_is_401(neon_auth, client):
+    ahead = token(iat=int(time.time()) + 120)
+    assert (await client.get("/whoami", headers=bearer(ahead))).status_code == 401
 
 
 def foreign_kid_token(kid: str) -> str:
@@ -253,9 +354,10 @@ def test_neon_mode_requires_the_auth_url_and_the_internal_token():
         "LIVEKIT_API_SECRET": "s",
         "LIVEKIT_URL": "wss://synthetic.example",
     }
-    with pytest.raises(RuntimeError, match="NEON_AUTH_URL, INTERNAL_API_TOKEN"):
-        Settings(_env_file=None, AUTH_MODE="neon", **base).require_keys()
-    Settings(_env_file=None, AUTH_MODE="local", **base).require_keys()
+    hint = r"\(for local development set AUTH_MODE=local\)"
+    with pytest.raises(RuntimeError, match=f"NEON_AUTH_URL, INTERNAL_API_TOKEN {hint}"):
+        Settings(_env_file=None, AUTH_MODE="neon", **base).require_keys("api")
+    Settings(_env_file=None, AUTH_MODE="local", **base).require_keys("api")
     configured = Settings(
         _env_file=None,
         AUTH_MODE="neon",
@@ -263,7 +365,32 @@ def test_neon_mode_requires_the_auth_url_and_the_internal_token():
         INTERNAL_API_TOKEN="synthetic-internal-token",
         ADMIN_USER_IDS=" user-a, ,user-b ",
         **base,
-    ).require_keys()
+    ).require_keys("api")
     assert configured.neon_auth_url == NEON_AUTH_URL
     assert configured.admin_user_ids == ["user-a", "user-b"]
     assert "synthetic-internal-token" not in repr(configured)
+
+
+def test_the_worker_requires_only_the_internal_token():
+    # It never verifies a JWT: it only sends INTERNAL_API_TOKEN to /evaluate.
+    from interview_agent.config import Settings
+
+    base = {
+        "OPENAI_API_KEY": "k",
+        "LIVEKIT_API_KEY": "k",
+        "LIVEKIT_API_SECRET": "s",
+        "LIVEKIT_URL": "wss://synthetic.example",
+    }
+    with pytest.raises(RuntimeError, match=r"\.env: INTERNAL_API_TOKEN \(for local") as missing:
+        Settings(_env_file=None, AUTH_MODE="neon", **base).require_keys("worker")
+    assert "NEON_AUTH_URL" not in str(missing.value)
+    Settings(
+        _env_file=None, AUTH_MODE="neon", INTERNAL_API_TOKEN="synthetic-internal-token", **base
+    ).require_keys("worker")
+    Settings(_env_file=None, AUTH_MODE="local", **base).require_keys("worker")
+    # Provider keys missing are not an accounts problem: no AUTH_MODE hint.
+    with pytest.raises(RuntimeError, match=r"\.env: LIVEKIT_API_KEY\.$") as provider:
+        Settings(
+            _env_file=None, AUTH_MODE="local", **(base | {"LIVEKIT_API_KEY": ""})
+        ).require_keys("worker")
+    assert "AUTH_MODE" not in str(provider.value)

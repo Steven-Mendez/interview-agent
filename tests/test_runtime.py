@@ -11,7 +11,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import select, update
 
-from interview_agent.config import Settings
+from interview_agent.config import Settings, default_ssl_root_cert
 from interview_agent.interview import db
 from interview_agent.runtime import EXPECTED_REVISION, process_manifest, record_manifest
 
@@ -48,10 +48,30 @@ async def test_engine_refuses_verify_full_without_a_ca_bundle(monkeypatch, tmp_p
         await engine.dispose()
 
 
-def test_a_ca_bundle_is_available_for_verify_full_by_default():
+@pytest.mark.parametrize(
+    "query", ["ssl=verify-full", "ssl=verify-ca", "sslmode=verify-full", "ssl=VERIFY-FULL"]
+)
+def test_a_ca_bundle_is_available_for_verify_full_by_default(query):
     # config defaults PGSSLROOTCERT, so a Neon DATABASE_URL connects on any
     # host (FastAPI Cloud, the worker image, CI) without exporting it.
-    assert os.path.isfile(os.environ["PGSSLROOTCERT"])
+    environ = {}
+    default_ssl_root_cert(f"postgresql+asyncpg://user:pass@db.invalid/app?{query}", environ)
+    assert os.path.isfile(environ["PGSSLROOTCERT"])
+
+
+@pytest.mark.parametrize("query", ["?ssl=require", "?sslmode=require", ""])
+def test_no_ca_bundle_is_imposed_on_modes_that_do_not_verify(query):
+    # asyncpg's ssl=require reads PGSSLROOTCERT too: a default there would
+    # turn it into verification against certifi's bundle.
+    environ = {}
+    default_ssl_root_cert(f"postgresql+asyncpg://user:pass@db.invalid/app{query}", environ)
+    assert "PGSSLROOTCERT" not in environ
+
+
+def test_an_explicit_ca_bundle_wins():
+    environ = {"PGSSLROOTCERT": "/etc/ssl/neon.pem"}
+    default_ssl_root_cert("postgresql+asyncpg://user:pass@db.invalid/app?ssl=verify-full", environ)
+    assert environ == {"PGSSLROOTCERT": "/etc/ssl/neon.pem"}
 
 
 async def test_effective_manifest_distinguishes_defaults_process_snapshot_and_provider():
@@ -218,7 +238,8 @@ async def test_api_lifespan_records_effective_manifest_and_shutdowns_without_pro
     monkeypatch.setattr(server_app.settings, "livekit_api_secret", "synthetic-test-secret")
     monkeypatch.setattr(server_app.settings, "livekit_url", "wss://synthetic.example")
     monkeypatch.setattr(server_app.settings, "langsmith_api_key", "")
-    # Production's accounts setup: startup needs both, and fetches no keys.
+    # Production's accounts setup: the API's startup needs both (the worker
+    # only the internal token), and fetches no keys.
     monkeypatch.setattr(server_app.settings, "auth_mode", "neon")
     monkeypatch.setattr(
         server_app.settings, "neon_auth_url", "https://ep-synthetic.neonauth.example/neondb/auth"

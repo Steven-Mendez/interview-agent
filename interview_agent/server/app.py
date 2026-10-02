@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO)  # no-op if handlers already exist
     log_path = setup_file_logging("logs/server.log")
 
-    settings.require_keys()
+    settings.require_keys("api")
     otel_metrics.configure(settings, "interview-agent-api")
     engine, sessionmaker = create_engine_and_sessionmaker(settings.database_url)
     try:

@@ -1147,7 +1147,7 @@ async def entrypoint(ctx: JobContext) -> None:
     # Do this before validation/source loading too: the SDK otherwise uploads
     # buffered crash logs when startup fails before AgentSession.start().
     ctx.init_recording({"audio": False, "transcript": False, "traces": False, "logs": False})
-    settings.require_keys()
+    settings.require_keys("worker")
     try:
         metadata = json.loads(ctx.job.metadata or "{}")
     except (TypeError, json.JSONDecodeError):

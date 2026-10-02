@@ -27,6 +27,7 @@ SAFE_LOG_TEMPLATES = frozenset(
         "Metrics export did not complete",
         "Metrics export failed: %s",
         "Metrics flush did not complete",
+        "Neon Auth JWKS fetch failed",
         "Question recovery failed; delivery remains uncertain",
         "Shutdown cleanup failed: %s",
         "Technical notice attribute could not be published",

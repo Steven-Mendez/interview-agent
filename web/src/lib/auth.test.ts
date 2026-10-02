@@ -126,6 +126,28 @@ describe("getAccessToken", () => {
   })
 })
 
+describe("refreshAccessToken", () => {
+  it("asks the auth server even while the cached JWT has time left", async () => {
+    const fresh = jwt(900, "fresh")
+    sdk.jwt.mockResolvedValue(jwt(600))
+    sdk.getSession.mockResolvedValue({
+      data: { session: { token: fresh }, user: ALICE },
+      error: null,
+    })
+    const auth = await loadAuth()
+    expect(await auth.refreshAccessToken()).toBe(fresh)
+    expect(sdk.getSession).toHaveBeenCalledWith({
+      fetchOptions: { headers: { "X-Force-Fetch": "true" } },
+    })
+  })
+
+  it("has no token when the auth server cannot be reached", async () => {
+    sdk.getSession.mockRejectedValue(new Error("offline"))
+    const auth = await loadAuth()
+    expect(await auth.refreshAccessToken()).toBeNull()
+  })
+})
+
 describe("signOut", () => {
   it("reports signed out before Better Auth's session catches up", async () => {
     sdk.signOut.mockResolvedValue({ data: { success: true }, error: null })

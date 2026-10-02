@@ -383,6 +383,8 @@ async def journey(args):
         "LANGSMITH_TRACING": "true" if args.langsmith_project else "false",
         "OTEL_EXPORTER_OTLP_ENDPOINT": "",
         "OTEL_EXPORTER_OTLP_HEADERS": "",
+        # A probe's failures are its report, not a developer's error inbox.
+        "SENTRY_DSN": "",
         "APP_BASE_URL": f"http://127.0.0.1:{API_PORT}",
         # The browser drives the app without a login: the local user, unlimited.
         "AUTH_MODE": "local",
@@ -412,6 +414,11 @@ async def journey(args):
             subprocess.run(
                 [NODE, "node_modules/vite/bin/vite.js", "build"],
                 cwd=ROOT / "web",
+                # A developer's web/.env.local would point the build at Neon
+                # Auth or another API; Vite never overrides variables already
+                # in the process environment, so these empty ones win.
+                env=os.environ
+                | {"VITE_NEON_AUTH_URL": "", "VITE_API_BASE_URL": "", "VITE_SENTRY_DSN": ""},
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

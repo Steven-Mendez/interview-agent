@@ -1,4 +1,5 @@
 import * as React from "react"
+import { Link } from "@tanstack/react-router"
 
 import { useImmersive } from "@/components/app-shell"
 import { Mascot } from "@/components/mascot"
@@ -221,8 +222,27 @@ export function SignInPage({
               </p>
             </div>
           </div>
-          <div className="flex w-full max-w-sm flex-col gap-6 rounded-2xl border bg-card p-6 shadow-e1 md:justify-self-center dark:shadow-none">
-            {children}
+          <div className="flex w-full max-w-sm flex-col items-center gap-4 md:justify-self-center">
+            <div className="flex w-full flex-col gap-6 rounded-2xl border bg-card p-6 shadow-e1 dark:shadow-none">
+              {children}
+            </div>
+            {/* Public, and linked from here: Google's consent screen points
+                at them, and a visitor deciding whether to sign in reads them. */}
+            <p className="flex items-center gap-2 text-xs text-muted-foreground">
+              <Link
+                to="/privacy"
+                className="rounded-sm underline-offset-4 hover:text-foreground hover:underline"
+              >
+                Privacy policy
+              </Link>
+              <span aria-hidden>·</span>
+              <Link
+                to="/terms"
+                className="rounded-sm underline-offset-4 hover:text-foreground hover:underline"
+              >
+                Terms of service
+              </Link>
+            </p>
           </div>
         </div>
       </div>

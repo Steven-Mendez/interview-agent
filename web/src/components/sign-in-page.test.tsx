@@ -137,6 +137,18 @@ describe("SignInPage", () => {
     expect(screen.queryByRole("link", { name: /home/i })).toBeNull()
   })
 
+  it("links the public privacy policy and terms under the card", () => {
+    mount(<p>The card</p>)
+    expect(
+      screen.getByRole("link", { name: "Privacy policy" }).getAttribute("href")
+    ).toBe("/privacy")
+    expect(
+      screen
+        .getByRole("link", { name: "Terms of service" })
+        .getAttribute("href")
+    ).toBe("/terms")
+  })
+
   it("says hello on arrival, then rests", async () => {
     mount(<p>The card</p>)
     expect(mascotState()).toBe("greeting")

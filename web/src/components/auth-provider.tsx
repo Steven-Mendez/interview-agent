@@ -2,12 +2,14 @@ import * as React from "react"
 import { useQueryClient } from "@tanstack/react-query"
 import { useRouter } from "@tanstack/react-router"
 
-import { authClient, useAuth } from "@/lib/auth"
+import { useAuth, useAuthMode } from "@/lib/auth"
+import type { AuthMode } from "@/lib/auth"
 import { setErrorReportingUser } from "@/lib/error-reporting"
 
 /** Follows the signed-in account wherever it changes — this tab's menu,
- *  another tab, the auth server ending the session. */
-function SessionWatcher() {
+ *  another tab, the auth server ending the session, the API restarting
+ *  without sign-in (mode none: no account, as if signed out). */
+function SessionWatcher({ mode }: { mode: AuthMode }) {
   const { user, isPending } = useAuth()
   const queryClient = useQueryClient()
   const router = useRouter()
@@ -15,8 +17,10 @@ function SessionWatcher() {
   // undefined until the session is first known: loading it is no change.
   const lastId = React.useRef<string | null | undefined>(undefined)
 
-  // Error reports name the signed-in account by its opaque id only.
-  React.useEffect(() => setErrorReportingUser(id), [id])
+  // Error reports name the signed-in account by its opaque id only: a
+  // Neon Auth one. A local account's id carries its username.
+  const reportedId = mode === "neon" ? id : null
+  React.useEffect(() => setErrorReportingUser(reportedId), [reportedId])
 
   React.useEffect(() => {
     if (isPending) return
@@ -33,13 +37,15 @@ function SessionWatcher() {
   return null
 }
 
-/** What every page needs of the session. Neon Auth's own views and their
- *  provider stay with the /auth route (components/auth-views), so their
- *  code loads there only. */
+/** What every page needs of the session — once the mode is known, in
+ *  every mode, so leaving one with accounts drops what was cached for
+ *  them. Neon Auth's own views and their provider stay with the /auth
+ *  route (components/auth-views), so their code loads there only. */
 export function AuthProvider({ children }: { children: React.ReactNode }) {
+  const mode = useAuthMode()
   return (
     <>
-      {authClient && <SessionWatcher />}
+      {mode !== undefined && <SessionWatcher mode={mode} />}
       {children}
     </>
   )

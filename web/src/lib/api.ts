@@ -1,13 +1,14 @@
 // Typed fetch wrappers for the backend contract (see
-// interview_agent/server/routes.py). Every endpoint lives under the `/api`
-// prefix — the dev proxy (vite.config.ts) and the prod SPA fallback both
-// key off that single prefix. A build for an API on another origin names it
-// in VITE_API_BASE_URL (ending in that same `/api`).
+// interview_agent/server/routes.py), all under API_BASE (lib/api-base).
 
-import { authEnabled, getAccessToken, refreshAccessToken } from "@/lib/auth"
-
-const API_BASE =
-  import.meta.env.VITE_API_BASE_URL?.replace(/\/+$/, "") || "/api"
+import { API_BASE } from "@/lib/api-base"
+import {
+  forgetRefusedToken,
+  getAccessToken,
+  refreshAccessToken,
+  resetAuthMode,
+} from "@/lib/auth"
+import { redirectsSuppressed } from "@/lib/redirect-suppression"
 
 // ---- Shapes -----------------------------------------------------------------
 
@@ -346,21 +347,7 @@ export function setUnauthorizedHandler(handler: () => void): void {
   unauthorizedHandler = handler
 }
 
-// Holders of suppressUnauthorizedRedirect() that have not released it yet.
-let redirectSuppressions = 0
-
-/** Keeps a 401 from leaving the page until the returned release runs: an
- *  interview in progress must not be navigated away from. A 401 meanwhile
- *  only throws. Counted, so each holder releases just its own hold. */
-export function suppressUnauthorizedRedirect(): () => void {
-  redirectSuppressions += 1
-  let released = false
-  return () => {
-    if (released) return
-    released = true
-    redirectSuppressions -= 1
-  }
-}
+export { suppressUnauthorizedRedirect } from "@/lib/redirect-suppression"
 
 /** The only fetch. Adds the user's JWT unless the caller brought its own
  *  credential (the closing routes carry the LiveKit participant token). */
@@ -371,24 +358,27 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     if (token) headers.set("Authorization", `Bearer ${token}`)
     return fetch(`${API_BASE}${path}`, { ...init, headers })
   }
-  const token = ownCredential ? null : await getAccessToken()
+  let token = ownCredential ? null : await getAccessToken()
   let res = await send(token)
   if (res.status === 401 && token) {
     // The JWT may only be stale (renewed elsewhere, minted by a clock ahead
-    // of the API's): once more, with one fresh from the auth server.
+    // of the API's): once more, with one fresh from the auth server. A
+    // local account has none to offer.
     const fresh = await refreshAccessToken()
-    if (fresh) res = await send(fresh)
+    if (fresh) {
+      token = fresh
+      res = await send(fresh)
+    }
   }
   if (!res.ok) {
     // Our session was refused (expired, revoked, never there): sign in
     // again. A refused participant token is the room's business, not the
-    // account's; a 503 is the API's, and the session stays.
-    if (
-      res.status === 401 &&
-      authEnabled &&
-      !ownCredential &&
-      redirectSuppressions === 0
-    ) {
+    // account's; a 503 is the API's, and the session stays. The API may
+    // also have changed how it signs in (restarted with other settings):
+    // the sign-in page asks it again.
+    if (res.status === 401 && !ownCredential && !redirectsSuppressed()) {
+      if (token) forgetRefusedToken(token)
+      resetAuthMode()
       unauthorizedHandler()
     }
     throw await toApiError(res)
@@ -477,10 +467,53 @@ export interface Me {
   interview_limit: number | null
   interviews_remaining: number | null
   demo_capacity_available: boolean
+  /** How the account signs in: Neon Auth, or a local (development) one. */
+  auth_provider: SignInMethod
+  /** ISO-8601, UTC: when the API first saw the account. */
+  created_at: string
+  /** ISO-8601, UTC; null until a later visit is recorded. */
+  last_seen_at: string | null
 }
+
+export type SignInMethod = "neon" | "local"
 
 export function getMe(): Promise<Me> {
   return request<Me>("/me")
+}
+
+/** One account of GET /admin/users: its profile, its quota, and how many
+ *  of its interviews are still in the history. */
+export interface AdminUser {
+  id: string
+  name: string | null
+  email: string | null
+  auth_provider: SignInMethod
+  is_admin: boolean
+  created_at: string
+  last_seen_at: string | null
+  interviews_used: number
+  /** Null for admins: no limit. */
+  interview_limit: number | null
+  interviews_stored: number
+  last_interview_at: string | null
+}
+
+export interface AdminUserPage {
+  total: number
+  items: AdminUser[]
+}
+
+/** Everyone who has signed in, most recently seen first. Admins only: a
+ *  403 for anyone else. */
+export function getAdminUsers(params?: {
+  limit?: number
+  offset?: number
+}): Promise<AdminUserPage> {
+  const query = new URLSearchParams()
+  if (params?.limit !== undefined) query.set("limit", String(params.limit))
+  if (params?.offset !== undefined) query.set("offset", String(params.offset))
+  const qs = query.toString()
+  return request<AdminUserPage>(`/admin/users${qs ? `?${qs}` : ""}`)
 }
 
 /** The two 429 details of POST /interviews and POST .../repeat. */

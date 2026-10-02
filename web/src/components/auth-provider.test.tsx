@@ -4,16 +4,24 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type * as Router from "@tanstack/react-router"
-import type { AuthState } from "@/lib/auth"
+import type { AuthMode, AuthState } from "@/lib/auth"
 import { AuthProvider } from "./auth-provider"
 
-const mocks = vi.hoisted(() => {
-  const auth: AuthState = { isPending: true, user: null }
-  return { auth, invalidate: vi.fn(), reportingUser: vi.fn() }
-})
+interface Mocks {
+  auth: AuthState
+  mode: AuthMode | undefined
+  invalidate: ReturnType<typeof vi.fn>
+  reportingUser: ReturnType<typeof vi.fn>
+}
+const mocks = vi.hoisted((): Mocks => ({
+  auth: { isPending: true, user: null },
+  mode: "neon",
+  invalidate: vi.fn(),
+  reportingUser: vi.fn(),
+}))
 vi.mock("@/lib/auth", () => ({
-  authClient: {},
   useAuth: () => mocks.auth,
+  useAuthMode: () => mocks.mode,
 }))
 vi.mock("@/lib/error-reporting", () => ({
   setErrorReportingUser: mocks.reportingUser,
@@ -38,6 +46,7 @@ function app(auth: AuthState) {
 }
 
 beforeEach(() => {
+  mocks.mode = "neon"
   client = new QueryClient()
   mocks.invalidate.mockResolvedValue(undefined)
 })
@@ -82,5 +91,49 @@ describe("AuthProvider", () => {
     rerender(app({ isPending: false, user: user("alice") }))
     expect(client.getQueryData(["me"])).toEqual({ id: "alice" })
     expect(mocks.invalidate).not.toHaveBeenCalled()
+  })
+
+  it("follows a local account the same way, without naming it in reports", () => {
+    mocks.mode = "local"
+    const { rerender } = render(
+      app({ isPending: false, user: user("local:a") })
+    )
+    client.setQueryData(["me"], { id: "local:a" })
+    // A local id carries the username: error reports never get it.
+    expect(mocks.reportingUser).not.toHaveBeenCalledWith("local:a")
+    expect(mocks.reportingUser).toHaveBeenLastCalledWith(null)
+    // Signed out in another tab.
+    rerender(app({ isPending: false, user: null }))
+    expect(client.getQueryData(["me"])).toBeUndefined()
+    expect(mocks.invalidate).toHaveBeenCalledTimes(1)
+  })
+
+  it("drops a local account's cache when the API stops asking to sign in", () => {
+    mocks.mode = "local"
+    const { rerender } = render(
+      app({ isPending: false, user: user("local:a") })
+    )
+    client.setQueryData(["me"], { id: "local:a" })
+    // The API restarted without accounts: no one is signed in any more.
+    mocks.mode = "none"
+    rerender(app({ isPending: false, user: null }))
+    expect(client.getQueryData(["me"])).toBeUndefined()
+    expect(mocks.invalidate).toHaveBeenCalledTimes(1)
+  })
+
+  it("keeps the cache of the local developer (mode none)", () => {
+    mocks.mode = "none"
+    const { rerender } = render(app({ isPending: false, user: null }))
+    client.setQueryData(["me"], { id: "local-dev" })
+    rerender(app({ isPending: false, user: null }))
+    expect(client.getQueryData(["me"])).toEqual({ id: "local-dev" })
+    expect(mocks.invalidate).not.toHaveBeenCalled()
+    expect(mocks.reportingUser).not.toHaveBeenCalledWith(expect.any(String))
+  })
+
+  it("watches nothing until the mode is known", () => {
+    mocks.mode = undefined
+    render(app({ isPending: false, user: null }))
+    expect(mocks.reportingUser).not.toHaveBeenCalled()
   })
 })

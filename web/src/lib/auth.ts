@@ -1,17 +1,34 @@
 import * as React from "react"
 import { BetterAuthReactAdapter } from "@neondatabase/neon-js/auth/react/adapters"
 
-// Sign-in through Neon Auth. Without VITE_NEON_AUTH_URL (local development
-// against an API running AUTH_MODE=local) there is no client at all: no
-// session, no token, and every caller treats the app as signed in.
+import { API_BASE } from "@/lib/api-base"
+import {
+  getLocalAccessToken,
+  getLocalSession,
+  isLive,
+  signOutLocal,
+  subscribeLocalSession,
+} from "@/lib/local-auth"
+
+// How users sign in. A build with VITE_NEON_AUTH_URL signs in through Neon
+// Auth, and nothing else. Without it the API decides (GET /auth/config),
+// asked once in the browser:
+//   none:  AUTH_MODE=local without accounts — no sign-in, every call is the
+//          local developer's;
+//   local: the dev login of LOCAL_ACCOUNTS (lib/local-auth);
+//   neon:  the API wants Neon Auth this build cannot do — the sign-in page
+//          says so.
 //
-// The client does no I/O when it is created — the session is fetched on
-// the first getSession() or useSession() subscriber, and never on the server
-// — so creating it here is safe while the shell is prerendered.
+// The Neon client does no I/O when it is created — the session is fetched
+// on the first getSession() or useSession() subscriber, and never on the
+// server — so creating it here is safe while the shell is prerendered.
+
+export type AuthMode = "none" | "local" | "neon"
 
 const AUTH_URL = import.meta.env.VITE_NEON_AUTH_URL
 
-export const authEnabled = Boolean(AUTH_URL)
+/** Whether this build signs in through Neon Auth (VITE_NEON_AUTH_URL). */
+export const neonAuthConfigured = Boolean(AUTH_URL)
 
 // What createAuthClient(url, { adapter: BetterAuthReactAdapter() }) does,
 // minus the step that throws getJWTToken away: build the adapter for the URL
@@ -19,8 +36,127 @@ export const authEnabled = Boolean(AUTH_URL)
 // root would also bundle the Supabase-compatible adapter, unused here.)
 const adapter = AUTH_URL ? BetterAuthReactAdapter()(AUTH_URL) : null
 
-/** The Better Auth client (React hooks included); null in local mode. */
+/** The Better Auth client (React hooks included); null without Neon Auth. */
 export const authClient = adapter?.getBetterAuthInstance() ?? null
+
+// ---- Mode ---------------------------------------------------------------------
+
+const AUTH_MODES: readonly AuthMode[] = ["none", "local", "neon"]
+
+// Known for good in a Neon build. Otherwise only an answer of the API's is
+// kept: a failure is asked again (Vite started before the API), and so is
+// a mode marked stale by resetAuthMode() — the last answer still shows
+// until the new one arrives.
+let currentMode: AuthMode | undefined = AUTH_URL ? "neon" : undefined
+let modeStale = false
+let pendingMode: Promise<AuthMode> | null = null
+// Why the last ask failed, until one succeeds: a page with no mode yet
+// shows it rather than loading forever.
+let modeError: Error | null = null
+const modeListeners = new Set<() => void>()
+
+function setModeError(error: Error | null) {
+  if (modeError === error) return
+  modeError = error
+  for (const listener of modeListeners) listener()
+}
+
+function subscribeMode(listener: () => void) {
+  modeListeners.add(listener)
+  return () => {
+    modeListeners.delete(listener)
+  }
+}
+
+async function fetchAuthMode(): Promise<AuthMode> {
+  let mode: unknown
+  try {
+    const res = await fetch(`${API_BASE}/auth/config`)
+    if (!res.ok) throw new Error()
+    mode = ((await res.json()) as { mode?: unknown } | null)?.mode
+  } catch {
+    throw new Error("The API could not be reached.")
+  }
+  if (!AUTH_MODES.includes(mode as AuthMode)) {
+    throw new Error("The API did not say how to sign in.")
+  }
+  return mode as AuthMode
+}
+
+/** How users sign in. Asks the API the first time (browser only: on the
+ *  server it never settles, so nothing should await it there); rejects
+ *  when the API cannot say, and the next call asks again. */
+export function resolveAuthMode(): Promise<AuthMode> {
+  if (currentMode !== undefined && !modeStale) {
+    return Promise.resolve(currentMode)
+  }
+  if (typeof window === "undefined") return new Promise(() => {})
+  pendingMode ??= fetchAuthMode()
+    .then(
+      (mode) => {
+        modeStale = false
+        if (currentMode !== mode) {
+          currentMode = mode
+          for (const listener of modeListeners) listener()
+        }
+        setModeError(null)
+        return mode
+      },
+      (error: unknown) => {
+        setModeError(error as Error)
+        throw error
+      }
+    )
+    .finally(() => {
+      pendingMode = null
+    })
+  return pendingMode
+}
+
+/** Asks the API again on the next resolveAuthMode(): it may have restarted
+ *  in another mode since. Nothing to ask in a Neon build. */
+export function resetAuthMode(): void {
+  if (!AUTH_URL) modeStale = true
+}
+
+// How long a page without a mode waits before asking a silent API again.
+const MODE_RETRY_MS = 5_000
+
+/** The sign-in mode, or undefined until it is known — the whole prerender,
+ *  outside a Neon build. While unknown it keeps asking. */
+export function useAuthMode(): AuthMode | undefined {
+  const mode = React.useSyncExternalStore(
+    subscribeMode,
+    () => currentMode,
+    () => (AUTH_URL ? "neon" : undefined)
+  )
+  React.useEffect(() => {
+    if (mode !== undefined) return
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const attempt = () => {
+      resolveAuthMode().catch(() => {
+        if (!cancelled) timer = setTimeout(attempt, MODE_RETRY_MS)
+      })
+    }
+    attempt()
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [mode])
+  return mode
+}
+
+/** Why the API could not say how to sign in, while it cannot; null once
+ *  it has (and always on the server and in a Neon build). */
+export function useAuthModeError(): Error | null {
+  return React.useSyncExternalStore(
+    subscribeMode,
+    () => modeError,
+    () => null
+  )
+}
 
 // The SDK hands out its cached JWT until 10 s before `exp`; the API allows
 // only 30 s of clock skew, so a slow upload or a slow clock could arrive with
@@ -53,15 +189,16 @@ async function fetchFreshToken(): Promise<string | null> {
   return data?.session.token ?? null
 }
 
-/** The JWT the API verifies, or null when signed out or in local mode.
+/** The token the API verifies, or null when signed out or without sign-in.
  *
- * Never the session's own token — Neon Auth swaps it for the JWT, but only
+ * Outside a Neon build, the local account's token while it lasts (the API
+ * ignores it when it has no sign-in). With Neon Auth, the JWT — never the session's own token — Neon Auth swaps it for the JWT, but only
  * getJWTToken says so. The SDK keeps the session (and so the JWT) in memory
  * and drops it on sign-out: calling this before every request costs no
  * round trip, except once a minute before the JWT expires, when concurrent
  * callers share one fetch of a fresh session. */
 export async function getAccessToken(): Promise<string | null> {
-  if (!adapter) return null
+  if (!adapter) return getLocalAccessToken()
   let token: string | null = null
   try {
     // false: no anonymous token when signed out — the API has no use for it.
@@ -83,8 +220,9 @@ export async function getAccessToken(): Promise<string | null> {
 }
 
 /** A JWT fresh from the auth server, for one the API refused (a session
- *  renewed elsewhere, a clock ahead of the API's). Null when signed out, in
- *  local mode, or when the auth server cannot be reached. */
+ *  renewed elsewhere, a clock ahead of the API's). Null when signed out,
+ *  for a local account (nothing to renew), or when the auth server cannot
+ *  be reached. */
 export async function refreshAccessToken(): Promise<string | null> {
   if (!adapter) return null
   refreshing ??= fetchFreshToken().finally(() => {
@@ -119,9 +257,13 @@ function subscribeSigningOut(listener: () => void) {
 }
 
 /** Signs `userId` out. Every useAuth() reports signed out at once; if the
- *  auth server refuses, the session comes back. */
+ *  auth server refuses, the session comes back. A local account just drops
+ *  its token. */
 export async function signOut(userId: string): Promise<void> {
-  if (!authClient) return
+  if (!authClient) {
+    signOutLocal()
+    return
+  }
   setSigningOutId(userId)
   try {
     const { error } = await authClient.signOut()
@@ -140,10 +282,16 @@ export interface AuthUser {
 }
 
 export interface AuthState {
-  /** False once the session is known (immediately in local mode). */
+  /** False once the session is known. */
   isPending: boolean
-  /** Null when signed out — and always in local mode. */
+  /** Null when signed out — and always without sign-in (mode none). */
   user: AuthUser | null
+}
+
+/** A local account's token after the API refused it: no longer a session
+ *  (a password changed, the account removed). Neon's are its own SDK's. */
+export function forgetRefusedToken(token: string): void {
+  if (!authClient) signOutLocal(token)
 }
 
 function useNoSession() {
@@ -152,9 +300,7 @@ function useNoSession() {
 
 const useClientSession = authClient ? authClient.useSession : useNoSession
 
-/** The current session, kept in sync across tabs. During the prerender it
- *  is pending: nothing session-dependent should render before mount. */
-export function useAuth(): AuthState {
+function useNeonAuth(): AuthState {
   const { data, isPending } = useClientSession()
   const signingOut = React.useSyncExternalStore(
     subscribeSigningOut,
@@ -180,10 +326,32 @@ export function useAuth(): AuthState {
   }
 }
 
+function useLocalAuth(): AuthState {
+  const mode = useAuthMode()
+  const session = React.useSyncExternalStore(
+    subscribeLocalSession,
+    getLocalSession,
+    () => null
+  )
+  const live = mode === "local" && session !== null && isLive(session)
+  const id = live ? session.user.id : null
+  const name = live ? session.user.name : null
+  const user = React.useMemo<AuthUser | null>(
+    () => (id === null ? null : { id, name, email: null, image: null }),
+    [id, name]
+  )
+  return { isPending: mode === undefined, user }
+}
+
+/** The current session, kept in sync across tabs. During the prerender it
+ *  is pending: nothing session-dependent should render before mount. */
+export const useAuth: () => AuthState = authClient ? useNeonAuth : useLocalAuth
+
 /** Whether calls to the API can go out: signed in, or no sign-in at all. */
 export function useCanCallApi(): boolean {
+  const mode = useAuthMode()
   const { user } = useAuth()
-  return !authEnabled || user !== null
+  return mode === "none" || user !== null
 }
 
 /** A path on this site, or undefined: no scheme, no protocol-relative

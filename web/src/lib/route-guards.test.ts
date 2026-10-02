@@ -8,23 +8,42 @@ import {
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import type * as Auth from "@/lib/auth"
+import type { AuthMode } from "@/lib/auth"
 import { safeRedirectPath } from "@/lib/auth"
 import { requireSession } from "@/lib/route-guards"
 import { routeTree } from "@/routeTree.gen"
 
-const auth = vi.hoisted(() => ({
-  client: null as { getSession: ReturnType<typeof vi.fn> } | null,
+interface AuthMock {
+  client: { getSession: ReturnType<typeof vi.fn> } | null
+  mode: AuthMode
+}
+const auth = vi.hoisted((): AuthMock => ({
+  client: null,
+  mode: "neon",
 }))
 vi.mock("@/lib/auth", async (original) => ({
   ...(await original<typeof Auth>()),
   get authClient() {
     return auth.client
   },
+  resolveAuthMode: () => Promise.resolve(auth.mode),
 }))
 
 function signedOut() {
   auth.client = { getSession: vi.fn().mockResolvedValue({ data: null }) }
   return auth.client
+}
+
+/** A local account's session in storage, expiring `ms` from now. */
+function storeLocalSession(ms: number) {
+  window.localStorage.setItem(
+    "interview-agent.local-session",
+    JSON.stringify({
+      token: "local.jwt.token",
+      expiresAt: Date.now() + ms,
+      user: { id: "local:guest", name: "guest" },
+    })
+  )
 }
 
 /** Where a thrown redirect would take the browser. */
@@ -49,6 +68,8 @@ async function thrown(promise: Promise<unknown>): Promise<unknown> {
 
 afterEach(() => {
   auth.client = null
+  auth.mode = "neon"
+  window.localStorage.clear()
 })
 
 describe("requireSession", () => {
@@ -73,7 +94,27 @@ describe("requireSession", () => {
   })
 
   it("does nothing without sign-in", async () => {
+    auth.mode = "none"
     await expect(requireSession({ href: "/settings" })).resolves.toBe(undefined)
+  })
+
+  it("sends a visitor without a local session to sign in", async () => {
+    auth.mode = "local"
+    const error = await thrown(requireSession({ href: "/profile" }))
+    expect(hrefOf(error)).toBe("/auth/sign-in?redirectTo=%2Fprofile")
+  })
+
+  it("lets a local account through while its token lasts", async () => {
+    auth.mode = "local"
+    storeLocalSession(3_600_000)
+    await expect(requireSession({ href: "/profile" })).resolves.toBe(undefined)
+  })
+
+  it("sends a local account whose token expired to sign in", async () => {
+    auth.mode = "local"
+    storeLocalSession(-1_000)
+    const error = await thrown(requireSession({ href: "/profile" }))
+    expect(hrefOf(error)).toBe("/auth/sign-in?redirectTo=%2Fprofile")
   })
 
   it("drops a destination that leaves the site", async () => {

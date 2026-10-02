@@ -3,7 +3,7 @@ import { useQueryClient } from "@tanstack/react-query"
 import { useRouter } from "@tanstack/react-router"
 import { NeonAuthUIProvider } from "@neondatabase/auth-ui"
 
-import { authClient, sameSitePath } from "@/lib/auth"
+import { authClient, sameSitePath, useAuthMode } from "@/lib/auth"
 
 /** Neon Auth's links, routed through the app's router instead of a full
  *  page load. */
@@ -42,11 +42,13 @@ function AuthLink({
 }
 
 /** Neon Auth's views (sign-in, the OAuth callback, sign-out) wired to the
- *  router and the query cache. Local mode has no sign-in: children only. */
+ *  router and the query cache. Rendered in the neon mode only; a build
+ *  without Neon Auth has no client to give them: children only. */
 export function AuthViewsProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter()
   const queryClient = useQueryClient()
-  if (!authClient) return children
+  const mode = useAuthMode()
+  if (mode !== "neon" || !authClient) return children
   // Every destination goes through the router, and only within this site:
   // the views also navigate to a `redirectTo` taken from the URL.
   const go = (href: string, replace: boolean) =>

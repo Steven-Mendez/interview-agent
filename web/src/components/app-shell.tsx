@@ -1,6 +1,5 @@
 import * as React from "react"
-import { Link, useRouter, useRouterState } from "@tanstack/react-router"
-import { useQueryClient } from "@tanstack/react-query"
+import { Link, useRouterState } from "@tanstack/react-router"
 import {
   HistoryIcon,
   HomeIcon,
@@ -9,6 +8,8 @@ import {
   MenuIcon,
   PlusIcon,
   SettingsIcon,
+  UserIcon,
+  UsersIcon,
 } from "lucide-react"
 
 import { BrandLink } from "@/components/brand"
@@ -20,6 +21,7 @@ import {
   DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuLinkItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { IconButton, IconLink } from "@/components/ui/icon-button"
@@ -30,7 +32,9 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
-import { authEnabled, safeRedirectPath, signOut, useAuth } from "@/lib/auth"
+import { useMe } from "@/hooks/use-me"
+import { useSignOut } from "@/hooks/use-sign-out"
+import { safeRedirectPath, useAuth, useAuthMode } from "@/lib/auth"
 import type { AuthUser } from "@/lib/auth"
 import { cn } from "@/lib/utils"
 
@@ -235,16 +239,67 @@ function initials(user: AuthUser): string {
   )
 }
 
-/** Sign in, or the signed-in account with its sign-out. Nothing in local
- *  mode, and nothing until mounted: the prerendered shell has no session. */
+/** The account's pages: its profile, and the user list for an admin (the
+ *  API has the last word on who is one). */
+function AccountLinks() {
+  const me = useMe()
+  return (
+    <>
+      <DropdownMenuLinkItem render={<Link to="/profile" />}>
+        <UserIcon />
+        Profile
+      </DropdownMenuLinkItem>
+      {me.data?.is_admin && (
+        <DropdownMenuLinkItem render={<Link to="/admin/users" />}>
+          <UsersIcon />
+          Users
+        </DropdownMenuLinkItem>
+      )}
+    </>
+  )
+}
+
+/** Sign in, or the signed-in account with its pages and sign-out; without
+ *  sign-in (mode none), the local developer's pages. Nothing until mounted
+ *  and the mode is known: the prerendered shell has no session. */
 function AccountControls() {
   const mounted = useMounted()
+  const mode = useAuthMode()
   const { user, isPending } = useAuth()
   const href = useRouterState({ select: (s) => s.location.href })
-  const router = useRouter()
-  const queryClient = useQueryClient()
+  const signOut = useSignOut()
 
-  if (!authEnabled || !mounted || isPending) return null
+  if (!mounted || mode === undefined) return null
+
+  if (mode === "none") {
+    return (
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button
+              variant="quiet"
+              size="icon"
+              aria-label="Account: Local developer"
+            >
+              <Avatar>
+                <AvatarFallback>LD</AvatarFallback>
+              </Avatar>
+            </Button>
+          }
+        />
+        <DropdownMenuContent align="end" className="max-w-72">
+          <DropdownMenuGroup>
+            <DropdownMenuLabel>
+              <span className="truncate font-medium">Local developer</span>
+            </DropdownMenuLabel>
+          </DropdownMenuGroup>
+          <AccountLinks />
+        </DropdownMenuContent>
+      </DropdownMenu>
+    )
+  }
+
+  if (isPending) return null
 
   if (!user) {
     return (
@@ -258,16 +313,6 @@ function AccountControls() {
         Sign in
       </LinkButton>
     )
-  }
-
-  const leave = async () => {
-    // Off the private pages first, while the session still holds. From
-    // signOut() on the app reports signed out — before Better Auth's own
-    // session catches up — so the home page asks the API nothing; then
-    // drop everything cached for this account.
-    await router.navigate({ to: "/" })
-    await signOut(user.id)
-    queryClient.clear()
   }
 
   const label = user.name ?? user.email ?? "Your account"
@@ -302,7 +347,8 @@ function AccountControls() {
             )}
           </DropdownMenuLabel>
         </DropdownMenuGroup>
-        <DropdownMenuItem onClick={() => void leave()}>
+        <AccountLinks />
+        <DropdownMenuItem onClick={() => void signOut(user.id)}>
           <LogOutIcon />
           Sign out
         </DropdownMenuItem>

@@ -1,3 +1,4 @@
+/** @vitest-environment jsdom */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type * as Api from "@/lib/api"
@@ -5,22 +6,22 @@ import type * as Api from "@/lib/api"
 // request() is reached through the public calls: getMe for a call made as
 // the user, getClosingState for one that carries a LiveKit participant
 // token of its own. Each test imports a fresh api module, so the build-time
-// env (VITE_API_BASE_URL) and the auth mode are read again.
+// env (VITE_API_BASE_URL) is read again.
 
 const auth = vi.hoisted(() => ({
-  enabled: true,
   token: vi.fn(),
   refresh: vi.fn(),
+  resetMode: vi.fn(),
+  forget: vi.fn(),
 }))
 vi.mock("@/lib/auth", () => ({
-  get authEnabled() {
-    return auth.enabled
-  },
   getAccessToken: auth.token,
   refreshAccessToken: auth.refresh,
+  resetAuthMode: auth.resetMode,
+  forgetRefusedToken: auth.forget,
 }))
 
-const ME = {
+const ME: Api.Me = {
   id: "user",
   email: null,
   name: null,
@@ -29,6 +30,9 @@ const ME = {
   interview_limit: 3,
   interviews_remaining: 3,
   demo_capacity_available: true,
+  auth_provider: "neon",
+  created_at: "2026-09-01T10:00:00+00:00",
+  last_seen_at: null,
 }
 
 const fetchMock = vi.fn<typeof fetch>()
@@ -59,7 +63,6 @@ function sent(call = 0): { url: string; headers: Headers } {
 }
 
 beforeEach(() => {
-  auth.enabled = true
   auth.token.mockResolvedValue("user.jwt.token")
   auth.refresh.mockResolvedValue(null)
   vi.stubGlobal("fetch", fetchMock)
@@ -92,6 +95,8 @@ describe("request", () => {
     expect(auth.token).not.toHaveBeenCalled()
     expect(auth.refresh).not.toHaveBeenCalled()
     expect(handler).not.toHaveBeenCalled()
+    expect(auth.resetMode).not.toHaveBeenCalled()
+    expect(auth.forget).not.toHaveBeenCalled()
   })
 
   it("hands a 401 on the user's JWT to the unauthorized handler", async () => {
@@ -104,6 +109,10 @@ describe("request", () => {
       message: "Authentication required",
     })
     expect(handler).toHaveBeenCalledTimes(1)
+    // The sign-in page asks the API its mode again, and the refused token
+    // is no session any more.
+    expect(auth.resetMode).toHaveBeenCalledTimes(1)
+    expect(auth.forget).toHaveBeenCalledWith("user.jwt.token")
   })
 
   it("retries a refused JWT once with a fresh one before signing out", async () => {
@@ -121,6 +130,7 @@ describe("request", () => {
     expect(sent(1).headers.get("Authorization")).toBe("Bearer fresh.jwt.token")
     expect(auth.refresh).toHaveBeenCalledTimes(1)
     expect(handler).toHaveBeenCalledTimes(1)
+    expect(auth.forget).toHaveBeenCalledWith("fresh.jwt.token")
   })
 
   it("stays signed in when the fresh JWT is accepted", async () => {
@@ -161,6 +171,9 @@ describe("request", () => {
     first()
     await expect(api.getMe()).rejects.toMatchObject({ status: 401 })
     expect(handler).not.toHaveBeenCalled()
+    // Nothing ends the session mid-interview either.
+    expect(auth.forget).not.toHaveBeenCalled()
+    expect(auth.resetMode).not.toHaveBeenCalled()
     second()
     await expect(api.getMe()).rejects.toMatchObject({ status: 401 })
     expect(handler).toHaveBeenCalledTimes(1)
@@ -256,20 +269,57 @@ describe("quotaErrorMessage", () => {
   })
 })
 
-describe("request without sign-in", () => {
-  it("never attaches a JWT nor signs out on a 401", async () => {
-    // Local mode as it really runs: the auth module itself, with no
-    // VITE_NEON_AUTH_URL, so there is no client to take a token from. Last
-    // in the file: the mock stays off from here on.
+describe("request with a local account", () => {
+  // The auth module as it really runs without VITE_NEON_AUTH_URL: the token
+  // is the local account's, from storage. Last in the file: the mock stays
+  // off from here on.
+  async function loadLocal() {
     vi.doUnmock("@/lib/auth")
     vi.stubEnv("VITE_NEON_AUTH_URL", "")
-    const api = await loadApi()
+    window.localStorage.setItem(
+      "interview-agent.local-session",
+      JSON.stringify({
+        token: "local.jwt.token",
+        expiresAt: Date.now() + 3_600_000,
+        user: { id: "local:guest", name: "guest" },
+      })
+    )
+    return loadApi()
+  }
+
+  afterEach(() => window.localStorage.clear())
+
+  it("attaches the local token", async () => {
+    const api = await loadLocal()
+    await api.getMe()
+    expect(sent().headers.get("Authorization")).toBe("Bearer local.jwt.token")
+  })
+
+  it("signs out on a 401 of the local token, without retrying", async () => {
+    const api = await loadLocal()
     const handler = vi.fn()
     api.setUnauthorizedHandler(handler)
-    await api.getMe()
-    expect(sent().headers.has("Authorization")).toBe(false)
     respond(401, { detail: "Authentication required" })
     await expect(api.getMe()).rejects.toMatchObject({ status: 401 })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(handler).toHaveBeenCalledTimes(1)
+    // A refused token is no session: it is forgotten.
+    expect(
+      window.localStorage.getItem("interview-agent.local-session")
+    ).toBeNull()
+  })
+
+  it("leaves the session alone on a participant token's 401", async () => {
+    const api = await loadLocal()
+    const handler = vi.fn()
+    api.setUnauthorizedHandler(handler)
+    respond(401, { detail: "Authentication required" })
+    await expect(
+      api.getClosingState("interview", "livekit.participant.token")
+    ).rejects.toMatchObject({ status: 401 })
     expect(handler).not.toHaveBeenCalled()
+    expect(
+      window.localStorage.getItem("interview-agent.local-session")
+    ).not.toBeNull()
   })
 })

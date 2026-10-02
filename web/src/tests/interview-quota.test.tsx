@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { UploadPage } from "../components/interview-setup"
+import type * as Auth from "@/lib/auth"
 import type * as Api from "@/lib/api"
 import type { Me } from "@/lib/api"
 import type * as Router from "@tanstack/react-router"
@@ -12,6 +13,11 @@ const mocks = vi.hoisted(() => ({
   settings: vi.fn(),
   create: vi.fn(),
   me: vi.fn(),
+}))
+// GET /me goes out as it would without sign-in (mode none).
+vi.mock("@/lib/auth", async (original) => ({
+  ...(await original<typeof Auth>()),
+  useCanCallApi: () => true,
 }))
 vi.mock("@/lib/api", async (original) => ({
   ...(await original<typeof Api>()),
@@ -34,6 +40,9 @@ const GUEST: Me = {
   interview_limit: 3,
   interviews_remaining: 2,
   demo_capacity_available: true,
+  auth_provider: "neon",
+  created_at: "2026-09-01T10:00:00+00:00",
+  last_seen_at: null,
 }
 
 beforeEach(() => {

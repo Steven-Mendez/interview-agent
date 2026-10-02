@@ -25,7 +25,13 @@ import { PageContainer, PageShell, Section } from "@/components/ui/page"
 import { Skeleton } from "@/components/ui/skeleton"
 import { ApiError, SENIORITY_LABELS, durationLabel } from "@/lib/api"
 import type { InterviewSummary } from "@/lib/api"
-import { authEnabled, useAuth } from "@/lib/auth"
+import {
+  resolveAuthMode,
+  useAuth,
+  useAuthMode,
+  useAuthModeError,
+  useCanCallApi,
+} from "@/lib/auth"
 import { recentInterviewsQueryOptions } from "@/lib/queries"
 import { pageHead } from "@/lib/head"
 
@@ -50,11 +56,17 @@ function errorMessage(error: unknown): string {
 
 function HomePage() {
   // The home page is public: interviews load once someone is signed in (or
-  // always, without sign-in). Until the session is known — the whole
-  // prerender — it looks the same as loading.
+  // always, without sign-in). Until the mode and the session are known —
+  // the whole prerender — it looks the same as loading.
+  const mode = useAuthMode()
+  // An API that cannot say how to sign in cannot list interviews either:
+  // say so instead of loading for as long as it stays silent.
+  const modeError = useAuthModeError()
+  const unreachable = mode === undefined ? modeError : null
   const { user, isPending: sessionPending } = useAuth()
-  const signedOut = authEnabled && !sessionPending && user === null
-  const enabled = !authEnabled || user !== null
+  const signedOut =
+    (mode === "local" || mode === "neon") && !sessionPending && user === null
+  const enabled = useCanCallApi()
   const recent = useQuery({
     ...recentInterviewsQueryOptions({ limit: RECENT_LIMIT }),
     enabled,
@@ -139,6 +151,24 @@ function HomePage() {
           </div>
         </section>
 
+        {unreachable ? (
+          <Alert variant="destructive">
+            <AlertCircleIcon />
+            <AlertDescription>
+              Your interviews could not be loaded — {unreachable.message}
+            </AlertDescription>
+            <AlertAction>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => void resolveAuthMode().catch(() => {})}
+              >
+                Try again
+              </Button>
+            </AlertAction>
+          </Alert>
+        ) : null}
+
         {!signedOut && recent.isError && (
           <Alert variant="destructive">
             <AlertCircleIcon />
@@ -167,7 +197,7 @@ function HomePage() {
           </Section>
         )}
 
-        {signedOut ? null : recent.isPending ? (
+        {signedOut || unreachable ? null : recent.isPending ? (
           <Section title="Recent interviews">
             <RowsSkeleton />
           </Section>

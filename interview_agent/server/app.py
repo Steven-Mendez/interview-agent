@@ -16,13 +16,13 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
+from interview_agent import otel_metrics
 from interview_agent.config import settings
 from interview_agent.interview import db
 from interview_agent.interview.db import create_engine_and_sessionmaker
 from interview_agent.logging_config import setup_file_logging
-from interview_agent.metrics import purge_metrics
 from interview_agent.observability import TraceLinks
-from interview_agent.privacy import ExternalDeletionWorker
+from interview_agent.privacy import ExternalDeletionWorker, expire_detail
 from interview_agent.runtime import process_manifest, record_manifest, validate_database_revision
 from interview_agent.server.evaluations import EvaluationRunner
 from interview_agent.server.reconciliation import LifecycleSweeper
@@ -52,20 +52,19 @@ class SpaStaticFiles(StaticFiles):
 
 
 _PURGE_INTERVAL_SECONDS = 24 * 60 * 60
+_METRICS_EXPORT_SECONDS = 5
 
 logger = logging.getLogger("interview_agent.server")
 
 
 async def _purge_loop(sessionmaker) -> None:
-    """PII retention: drop interviews older than RETENTION_DAYS, once at
-    startup and then daily. Postgres CASCADE removes milestones, messages
-    and evaluations."""
+    """Retention, once at startup and then daily: technical detail older than
+    METRICS_DETAIL_DAYS, then (PII) interviews older than RETENTION_DAYS.
+    Postgres CASCADE removes milestones, messages and evaluations."""
     while True:
         try:
             async with sessionmaker() as session:
-                await purge_metrics(
-                    session, settings.metrics_detail_days, settings.metrics_retention_days
-                )
+                await expire_detail(session, settings.metrics_detail_days)
                 deleted = (
                     await db.delete_conversations_older_than(session, settings.retention_days)
                     if settings.retention_days > 0
@@ -90,6 +89,7 @@ async def lifespan(app: FastAPI):
     log_path = setup_file_logging("logs/server.log")
 
     settings.require_keys()
+    otel_metrics.configure(settings, "interview-agent-api")
     engine, sessionmaker = create_engine_and_sessionmaker(settings.database_url)
     try:
         database_revision = await validate_database_revision(sessionmaker)
@@ -144,6 +144,9 @@ async def lifespan(app: FastAPI):
         # Before the engine goes: each cancelled run marks its row so the UI
         # offers a retry instead of a spinner over a run nobody is doing.
         await app.state.evaluations.shutdown()
+        # The last samples leave with the process. Shutdown is their final
+        # export and bounds itself, so a slow collector cannot hold the exit.
+        await asyncio.to_thread(otel_metrics.shutdown, _METRICS_EXPORT_SECONDS * 1000)
         await engine.dispose()
 
 

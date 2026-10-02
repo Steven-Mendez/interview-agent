@@ -10,8 +10,8 @@ from sqlalchemy import select
 
 from interview_agent.config import Settings
 from interview_agent.interview import db
-from interview_agent.metrics import purge_metrics
-from interview_agent.runtime import process_manifest, record_manifest
+from interview_agent.privacy import expire_detail
+from interview_agent.runtime import EXPECTED_REVISION, process_manifest, record_manifest
 
 
 def test_configuration_rejects_reconnect_longer_than_drain():
@@ -71,7 +71,7 @@ async def test_manifest_retention_and_conversation_cascade(postgres_sessionmaker
         assert row.snapshot["id"] == str(row.id)
         row.created_at = datetime.now(UTC) - timedelta(days=31)
         await session.commit()
-        await purge_metrics(session)
+        await expire_detail(session, 30)
         assert list(await session.scalars(select(db.ProcessManifest))) == []
 
 
@@ -80,7 +80,7 @@ async def test_schema_guard_rejects_stale_revision_before_any_session_starts(pos
 
     from interview_agent.runtime import validate_database_revision
 
-    assert await validate_database_revision(postgres_sessionmaker) == "34ae6815db20"
+    assert await validate_database_revision(postgres_sessionmaker) == EXPECTED_REVISION
     async with postgres_sessionmaker() as session:
         await session.execute(text("UPDATE alembic_version SET version_num='a3e72bc19054'"))
         await session.commit()
@@ -92,7 +92,9 @@ async def test_api_lifespan_records_effective_manifest_and_shutdowns_without_pro
     postgres_sessionmaker, monkeypatch
 ):
     from fastapi import FastAPI
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
+    from interview_agent import otel_metrics
     from interview_agent.server import app as server_app
 
     engine = postgres_sessionmaker.kw["bind"]
@@ -104,10 +106,27 @@ async def test_api_lifespan_records_effective_manifest_and_shutdowns_without_pro
     monkeypatch.setattr(server_app.settings, "livekit_api_secret", "synthetic-test-secret")
     monkeypatch.setattr(server_app.settings, "livekit_url", "wss://synthetic.example")
     monkeypatch.setattr(server_app.settings, "langsmith_api_key", "")
+    reader, services, configure = InMemoryMetricReader(), [], otel_metrics.configure
+
+    def in_memory(settings, service_name):
+        services.append(service_name)
+        return configure(settings, service_name, reader=reader)
+
+    monkeypatch.setattr(otel_metrics, "configure", in_memory)
     application = FastAPI()
     async with server_app.lifespan(application):
-        assert application.state.runtime_manifest["database_revision"] == "34ae6815db20"
+        assert application.state.runtime_manifest["database_revision"] == EXPECTED_REVISION
         async with postgres_sessionmaker() as session:
             row = (await session.scalars(select(db.ProcessManifest))).one()
             assert row.role == "api" and row.snapshot["provider_calls_performed"] is False
         assert application.state.evaluations.running == 0
+    assert services == ["interview-agent-api"]
+    # Shut down with the process: later samples go nowhere.
+    otel_metrics.record("server", "after_shutdown", 1)
+    data = reader.get_metrics_data()
+    assert "interview_agent.server.after_shutdown" not in {
+        metric.name
+        for resource in (data.resource_metrics if data else [])
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+    }

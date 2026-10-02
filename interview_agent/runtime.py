@@ -19,7 +19,7 @@ from sqlalchemy import text
 from interview_agent.interview import db
 from interview_agent.llm import build_chat_model, close_chat_model
 
-EXPECTED_REVISION = "34ae6815db20"
+EXPECTED_REVISION = "dad9ce0068bd"
 ROOT = Path(__file__).resolve().parents[1]
 FIELDS = (
     "planner_model",
@@ -36,7 +36,6 @@ FIELDS = (
     "closing_timeout_seconds",
     "retention_days",
     "metrics_detail_days",
-    "metrics_retention_days",
     "worker_drain_minutes",
 )
 SOURCES = (

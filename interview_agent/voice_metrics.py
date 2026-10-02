@@ -33,6 +33,10 @@ def record_voice_metrics(telemetry, metric, *, stt_model, tts_model):
         dimensions["model"] = model
         dimensions["resolved_model"] = getattr(metadata, "model_name", None) or model
         dimensions["provider"] = getattr(metadata, "model_provider", None) or model.split("/")[0]
+    elif component == "eou" and stt_model:
+        # Streaming STT reports no request duration, so the transcript delay is
+        # its latency. The metadata here names the turn detector, not the STT.
+        dimensions["model"] = stt_model
     turn_id = getattr(metric, "speech_id", None)
     for field, name in TIMINGS.items():
         if field in type(metric).model_fields:

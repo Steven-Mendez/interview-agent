@@ -49,7 +49,9 @@ async def reconcile(sessions, interview_id):
         return await reconcile_interview(session, interview_id, LIMITS)
 
 
-async def test_sweep_preserves_replacement_window_then_seals_without_browser(postgres_sessionmaker):
+async def test_sweep_preserves_replacement_window_then_seals_without_browser(
+    postgres_sessionmaker, recorded_metrics
+):
     interview_id, old = await started(postgres_sessionmaker)
     await age(postgres_sessionmaker, interview_id, worker_lease_until=-1)
     assert await reconcile(postgres_sessionmaker, interview_id) is None
@@ -65,21 +67,17 @@ async def test_sweep_preserves_replacement_window_then_seals_without_browser(pos
         assert row.stt_drain["complete"] is False and row.transcript_sealed_at
         assert row.worker_epoch == 1 and row.worker_owner_id == old.owner_id
     assert await workers.WorkerCoordinator(interview_id, postgres_sessionmaker).claim() is None
-    async with postgres_sessionmaker() as session:
-        outcomes = {
-            event.name: (event.value, event.dimensions["farewell_status"])
-            for event in await session.scalars(
-                select(db.MetricEvent).where(
-                    db.MetricEvent.conversation_id == interview_id,
-                    db.MetricEvent.component == "closing",
-                )
-            )
-        }
-    # A server-reconciled close still counts in the closing outcome denominator.
-    assert outcomes == {
-        "reconciled": (1, "not_possible"),
-        "playback_confirmed": (0, "not_possible"),
+    # A server-reconciled close still counts in the closing outcome denominator,
+    # with no candidate or interview identity.
+    outcomes = {
+        name: [
+            (point.count, point.sum, dict(point.attributes))
+            for point in recorded_metrics(f"interview_agent.closing.{name}")
+        ]
+        for name in ("reconciled", "playback_confirmed")
     }
+    labels = {"farewell_status": "not_possible", "source": "lifecycle_sweeper"}
+    assert outcomes == {"reconciled": [(1, 1, labels)], "playback_confirmed": [(1, 0, labels)]}
 
 
 @pytest.mark.parametrize("limit", ["duration", "idle", "disconnect"])
@@ -195,14 +193,26 @@ async def test_monitor_fails_closed_without_waiting_for_local_expiration(
         owner.require_local()
 
 
-async def test_server_health_metrics_have_no_candidate_identity(postgres_sessionmaker):
-    sweeper = LifecycleSweeper(postgres_sessionmaker, LIMITS)
-    await sweeper.metric("sweep_lag_seconds", 0.2)
-    async with postgres_sessionmaker() as session:
-        event = await session.scalar(select(db.MetricEvent))
-        assert event.conversation_id is None and event.turn_id is None
-        assert event.dimensions == {"source": "lifecycle_sweeper"}
-        assert (await session.scalar(select(db.MetricAggregate))).count == 1
+async def test_server_health_metrics_have_no_candidate_identity(
+    postgres_sessionmaker, recorded_metrics, monkeypatch
+):
+    interview_id, _owner = await started(postgres_sessionmaker)
+    await age(postgres_sessionmaker, interview_id, worker_lease_until=-31)
+    sleep = asyncio.sleep
+
+    async def one_sweep(seconds, *args, **kwargs):
+        if seconds >= 1:  # the wait for the next sweep, SWEEP_SECONDS later
+            raise asyncio.CancelledError
+        return await sleep(seconds, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", one_sweep)
+    with pytest.raises(asyncio.CancelledError):
+        await LifecycleSweeper(postgres_sessionmaker, LIMITS).run()
+    sweep = {}
+    for name in ("lag_seconds", "reconciled", "errors", "duration_seconds"):
+        (sweep[name],) = recorded_metrics(f"interview_agent.server.sweep_{name}")
+        assert dict(sweep[name].attributes) == {"source": "lifecycle_sweeper"}
+    assert (sweep["reconciled"].sum, sweep["errors"].sum) == (1, 0)
 
 
 async def test_delayed_disconnect_cannot_overwrite_a_newer_reconnect(postgres_sessionmaker):

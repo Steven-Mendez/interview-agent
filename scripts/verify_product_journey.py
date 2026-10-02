@@ -9,6 +9,8 @@ plays a fixed answer, synthesized with the production TTS, once the first
 question is delivered.
 Requires --live; uses a fresh migrated interview_benchmark_*_test database and
 its own worker name, so the primary database and worker are never touched.
+Neither LangSmith traces nor OTLP metrics are exported, so synthetic interviews
+never reach the shared observability backends.
 """
 
 from __future__ import annotations
@@ -327,23 +329,8 @@ async def postconditions(sessions, interview_id):
             "followup_limit": row.followup_limit,
             "run_config_models": (row.run_config or {}).get("models"),
             "token_usage_roles": sorted((row.token_usage or {}).keys()),
-            "response_onset_seconds": list(
-                await session.scalars(
-                    select(db.MetricEvent.value).where(
-                        db.MetricEvent.conversation_id == interview_id,
-                        db.MetricEvent.name == "response_onset_seconds",
-                    )
-                )
-            ),
-            "farewell_audio_output": [
-                event.dimensions.get("audio_output")
-                for event in await session.scalars(
-                    select(db.MetricEvent).where(
-                        db.MetricEvent.conversation_id == interview_id,
-                        db.MetricEvent.name == "farewell_audio_output",
-                    )
-                )
-            ],
+            # The timings themselves are anonymous OTLP metrics, not rows.
+            "response_onset_samples": row.response_onset_samples,
         }
 
 
@@ -391,6 +378,8 @@ async def journey(args):
         "LIVEKIT_AGENT_NAME": f"product-probe-{tag}",
         "LANGSMITH_API_KEY": "",
         "LANGSMITH_TRACING": "false",
+        "OTEL_EXPORTER_OTLP_ENDPOINT": "",
+        "OTEL_EXPORTER_OTLP_HEADERS": "",
         "APP_BASE_URL": f"http://127.0.0.1:{API_PORT}",
         "WORKER_DRAIN_MINUTES": "1",
         "INTERVIEW_RECONNECT_SECONDS": "10",

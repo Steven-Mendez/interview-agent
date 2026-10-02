@@ -16,6 +16,7 @@ import httpx
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 
+from interview_agent import otel_metrics
 from interview_agent.interview import db
 
 logger = logging.getLogger(__name__)
@@ -120,16 +121,21 @@ async def retire_traces(session, *, conversation_id=None, expired_only=False) ->
         row.state = "pending"
         row.deletion_requested_at = now
         row.next_attempt_at = now
-    ids = [row.id for row in rows]
-    if ids:
-        await session.execute(
-            delete(db.MetricEvent).where(
-                db.MetricEvent.dimensions["trace_id"].astext.in_(
-                    [str(identifier) for identifier in ids]
-                )
-            )
+    return [row.id for row in rows]
+
+
+async def expire_detail(session, detail_days: int) -> None:
+    """Technical detail ends after METRICS_DETAIL_DAYS: expired LangSmith traces
+    are retired (ExternalDeletionWorker deletes them) and startup manifests
+    dropped."""
+    await retire_traces(session, expired_only=True)
+    now = await session.scalar(select(func.clock_timestamp()))
+    await session.execute(
+        delete(db.ProcessManifest).where(
+            db.ProcessManifest.created_at < now - timedelta(days=detail_days)
         )
-    return ids
+    )
+    await session.commit()
 
 
 async def delete_conversation(session, conversation_id) -> bool:
@@ -218,6 +224,7 @@ class ExternalDeletionWorker:
 
     async def once(self) -> bool:
         owner = uuid.uuid4()
+        gave_up = None
         async with self.sessionmaker() as session, session.begin():
             row = await session.scalar(
                 select(db.ExternalTrace)
@@ -248,22 +255,26 @@ class ExternalDeletionWorker:
                 row.next_attempt_at = now + timedelta(minutes=1)
                 return True
             if now >= row.deletion_requested_at + timedelta(days=VERIFICATION_DAYS):
-                row.state, row.last_error = "failed", "verification_deadline"
-                return True
-            if row.state == "pending" and row.attempts >= MAX_SUBMISSIONS:
-                row.state, row.last_error = "failed", "submission_limit"
-                return True
-            if row.state == "pending":
-                row.attempts += 1  # reserved before any external request
-            row.lease_owner = owner
-            row.lease_until = now + timedelta(seconds=LEASE_SECONDS)
-            identifier, project_name, project_id, phase, registered = (
-                row.id,
-                row.project_name,
-                row.project_id,
-                row.state,
-                row.created_at,
-            )
+                gave_up = "verification_deadline"
+            elif row.state == "pending" and row.attempts >= MAX_SUBMISSIONS:
+                gave_up = "submission_limit"
+            if gave_up:
+                row.state, row.last_error = "failed", gave_up
+            else:
+                if row.state == "pending":
+                    row.attempts += 1  # reserved before any external request
+                row.lease_owner = owner
+                row.lease_until = now + timedelta(seconds=LEASE_SECONDS)
+                identifier, project_name, project_id, phase, registered = (
+                    row.id,
+                    row.project_name,
+                    row.project_id,
+                    row.state,
+                    row.created_at,
+                )
+        if gave_up:
+            _count_outcome("failed", gave_up)
+            return True
 
         error, absent, submitted = None, False, False
         try:
@@ -303,6 +314,8 @@ class ExternalDeletionWorker:
                 row.project_id = None
             else:
                 row.next_attempt_at = now + timedelta(hours=1)
+            state = row.state
+        _count_outcome(state, error)
         return True
 
     async def run(self):
@@ -317,36 +330,10 @@ class ExternalDeletionWorker:
             await self.api.close()
 
 
-async def deletion_report(session) -> dict:
-    rows = list(
-        await session.scalars(
-            select(db.ExternalTrace)
-            .where(db.ExternalTrace.state != "active")
-            .order_by(db.ExternalTrace.deletion_requested_at.desc())
-            .limit(100)
-        )
-    )
-    counts = dict(
-        (
-            await session.execute(
-                select(db.ExternalTrace.state, func.count()).group_by(db.ExternalTrace.state)
-            )
-        ).all()
-    )
-    return {
-        "counts": counts,
-        "items": [
-            {
-                "id": str(row.id),
-                "state": row.state,
-                "attempts": row.attempts,
-                "failures": row.failures,
-                "last_error": row.last_error,
-                "requested_at": row.deletion_requested_at,
-                "submitted_at": row.deletion_submitted_at,
-                "verified_at": row.deleted_at,
-                "next_attempt_at": row.next_attempt_at,
-            }
-            for row in rows
-        ],
-    }
+def _count_outcome(state: str, error: str | None) -> None:
+    """After the commit, so each trace counts once: neither final state is
+    claimed again. The error is our own code or an exception class name."""
+    if state == "completed":
+        otel_metrics.count("privacy", "external_deletions_completed")
+    elif state == "failed":
+        otel_metrics.count("privacy", "external_deletions_failed", dimensions={"error_type": error})

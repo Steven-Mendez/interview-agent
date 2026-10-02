@@ -1,10 +1,13 @@
-"""Durable metrics and, when LangSmith is configured, full interview traces.
+"""Anonymous metrics and, when LangSmith is configured, full interview traces.
 
-Without a LangSmith key nothing leaves the process. With one, the key is the
-consent: each interview's trace carries its content (CV, offer, plan, turns,
-prompts, model answers and the evaluation) and is deleted from LangSmith once
-local detail expires (see privacy.ExternalDeletionWorker). Local metrics and
-logs stay content-free either way."""
+Metrics are not rows in Postgres: they are OTLP metrics (see otel_metrics),
+exported only when an endpoint is configured, with categories and numbers but
+no interview, trace or turn ID and no content. Without a LangSmith key no
+interview content leaves the process. With one, the key is the consent: each
+interview's trace carries its content (CV, offer, plan, turns, prompts, model
+answers and the evaluation) and is deleted from LangSmith once local detail
+expires (see privacy.ExternalDeletionWorker). Metrics and logs stay
+content-free either way."""
 
 from __future__ import annotations
 
@@ -34,9 +37,8 @@ from opentelemetry import trace as otel_trace
 from opentelemetry.trace import NonRecordingSpan, SpanContext, Status, StatusCode, TraceFlags
 from urllib3.util.retry import Retry
 
+from interview_agent import otel_metrics
 from interview_agent.config import Settings
-from interview_agent.interview import db
-from interview_agent.metrics import record_metric, safe_dimensions
 from interview_agent.privacy import LangSmithDeletionAPI, guarded_export, register_trace
 
 GRAPH_VERSION = "interview-v1"
@@ -107,7 +109,7 @@ def practice_thread_id(root_conversation_id: uuid.UUID) -> str:
 
 # Trace metadata (filters and grouping in LangSmith): categories and numbers
 # produced by our own code. Content goes in run inputs/outputs instead.
-# Metric storage keeps its own list.
+# Metrics keep their own list (otel_metrics.DIMENSIONS).
 TRACE_FIELDS = frozenset(
     {
         "process",
@@ -549,7 +551,7 @@ class Telemetry:
         )
 
     def dimensions(self, extra: dict | None = None) -> dict:
-        return safe_dimensions(
+        return otel_metrics.safe_dimensions(
             {
                 "graph_version": self.config.get("graph_version", GRAPH_VERSION),
                 "language": self.config.get("language", "unknown"),
@@ -571,6 +573,8 @@ class Telemetry:
         turn_id: str | None = None,
         dimensions: dict | None = None,
     ) -> None:
+        """An anonymous sample: the interview's categories and the component's
+        configured model, never the trace or turn it came from."""
         await self._dimensions_ready.wait()
         model_component = (
             "interviewer" if component in ("graph", "dialogue", "voice", "closing") else component
@@ -580,19 +584,7 @@ class Telemetry:
             **({"model": configured["model"]} if configured.get("model") else {}),
             **(dimensions or {}),
         }
-        async with self.sessionmaker() as session:
-            await record_metric(
-                session,
-                db.MetricEvent(
-                    id=uuid.uuid4(),
-                    conversation_id=self.conversation_id,
-                    component=component,
-                    name=name,
-                    value=value,
-                    turn_id=turn_id,
-                    dimensions=self.dimensions(dimensions),
-                ),
-            )
+        otel_metrics.record(component, name, value, self.dimensions(dimensions))
 
     def emit(
         self,
@@ -608,7 +600,7 @@ class Telemetry:
                 await self.record(component, name, value, turn_id=turn_id, dimensions=dimensions)
             except Exception:
                 self.failures += 1
-                logger.exception("Metric persistence failed: %s/%s", component, name)
+                logger.exception("Metric recording failed: %s/%s", component, name)
 
         task = asyncio.create_task(write())
         self.pending.add(task)
@@ -842,8 +834,8 @@ class Telemetry:
 
 
 class LLMObserver(AsyncCallbackHandler):
-    """LLM invocations and SDK HTTP attempts are measured separately. Local
-    metrics never read bodies; the exported LLM run carries prompt and answer."""
+    """LLM invocations and SDK HTTP attempts are measured separately. Metrics
+    never read bodies; the exported LLM run carries prompt and answer."""
 
     def __init__(
         self,

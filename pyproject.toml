@@ -25,6 +25,9 @@ dependencies = [
     "alembic>=1.18.5",
     "httpx>=0.28.1",
     "pdfminer-six>=20260107",
+    # Anonymous metrics over OTLP
+    "opentelemetry-sdk>=1.39.1",
+    "opentelemetry-exporter-otlp-proto-http>=1.39.1",
 ]
 
 [project.scripts]

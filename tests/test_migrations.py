@@ -12,6 +12,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from interview_agent.interview import db
+from interview_agent.runtime import EXPECTED_REVISION
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -85,6 +86,17 @@ async def test_v2_upgrade_preserves_legacy_data_and_blocks_destructive_downgrade
             )
         code, output = await alembic("upgrade", "head")
         assert code == 0, output
+        async with engine.connect() as connection:
+            assert (
+                await connection.scalar(text("SELECT version_num FROM alembic_version"))
+                == EXPECTED_REVISION
+            )
+            # Metrics are exported over OTLP; no table keeps them any more.
+            for table in ("metric_events", "metric_aggregates"):
+                assert (
+                    await connection.scalar(text("SELECT to_regclass(:name)"), {"name": table})
+                    is None
+                )
         migrated_engine, sessionmaker = db.create_engine_and_sessionmaker(
             target.render_as_string(hide_password=False)
         )
@@ -98,6 +110,7 @@ async def test_v2_upgrade_preserves_legacy_data_and_blocks_destructive_downgrade
                 assert row.worker_epoch == 0 and row.worker_owner_id is None
                 assert row.worker_acquired_at is None and row.worker_lease_until is None
                 assert row.worker_activity_at is None and row.worker_disconnected_at is None
+                assert row.response_onset_samples == 0
                 assert list(await session.scalars(select(db.TurnExecution))) == []
                 assert row.milestones[0].lifecycle == "closed"
                 assert row.milestones[0].close_reason == "legacy_unspecified"
@@ -116,24 +129,35 @@ async def test_v2_upgrade_preserves_legacy_data_and_blocks_destructive_downgrade
                 row = await db.get_conversation(session, conversation_id)
                 assert row.worker_epoch == 1 and row.worker_owner_id is not None
                 row.worker_epoch, row.worker_owner_id = 0, None
-                metric_id = uuid.uuid4()
-                session.add(
-                    db.MetricEvent(
-                        id=metric_id,
-                        conversation_id=None,
-                        component="server",
-                        name="sweep_lag_seconds",
-                        value=0.1,
-                        dimensions={"source": "lifecycle_sweeper"},
-                    )
-                )
                 await session.commit()
+            # The legacy metric tables come back below head: a server sample
+            # without an interview still blocks the worker ownership downgrade.
+            code, output = await alembic("downgrade", "34ae6815db20")
+            assert code == 0, output
+            metric_id = uuid.uuid4()
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "INSERT INTO metric_events (id,component,name,value,dimensions) "
+                        "VALUES (:id,'server','sweep_lag_seconds',0.1,CAST(:dimensions AS jsonb))"
+                    ),
+                    {"id": metric_id, "dimensions": '{"source": "lifecycle_sweeper"}'},
+                )
             code, output = await alembic("downgrade", "c632ad97e120")
             assert code != 0 and "Downgrade would destroy worker ownership" in output
+            async with engine.begin() as connection:
+                assert (
+                    await connection.scalar(
+                        text("SELECT count(*) FROM metric_events WHERE conversation_id IS NULL")
+                    )
+                    == 1
+                )
+                await connection.execute(
+                    text("DELETE FROM metric_events WHERE id=:id"), {"id": metric_id}
+                )
+            code, output = await alembic("upgrade", "head")
+            assert code == 0, output
             async with sessionmaker() as session:
-                metric = await session.get(db.MetricEvent, metric_id)
-                assert metric.conversation_id is None
-                await session.delete(metric)
                 row = await db.get_conversation(session, conversation_id)
                 row.run_config = {"schema_version": 2}
                 row.evaluation.score = None

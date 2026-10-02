@@ -1,114 +1,299 @@
-"""Real PostgreSQL proof for telemetry preservation, missing data and concurrency."""
+"""Anonymous OTLP metrics, plus the LangSmith export and LLM measurements around them."""
 
 import asyncio
+import gzip
+import math
+import socket
+import subprocess
+import sys
 import threading
 import time
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import Mock
 
 import httpx
 import pytest
-from sqlalchemy import delete, select
-from sqlalchemy.exc import IntegrityError
+from livekit.agents.metrics.base import EOUMetrics, Metadata
+from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (
+    ExportMetricsServiceRequest,
+)
+from opentelemetry.proto.metrics.v1.metrics_pb2 import AggregationTemporality
+from opentelemetry.sdk.metrics.export import ExponentialHistogramDataPoint, InMemoryMetricReader
+from opentelemetry.sdk.trace import TracerProvider
 
+from interview_agent import otel_metrics
 from interview_agent.config import Settings
 from interview_agent.interview import db
-from interview_agent.metrics import metrics_report, purge_metrics, record_metric
 from interview_agent.observability import LLMObserver, Telemetry
+from interview_agent.voice_metrics import record_voice_metrics
+
+IDENTITY = {
+    "trace_id": str(uuid.uuid4()),
+    "conversation_id": str(uuid.uuid4()),
+    "turn_id": "turn-1",
+    "candidate_name": "Private name",
+}
 
 
-async def conversation(sessionmaker):
-    conversation_id = uuid.uuid4()
-    async with sessionmaker() as session:
-        session.add(
-            db.Conversation(
-                id=conversation_id,
-                job_offer="Private offer",
-                resume_markdown="Private CV",
-                status="completed",
+async def test_each_measurement_is_one_exponential_histogram_without_identity(recorded_metrics):
+    for value in range(1, 21):
+        otel_metrics.record(
+            "graph",
+            "decision_seconds",
+            value,
+            # A new trace per sample would split the series if it were kept.
+            {"graph_version": "v2", "language": "es", "model": "gpt-6-astra", **IDENTITY}
+            | {"trace_id": str(uuid.uuid4())},
+        )
+    otel_metrics.record("graph", "repair_seconds", 3.0)
+    (point,) = recorded_metrics("interview_agent.graph.decision_seconds")
+    assert isinstance(point, ExponentialHistogramDataPoint)
+    assert (point.count, point.sum, point.min, point.max) == (20, 210, 1, 20)
+    assert dict(point.attributes) == {
+        "graph_version": "v2",
+        "language": "es",
+        "model": "gpt-6-astra",
+    }
+    (other,) = recorded_metrics("interview_agent.graph.repair_seconds")
+    assert other.count == 1 and dict(other.attributes) == {}
+
+
+async def test_missing_values_count_as_unknown_never_as_zero(recorded_metrics):
+    for value in (None, math.nan, math.inf, -math.inf):
+        otel_metrics.record("planner", "estimated_cost_usd", value, {"model": "gpt-6-astra"})
+    otel_metrics.record("planner", "estimated_cost_usd", 0.5, {"model": "gpt-6-astra"})
+    (unknown,) = recorded_metrics("interview_agent.planner.estimated_cost_usd.unknown")
+    assert unknown.value == 4 and dict(unknown.attributes) == {"model": "gpt-6-astra"}
+    (known,) = recorded_metrics("interview_agent.planner.estimated_cost_usd")
+    assert (known.count, known.sum) == (1, 0.5)
+
+
+async def test_samples_never_carry_the_current_span_as_an_exemplar(recorded_metrics):
+    # The SDK default would attach the sampled span's trace and span IDs.
+    with TracerProvider().get_tracer("test").start_as_current_span("voice turn"):
+        otel_metrics.record("voice", "ttfb_seconds", 0.3)
+        otel_metrics.count("privacy", "external_deletions_completed")
+    (sample,) = recorded_metrics("interview_agent.voice.ttfb_seconds")
+    (deletion,) = recorded_metrics("interview_agent.privacy.external_deletions_completed")
+    assert not sample.exemplars and not deletion.exemplars
+
+
+def test_without_an_endpoint_nothing_is_built_and_recording_is_a_no_op(monkeypatch):
+    reader = InMemoryMetricReader()
+    assert otel_metrics.configure(Settings(_env_file=None), "interview-agent-test", reader=reader)
+    monkeypatch.setattr(otel_metrics, "MeterProvider", Mock(side_effect=AssertionError))
+    monkeypatch.setattr(otel_metrics, "OTLPMetricExporter", Mock(side_effect=AssertionError))
+    # Configuring again replaces the earlier provider, here with none.
+    assert not otel_metrics.configure(Settings(_env_file=None), "interview-agent-test")
+    otel_metrics.record("graph", "decision_seconds", 1.0)
+    otel_metrics.record("graph", "decision_seconds", None)
+    otel_metrics.count("privacy", "external_deletions_completed")
+    assert otel_metrics.force_flush() is True
+    otel_metrics.shutdown()
+    data = reader.get_metrics_data()
+    assert not data or not any(r.scope_metrics for r in data.resource_metrics)
+
+
+def test_resource_names_the_service_and_each_configured_instance():
+    instances = []
+    try:
+        for _ in range(2):
+            reader = InMemoryMetricReader()
+            otel_metrics.configure(
+                Settings(_env_file=None), "interview-agent-worker", reader=reader
             )
-        )
-        await session.commit()
-    return conversation_id
+            otel_metrics.record("voice", "interruptions", 1)
+            (resource,) = reader.get_metrics_data().resource_metrics
+            assert resource.resource.attributes["service.name"] == "interview-agent-worker"
+            instances.append(uuid.UUID(resource.resource.attributes["service.instance.id"]))
+    finally:
+        otel_metrics.shutdown()
+    assert instances[0] != instances[1]
 
 
-def event(conversation_id, value, **kwargs):
-    return db.MetricEvent(
-        id=uuid.uuid4(),
-        conversation_id=conversation_id,
-        component="graph",
-        name="decision_seconds",
-        value=value,
-        dimensions={
-            "graph_version": "v2",
-            "language": "es",
-            "model": "gpt-6-astra",
-            "trace_id": str(uuid.uuid4()),
-            "candidate_name": "Private name",
-        },
-        **kwargs,
+def test_otlp_export_reaches_the_configured_endpoint_with_its_headers():
+    requests = []
+
+    class Collector(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            if self.headers.get("Content-Encoding") == "gzip":
+                body = gzip.decompress(body)
+            headers = {key.lower(): value for key, value in self.headers.items()}
+            requests.append((self.path, headers, body))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Collector)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    settings = Settings(
+        _env_file=None,
+        OTEL_EXPORTER_OTLP_ENDPOINT=f"http://127.0.0.1:{server.server_port}/",
+        # The OTel env format: URL-encoded values, comma-separated pairs.
+        OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20c3ludGhldGlj,X-Scope-OrgID=local",
     )
-
-
-async def test_atomic_concurrent_rollup_survives_interview_deletion(postgres_sessionmaker):
-    conversation_id = await conversation(postgres_sessionmaker)
-
-    async def write(value):
-        async with postgres_sessionmaker() as session:
-            await record_metric(session, event(conversation_id, value))
-
-    await asyncio.gather(*(write(value) for value in range(1, 21)))
-    async with postgres_sessionmaker() as session:
-        aggregate = (await session.scalars(select(db.MetricAggregate))).one()
-        assert aggregate.count == 20
-        assert aggregate.total == 210
-        assert sum(aggregate.histogram.values()) == 20
-        assert "trace_id" not in aggregate.dimensions
-        assert "candidate_name" not in aggregate.dimensions
-        await session.execute(delete(db.Conversation).where(db.Conversation.id == conversation_id))
-        await session.commit()
-        assert (await session.scalars(select(db.MetricEvent))).all() == []
-        report = await metrics_report(session, 30, {"model": "gpt-6-astra"})
-        item = report["items"][0]
-        assert item["count"] == 20
-        assert item["p50"] == pytest.approx(10, rel=0.025)
-        assert item["p95"] == pytest.approx(19, rel=0.025)
-
-
-async def test_unknown_samples_are_not_zero_and_duplicate_event_rolls_back(postgres_sessionmaker):
-    conversation_id = await conversation(postgres_sessionmaker)
-    identifier = uuid.uuid4()
-    async with postgres_sessionmaker() as session:
-        sample = event(conversation_id, None)
-        sample.id = identifier
-        await record_metric(session, sample)
-    async with postgres_sessionmaker() as session:
-        duplicate = event(conversation_id, 99)
-        duplicate.id = identifier
-        with pytest.raises(IntegrityError):
-            await record_metric(session, duplicate)
-        await session.rollback()
-        item = (await metrics_report(session, 30, {}))["items"][0]
-        assert item["count"] == 0
-        assert item["unknown_count"] == 1
-        assert item["mean"] is None and item["p95"] is None
-        assert item["minimum"] is None and item["maximum"] is None
-
-
-async def test_detail_and_aggregate_have_separate_retention(postgres_sessionmaker):
-    conversation_id = await conversation(postgres_sessionmaker)
-    async with postgres_sessionmaker() as session:
-        await record_metric(
-            session, event(conversation_id, 2, created_at=datetime.now(UTC) - timedelta(days=40))
+    try:
+        assert otel_metrics.configure(settings, "interview-agent-api")
+        otel_metrics.record("browser", "response_onset_seconds", 1.25, {"language": "es"})
+        otel_metrics.count(
+            "privacy", "external_deletions_failed", dimensions={"error_type": "submission_limit"}
         )
-        await record_metric(
-            session, event(conversation_id, 3, created_at=datetime.now(UTC) - timedelta(days=400))
-        )
-        await purge_metrics(session, 30, 365)
-        assert (await session.scalars(select(db.MetricEvent))).all() == []
-        items = (await metrics_report(session, 365, {}))["items"]
-        assert len(items) == 1 and items[0]["total"] == 2
+        assert otel_metrics.force_flush()
+    finally:
+        otel_metrics.shutdown()
+        server.shutdown()
+        server.server_close()
+    path, headers, body = requests[0]
+    assert path == "/v1/metrics"
+    assert headers["authorization"] == "Basic c3ludGhldGlj"
+    assert headers["x-scope-orgid"] == "local"
+    (resource,) = ExportMetricsServiceRequest.FromString(body).resource_metrics
+    service = {a.key: a.value.string_value for a in resource.resource.attributes}
+    assert service["service.name"] == "interview-agent-api"
+    metrics = {m.name: m for scope in resource.scope_metrics for m in scope.metrics}
+    onset = metrics["interview_agent.browser.response_onset_seconds"]
+    # Cumulative, native-histogram ready and without a unit suffix for Prometheus.
+    assert onset.WhichOneof("data") == "exponential_histogram" and onset.unit == ""
+    cumulative = AggregationTemporality.AGGREGATION_TEMPORALITY_CUMULATIVE
+    assert onset.exponential_histogram.aggregation_temporality == cumulative
+    (point,) = onset.exponential_histogram.data_points
+    assert point.count == 1 and point.sum == 1.25
+    assert {a.key: a.value.string_value for a in point.attributes} == {"language": "es"}
+    failed = metrics["interview_agent.privacy.external_deletions_failed"]
+    assert failed.sum.is_monotonic and failed.sum.aggregation_temporality == cumulative
+    (point,) = failed.sum.data_points
+    assert point.as_int == 1
+    assert {a.key: a.value.string_value for a in point.attributes} == {
+        "error_type": "submission_limit"
+    }
+
+
+_SILENT_COLLECTOR_PROCESS = """
+import sys
+from interview_agent import otel_metrics
+from interview_agent.config import Settings
+
+settings = Settings(_env_file=None, OTEL_EXPORTER_OTLP_ENDPOINT=sys.argv[1])
+otel_metrics.configure(settings, "interview-agent-test")
+otel_metrics.record("server", "sweep_duration_seconds", 0.5)
+print(otel_metrics.force_flush(500), flush=True)
+otel_metrics.shutdown(500)
+print("shut down", flush=True)
+"""
+
+
+def test_an_unresponsive_collector_cannot_hold_the_process_exit():
+    # Accepts connections and never answers, as a stuck collector would.
+    collector = socket.create_server(("127.0.0.1", 0))
+    accepted = []
+
+    def accept():
+        while True:
+            try:
+                accepted.append(collector.accept()[0])
+            except OSError:
+                return
+
+    threading.Thread(target=accept, daemon=True).start()
+    endpoint = f"http://127.0.0.1:{collector.getsockname()[1]}"
+    process = subprocess.Popen(
+        [sys.executable, "-c", _SILENT_COLLECTOR_PROCESS, endpoint],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout.readline().strip() == "False"
+        flushed_at = time.monotonic()
+        assert process.stdout.readline().strip() == "shut down"
+        assert process.wait(timeout=30) == 0
+        # Without the bound, the abandoned export and an atexit export each
+        # waited for the exporter's own timeout.
+        assert time.monotonic() - flushed_at < 2
+    finally:
+        process.kill()
+        collector.close()
+        for connection in accepted:
+            connection.close()
+    assert accepted
+
+
+async def test_telemetry_waits_for_deferred_dimensions_and_adds_the_configured_model(
+    recorded_metrics,
+):
+    telemetry = Telemetry(
+        None,
+        uuid.uuid4(),
+        Settings(_env_file=None),
+        {
+            "graph_version": "interview-v1",
+            "config_version": "synthetic-config",
+            "models": {
+                "planner": {"model": "gpt-6-astra"},
+                "interviewer": {"model": "gpt-6.1-sol"},
+            },
+        },
+        defer_dimensions=True,
+    )
+    telemetry.emit("planner", "duration_seconds", 1.5, dimensions=IDENTITY)
+    telemetry.emit("dialogue", "validation_failures", 1, turn_id="turn-1")
+    telemetry.emit("stt", "ttfb_seconds", 0.2, dimensions={"model": "assemblyai/test"})
+    await asyncio.sleep(0.05)
+    # The planner has not classified the interview yet: nothing is recorded.
+    assert recorded_metrics("interview_agent.planner.duration_seconds") == []
+    telemetry.resolve_dimensions(
+        {"language": "es", "seniority": "junior", "interview_length": "short"}
+    )
+    await telemetry.drain()
+    interview = {
+        "graph_version": "interview-v1",
+        "config_version": "synthetic-config",
+        "language": "es",
+        "seniority": "junior",
+        "length": "short",
+    }
+    (planner,) = recorded_metrics("interview_agent.planner.duration_seconds")
+    assert dict(planner.attributes) == interview | {"model": "gpt-6-astra"}
+    # The dialogue runs on the interviewer's model.
+    (dialogue,) = recorded_metrics("interview_agent.dialogue.validation_failures")
+    assert dict(dialogue.attributes) == interview | {"model": "gpt-6.1-sol"}
+    (stt,) = recorded_metrics("interview_agent.stt.ttfb_seconds")
+    assert dict(stt.attributes)["model"] == "assemblyai/test"
+    await telemetry.record("evaluator", "coverage", None)
+    (unknown,) = recorded_metrics("interview_agent.evaluator.coverage.unknown")
+    assert dict(unknown.attributes) == interview
+
+
+async def test_streaming_stt_latency_is_the_transcript_delay_labelled_with_the_stt_model(
+    recorded_metrics,
+):
+    telemetry = Telemetry(None, uuid.uuid4(), Settings(_env_file=None), {})
+    models = {"stt_model": "assemblyai/test", "tts_model": "cartesia/test"}
+    record_voice_metrics(
+        telemetry,
+        EOUMetrics(
+            timestamp=time.time(),
+            end_of_utterance_delay=0.6,
+            transcription_delay=0.25,
+            on_user_turn_completed_delay=0.01,
+            speech_id="speech-1",
+            # LiveKit describes the turn detector here, not the STT.
+            metadata=Metadata(model_name="turn-detector", model_provider="livekit"),
+        ),
+        **models,
+    )
+    await telemetry.drain()
+    (delay,) = recorded_metrics("interview_agent.eou.transcription_seconds")
+    attributes = dict(delay.attributes)
+    assert (attributes["source"], attributes["model"]) == ("livekit", "assemblyai/test")
+    assert "resolved_model" not in attributes and "provider" not in attributes
+    assert delay.sum == 0.25
+    (end_of_turn,) = recorded_metrics("interview_agent.eou.end_of_utterance_seconds")
+    assert dict(end_of_turn.attributes)["model"] == "assemblyai/test"
 
 
 async def test_slow_langsmith_export_is_not_on_llm_response_path(monkeypatch):

@@ -1,7 +1,8 @@
 import { createFileRoute } from "@tanstack/react-router"
 import * as React from "react"
 
-import { MASCOT_STATE_LABELS, Mascot, type MascotState } from "@/components/mascot"
+import { MASCOT_STATE_LABELS, Mascot } from "@/components/mascot"
+import type { MascotState } from "@/components/mascot"
 
 export const Route = createFileRoute("/mascot-lab")({ component: Lab })
 
@@ -23,7 +24,20 @@ function Lab() {
         </div>
       ))}
       <div className="flex flex-col items-center">
-        <Mascot state={states[cycle % 4 === 0 ? 2 : cycle % 4 === 1 ? 3 : cycle % 4 === 2 ? 4 : 0]} className="w-40" />
+        <Mascot
+          state={
+            states[
+              cycle % 4 === 0
+                ? 2
+                : cycle % 4 === 1
+                  ? 3
+                  : cycle % 4 === 2
+                    ? 4
+                    : 0
+            ]
+          }
+          className="w-40"
+        />
         <span>cycling</span>
       </div>
       <div className="flex flex-col items-center">

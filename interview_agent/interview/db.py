@@ -149,6 +149,9 @@ class Conversation(Base):
     stt_drain: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     farewell_status: Mapped[str | None] = mapped_column(Text)
     evaluation_claim_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    # Browser response-onset samples accepted so far; bounds what one
+    # interview's participant token can send.
+    response_onset_samples: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     # lazy="selectin": async sessions cannot lazy-load on attribute access
     # (MissingGreenlet), so both relationships load eagerly with the parent.
@@ -515,20 +518,6 @@ class Evidence(Base):
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
 
-class MetricEvent(Base):
-    __tablename__ = "metric_events"
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
-        ForeignKey("conversations.id", ondelete="CASCADE"), index=True
-    )
-    turn_id: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), index=True)
-    component: Mapped[str] = mapped_column(Text)
-    name: Mapped[str] = mapped_column(Text)
-    value: Mapped[float | None] = mapped_column(Float)
-    dimensions: Mapped[dict[str, Any]] = mapped_column(JSONB)
-
-
 class ProcessManifest(Base):
     """Effective process configuration; no source documents or credentials."""
 
@@ -565,23 +554,6 @@ class ExternalTrace(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     failures: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     last_error: Mapped[str | None] = mapped_column(Text)
-
-
-class MetricAggregate(Base):
-    """No transcript, candidate ID, or link to a purged conversation."""
-
-    __tablename__ = "metric_aggregates"
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
-    bucket_date: Mapped[datetime] = mapped_column(index=True)
-    dimensions: Mapped[dict[str, Any]] = mapped_column(JSONB)
-    component: Mapped[str] = mapped_column(Text)
-    name: Mapped[str] = mapped_column(Text)
-    count: Mapped[int] = mapped_column(Integer)
-    unknown_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
-    total: Mapped[float] = mapped_column(Float)
-    minimum: Mapped[float | None] = mapped_column(Float)
-    maximum: Mapped[float | None] = mapped_column(Float)
-    histogram: Mapped[dict[str, int]] = mapped_column(JSONB, default=dict, server_default="{}")
 
 
 class AppSettings(Base):

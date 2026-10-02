@@ -13,12 +13,13 @@ from sqlalchemy import select, update
 
 from interview_agent.config import Settings
 from interview_agent.interview import db
-from interview_agent.metrics import purge_metrics, record_metric
 from interview_agent.observability import Telemetry
 from interview_agent.privacy import (
+    MAX_FAILURES,
     ExternalDeletionWorker,
     LangSmithDeletionAPI,
     delete_conversation,
+    expire_detail,
     guarded_export,
     register_trace,
     retire_traces,
@@ -64,8 +65,8 @@ async def make_due(sessionmaker, identifier):
         await session.commit()
 
 
-async def test_content_is_exported_until_the_tombstone_then_nothing_and_rollups_survive(
-    postgres_sessionmaker, monkeypatch
+async def test_content_is_exported_until_the_tombstone_then_nothing_and_metrics_stay_anonymous(
+    postgres_sessionmaker, monkeypatch, recorded_metrics
 ):
     cid, _ = await setup_trace(postgres_sessionmaker)
     client = Mock()
@@ -96,10 +97,11 @@ async def test_content_is_exported_until_the_tombstone_then_nothing_and_rollups_
     assert "CANARY_ANSWER" in str(runs["interviewer"]["inputs"])
     # ...while metadata (filters) keeps only our own categories.
     assert "CANARY_METADATA" not in str(client.mock_calls)
+    # Metrics never link back to the interview, so its deletion leaves them be.
+    (sample,) = recorded_metrics("interview_agent.planner.duration_seconds")
+    assert "trace_id" not in sample.attributes
     async with postgres_sessionmaker() as session:
         assert await delete_conversation(session, cid)
-        assert list(await session.scalars(select(db.MetricEvent))) == []
-        assert len(list(await session.scalars(select(db.MetricAggregate)))) == 1
         row = await session.get(db.ExternalTrace, telemetry.trace_id)
         assert row.state == "pending" and row.conversation_id is None
     before = len(client.mock_calls)
@@ -165,8 +167,9 @@ class FakeAPI:
 
 
 async def test_submission_ack_is_pending_until_external_query_verifies_removal(
-    postgres_sessionmaker,
+    postgres_sessionmaker, recorded_metrics
 ):
+    completed = "interview_agent.privacy.external_deletions_completed"
     cid, tid = await setup_trace(postgres_sessionmaker)
     async with postgres_sessionmaker() as session:
         await retire_traces(session, conversation_id=cid)
@@ -181,6 +184,7 @@ async def test_submission_ack_is_pending_until_external_query_verifies_removal(
     await worker.once()  # root/children still exist
     async with postgres_sessionmaker() as session:
         assert (await session.get(db.ExternalTrace, tid)).state == "verifying"
+    assert recorded_metrics(completed) == []  # accepted is not deleted
     api.missing = True
     await make_due(postgres_sessionmaker, tid)
     await worker.once()
@@ -188,6 +192,8 @@ async def test_submission_ack_is_pending_until_external_query_verifies_removal(
         row = await session.get(db.ExternalTrace, tid)
         assert row.state == "completed" and row.deleted_at is not None
         assert row.conversation_id is None and row.project_name == ""
+    (point,) = recorded_metrics(completed)
+    assert point.value == 1 and dict(point.attributes) == {}
     # Re-registering after a process restart cannot resurrect the same trace.
     await register_trace(postgres_sessionmaker, tid, cid, settings())
     assert not await guarded_export(postgres_sessionmaker, tid, lambda: pytest.fail("reexport"))
@@ -195,7 +201,7 @@ async def test_submission_ack_is_pending_until_external_query_verifies_removal(
 
 
 async def test_submission_retries_reserved_durably_and_failure_messages_redacted(
-    postgres_sessionmaker,
+    postgres_sessionmaker, recorded_metrics
 ):
     cid, tid = await setup_trace(postgres_sessionmaker)
     async with postgres_sessionmaker() as session:
@@ -213,48 +219,133 @@ async def test_submission_retries_reserved_durably_and_failure_messages_redacted
         assert "CANARY_SECRET" not in str(row.last_error)
     assert len(api.submitted) == 3
     assert not await worker.once()
+    # Transient errors are retried, not counted; giving up counts once.
+    (point,) = recorded_metrics("interview_agent.privacy.external_deletions_failed")
+    assert point.value == 1 and dict(point.attributes) == {"error_type": "submission_limit"}
 
 
-async def test_external_detail_retention_unlinks_trace_and_keeps_anonymous_rollup(
-    postgres_sessionmaker,
+@pytest.mark.parametrize("cause", ["verification_deadline", "failures"])
+async def test_a_deletion_given_up_is_counted_once_with_its_reason(
+    postgres_sessionmaker, recorded_metrics, cause
 ):
     cid, tid = await setup_trace(postgres_sessionmaker)
     async with postgres_sessionmaker() as session:
-        await record_metric(
-            session,
-            db.MetricEvent(
-                id=uuid.uuid4(),
-                conversation_id=cid,
-                component="graph",
-                name="duration_seconds",
-                value=2,
-                dimensions={"trace_id": str(tid), "language": "es"},
-            ),
-        )
+        await retire_traces(session, conversation_id=cid)
+        await session.commit()
+    api = FakeAPI()
+    worker = ExternalDeletionWorker(postgres_sessionmaker, settings(), api=api)
+    assert await worker.once()  # submitted, now verifying
+    if cause == "verification_deadline":
+        async with postgres_sessionmaker() as session:
+            await session.execute(
+                update(db.ExternalTrace)
+                .where(db.ExternalTrace.id == tid)
+                .values(deletion_requested_at=datetime.now(UTC) - timedelta(days=15))
+            )
+            await session.commit()
+        rounds, reason = 1, "verification_deadline"
+    else:
+
+        async def unreachable(tid, pid, since):
+            raise ConnectionError("CANARY_SECRET")
+
+        api.absent = unreachable
+        rounds, reason = MAX_FAILURES, "ConnectionError"
+    for _ in range(rounds):
+        await make_due(postgres_sessionmaker, tid)
+        await worker.once()
+    async with postgres_sessionmaker() as session:
+        row = await session.get(db.ExternalTrace, tid)
+        assert row.state == "failed" and row.last_error == reason
+    assert not await worker.once()
+    (point,) = recorded_metrics("interview_agent.privacy.external_deletions_failed")
+    assert point.value == 1 and dict(point.attributes) == {"error_type": reason}
+    assert recorded_metrics("interview_agent.privacy.external_deletions_completed") == []
+
+
+async def expire(sessionmaker, trace_id):
+    async with sessionmaker() as session:
         await session.execute(
             update(db.ExternalTrace)
-            .where(db.ExternalTrace.id == tid)
+            .where(db.ExternalTrace.id == trace_id)
             .values(expires_at=datetime.now(UTC) - timedelta(seconds=1))
         )
         await session.commit()
-        await purge_metrics(session)
+
+
+async def manifest(sessionmaker, days_old):
+    identifier = uuid.uuid4()
+    async with sessionmaker() as session:
+        session.add(
+            db.ProcessManifest(
+                id=identifier,
+                role="api",
+                snapshot={"id": str(identifier)},
+                created_at=datetime.now(UTC) - timedelta(days=days_old),
+            )
+        )
+        await session.commit()
+    return identifier
+
+
+async def test_detail_expiry_retires_expired_traces_and_old_manifests_only(postgres_sessionmaker):
+    cid, tid = await setup_trace(postgres_sessionmaker)
+    current_cid, current_tid = await setup_trace(postgres_sessionmaker)
+    await expire(postgres_sessionmaker, tid)
+    await manifest(postgres_sessionmaker, days_old=31)
+    recent = await manifest(postgres_sessionmaker, days_old=29)
+    async with postgres_sessionmaker() as session:
+        await expire_detail(session, 30)
+    async with postgres_sessionmaker() as session:
         row = await session.get(db.ExternalTrace, tid)
         assert row.state == "pending" and row.conversation_id is None
+        # Only the trace leaves: the interview itself follows RETENTION_DAYS.
         assert await session.get(db.Conversation, cid)
-        assert list(await session.scalars(select(db.MetricEvent))) == []
-        await record_metric(
-            session,
-            db.MetricEvent(
-                id=uuid.uuid4(),
-                conversation_id=cid,
-                component="graph",
-                name="duration_seconds",
-                value=99,
-                dimensions={"trace_id": str(tid)},
-            ),
+        current = await session.get(db.ExternalTrace, current_tid)
+        assert current.state == "active" and current.conversation_id == current_cid
+        manifests = set(await session.scalars(select(db.ProcessManifest.id)))
+        assert manifests == {recent}
+
+
+async def test_purge_loop_expires_detail_before_the_retention_purge(
+    postgres_sessionmaker, monkeypatch
+):
+    from interview_agent.server import app as server_app
+
+    cid, tid = await setup_trace(postgres_sessionmaker)
+    retained_cid, retained_tid = await setup_trace(postgres_sessionmaker)
+    await expire(postgres_sessionmaker, tid)
+    await manifest(postgres_sessionmaker, days_old=31)
+    recent = await manifest(postgres_sessionmaker, days_old=29)
+    async with postgres_sessionmaker() as session:
+        await session.execute(
+            update(db.Conversation)
+            .where(db.Conversation.id == retained_cid)
+            .values(created_at=datetime.now(UTC) - timedelta(days=8))
         )
-        assert list(await session.scalars(select(db.MetricEvent))) == []
-        assert (await session.scalars(select(db.MetricAggregate))).one().total == 2
+        await session.commit()
+    monkeypatch.setattr(server_app.settings, "metrics_detail_days", 30)
+    monkeypatch.setattr(server_app.settings, "retention_days", 7)
+    sleep = asyncio.sleep
+
+    async def one_cycle(seconds, *args, **kwargs):
+        if seconds == server_app._PURGE_INTERVAL_SECONDS:
+            raise asyncio.CancelledError
+        return await sleep(seconds, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", one_cycle)
+    with pytest.raises(asyncio.CancelledError):
+        await server_app._purge_loop(postgres_sessionmaker)
+    async with postgres_sessionmaker() as session:
+        # Expired LangSmith detail is retired; the interview itself is kept.
+        expired = await session.get(db.ExternalTrace, tid)
+        assert expired.state == "pending" and expired.conversation_id is None
+        assert await session.get(db.Conversation, cid)
+        assert set(await session.scalars(select(db.ProcessManifest.id))) == {recent}
+        # RETENTION_DAYS still deletes old interviews and tombstones their traces.
+        assert await session.get(db.Conversation, retained_cid) is None
+        retained = await session.get(db.ExternalTrace, retained_tid)
+        assert retained.state == "pending" and retained.conversation_id is None
 
 
 async def test_missing_credentials_stays_visible_without_spending_retry_budget(

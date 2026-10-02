@@ -80,8 +80,13 @@ class Settings(BaseSettings):
     langsmith_endpoint: str = Field(
         default="https://api.smith.langchain.com", alias="LANGSMITH_ENDPOINT"
     )
-    metrics_retention_days: int = Field(default=365, alias="METRICS_RETENTION_DAYS", ge=1)
     metrics_detail_days: int = Field(default=30, alias="METRICS_DETAIL_DAYS", ge=1)
+    # Anonymous metrics over OTLP/HTTP (see otel_metrics); empty: none leave the
+    # process. Read here: pydantic-settings never exports .env to os.environ.
+    otel_exporter_otlp_endpoint: str = Field(default="", alias="OTEL_EXPORTER_OTLP_ENDPOINT")
+    otel_exporter_otlp_headers: str = Field(
+        default="", alias="OTEL_EXPORTER_OTLP_HEADERS", repr=False
+    )
     closing_timeout_seconds: int = Field(default=20, alias="CLOSING_TIMEOUT_SECONDS", ge=5, le=60)
 
     # LiveKit: key/secret auth the Inference gateway (STT/TTS); the server URL

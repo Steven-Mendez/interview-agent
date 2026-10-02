@@ -55,7 +55,11 @@ def _promote(conv):
             ).total_seconds() > conv.closing_audio_timeout_seconds
 
 
-async def acknowledge_playback(sessionmaker, conversation_id, ack: PlaybackAck) -> dict:
+async def acknowledge_playback(
+    sessionmaker, conversation_id, ack: PlaybackAck
+) -> tuple[dict, bool]:
+    """The response, and whether this call stored the attempt's first ACK: the
+    browser repeats it until one is accepted."""
     async with sessionmaker() as session:
         conv = await session.scalar(
             select(db.Conversation).where(db.Conversation.id == conversation_id).with_for_update()
@@ -65,10 +69,11 @@ async def acknowledge_playback(sessionmaker, conversation_id, ack: PlaybackAck) 
         if not _matches(conv, ack):
             raise ValueError("Playback acknowledgement does not match the closure attempt")
         if conv.farewell_status == "played" and conv.closing_ack_status == "played":
-            return {"accepted": True, "status": "played", "provisional": False}
+            return {"accepted": True, "status": "played", "provisional": False}, False
         now = await session.scalar(select(func.clock_timestamp()))
         if conv.closing_ack_deadline_at is None or now > conv.closing_ack_deadline_at:
-            return {"accepted": False, "reason": "expired"}
+            return {"accepted": False, "reason": "expired"}, False
+        first = conv.closing_ack_received_at is None
         if conv.closing_ack_status != "played":
             conv.closing_ack_status = ack.status
             conv.closing_ack_received_at = now
@@ -81,7 +86,7 @@ async def acknowledge_playback(sessionmaker, conversation_id, ack: PlaybackAck) 
             "accepted": True,
             "status": conv.farewell_status,
             "provisional": conv.closing_ack_status == "played" and conv.farewell_status != "played",
-        }
+        }, first
 
 
 async def record_delivery(

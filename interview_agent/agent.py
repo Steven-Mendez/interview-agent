@@ -47,6 +47,7 @@ from livekit.agents.voice import room_io
 from livekit.plugins import silero
 from sqlalchemy import func, select
 
+from interview_agent import otel_metrics
 from interview_agent.closing import ClosingCoordinator
 from interview_agent.config import settings
 from interview_agent.interview import db
@@ -91,10 +92,12 @@ _RESUME_MAX_MESSAGES = 160
 
 
 def prewarm(proc: JobProcess) -> None:
-    """Load the Silero VAD once per worker process so every job reuses it, and
-    bind LiveKit's spans to LangSmith before the first job starts any."""
+    """Load the Silero VAD once per worker process so every job reuses it,
+    bind LiveKit's spans to LangSmith before the first job starts any, and give
+    the process its own metrics provider (the parent running run() has none)."""
     proc.userdata["vad"] = silero.VAD.load()
     proc.userdata["voice_tracing"] = configure_voice_tracing(settings)
+    otel_metrics.configure(settings, "interview-agent-worker")
 
 
 def _conversation_id_from_job(ctx: JobContext) -> uuid.UUID | None:
@@ -441,6 +444,22 @@ async def _trigger_evaluation(
             "evaluation never triggered for %s; retry it from the UI",
             conversation_id,
         )
+
+
+_METRICS_FLUSH_SECONDS = 4
+
+
+async def _flush_metrics(telemetry: Telemetry) -> None:
+    """The job's process exits after its interview: export what it recorded,
+    off the event loop and bounded; a failure only logs. A displaced worker
+    never drains its telemetry, so samples still in flight get a moment."""
+    try:
+        if telemetry.pending:
+            await asyncio.wait(list(telemetry.pending), timeout=1)
+        # The flush bounds itself: an abandoned to_thread would hold the exit.
+        await asyncio.to_thread(otel_metrics.force_flush, _METRICS_FLUSH_SECONDS * 1000)
+    except Exception:
+        logger.warning("Metrics flush did not complete")
 
 
 async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
@@ -967,6 +986,7 @@ async def _run_interview_job(ctx, conversation_id, engine, sessionmaker, startup
             if not task.done():
                 task.cancel()
                 task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            await _flush_metrics(telemetry)
             try:
                 async with asyncio.timeout(2):
                     await engine.dispose()

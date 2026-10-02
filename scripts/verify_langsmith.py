@@ -264,17 +264,8 @@ async def inspect(conversation_id: uuid.UUID) -> int:
                     .order_by(db.ExternalTrace.created_at)
                 )
             )
-            errors = list(
-                await session.scalars(
-                    select(db.MetricEvent).where(
-                        db.MetricEvent.conversation_id == conversation_id,
-                        db.MetricEvent.component == "telemetry",
-                    )
-                )
-            )
     finally:
         await engine.dispose()
-    print("telemetry errors:", [(e.name, e.dimensions.get("error_type")) for e in errors])
     client = Client(api_key=settings.langsmith_api_key, api_url=settings.langsmith_endpoint)
     total = 0.0
     for row in rows:

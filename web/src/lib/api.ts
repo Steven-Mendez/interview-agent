@@ -508,60 +508,6 @@ export function getInterview(interviewId: string): Promise<Interview> {
   return request<Interview>(`/interviews/${interviewId}`)
 }
 
-export interface MetricFilters {
-  days?: number
-  graph_version?: string
-  model?: string
-  language?: string
-  seniority?: string
-  length?: string
-}
-export interface MetricSeries {
-  series_id: string
-  component: string
-  name: string
-  dimensions: Record<string, string | number | boolean>
-  count: number
-  unknown_count: number
-  total: number
-  mean: number | null
-  minimum: number | null
-  maximum: number | null
-  p50: number | null
-  p95: number | null
-}
-export interface MetricsReport {
-  days: number
-  items: MetricSeries[]
-  facets: Record<string, string[]>
-  percentiles: { method: string; relative_bucket_width: number }
-}
-export interface MetricTraceEvent {
-  id: string
-  created_at: string
-  component: string
-  name: string
-  value: number | null
-  dimensions: Record<string, string | number | boolean>
-}
-function metricQuery(params: MetricFilters & { trace_id?: string }): string {
-  return new URLSearchParams(
-    Object.entries(params)
-      .filter(([, value]) => value !== undefined && value !== "")
-      .map(([key, value]) => [key, String(value)])
-  ).toString()
-}
-export function getMetrics(
-  filters: MetricFilters = {}
-): Promise<MetricsReport> {
-  return request<MetricsReport>(`/metrics?${metricQuery(filters)}`)
-}
-export function getMetricTraces(
-  filters: MetricFilters & { trace_id?: string } = {}
-): Promise<{ items: MetricTraceEvent[]; has_more: boolean }> {
-  return request(`/metrics/traces?${metricQuery(filters)}`)
-}
-
 export function getInterviewToken(interviewId: string): Promise<TokenResponse> {
   return request<TokenResponse>(`/interviews/${interviewId}/token`)
 }
@@ -698,23 +644,4 @@ export function createReviewedSnapshot(
     method: "POST",
     body: JSON.stringify(body),
   })
-}
-
-export interface ExternalDeletionReport {
-  counts: Partial<Record<string, number>>
-  items: {
-    id: string
-    state: string
-    attempts: number
-    failures: number
-    last_error: string | null
-    requested_at: string | null
-    submitted_at: string | null
-    verified_at: string | null
-    next_attempt_at: string | null
-  }[]
-}
-
-export function getExternalDeletions() {
-  return request<ExternalDeletionReport>("/metrics/deletions")
 }

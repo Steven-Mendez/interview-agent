@@ -10,6 +10,7 @@ from datetime import timedelta
 
 from sqlalchemy import func, select
 
+from interview_agent import otel_metrics
 from interview_agent.interview import db
 from interview_agent.interview.workers import (
     DATABASE_SECONDS,
@@ -17,7 +18,6 @@ from interview_agent.interview.workers import (
     REPLACEMENT_SECONDS,
     last_activity,
 )
-from interview_agent.metrics import record_metric
 
 logger = logging.getLogger(__name__)
 SWEEP_SECONDS = 5
@@ -128,20 +128,9 @@ async def reconcile_interview(session, conversation_id, settings):
         ("reconciled", 1),
         ("playback_confirmed", int(farewell == "played")),
     ):
-        try:
-            await record_metric(
-                session,
-                db.MetricEvent(
-                    id=uuid.uuid5(uuid.NAMESPACE_URL, f"reconciled:{conversation_id}:{name}"),
-                    conversation_id=conversation_id,
-                    component="closing",
-                    name=name,
-                    value=value,
-                    dimensions={"farewell_status": farewell, "source": "lifecycle_sweeper"},
-                ),
-            )
-        except Exception:
-            logger.exception("Lifecycle sweep metric could not be persisted")
+        otel_metrics.record(
+            "closing", name, value, {"farewell_status": farewell, "source": "lifecycle_sweeper"}
+        )
     return "sealed_partial"
 
 
@@ -183,37 +172,25 @@ class LifecycleSweeper:
             changed += await self.evaluations.reconcile_pending()
         return changed, failures
 
-    async def metric(self, name, value):
-        try:
-            async with asyncio.timeout(DATABASE_SECONDS), self.sessions() as session:
-                await record_metric(
-                    session,
-                    db.MetricEvent(
-                        id=uuid.uuid4(),
-                        component="server",
-                        name=name,
-                        value=value,
-                        dimensions={"source": "lifecycle_sweeper"},
-                    ),
-                )
-        except Exception:
-            logger.exception("Lifecycle sweep metric could not be persisted")
+    def metric(self, name, value):
+        # Server health: no interview or candidate behind these samples.
+        otel_metrics.record("server", name, value, {"source": "lifecycle_sweeper"})
 
     async def run(self):
         next_sweep = time.monotonic()
         while True:
             started = time.monotonic()
-            await self.metric("sweep_lag_seconds", max(0, started - next_sweep))
+            self.metric("sweep_lag_seconds", max(0, started - next_sweep))
             try:
                 changed, failures = await self.once()
-                await self.metric("sweep_reconciled", changed)
-                await self.metric("sweep_errors", failures)
+                self.metric("sweep_reconciled", changed)
+                self.metric("sweep_errors", failures)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("Lifecycle sweep failed")
-                await self.metric("sweep_errors", 1)
-            await self.metric("sweep_duration_seconds", time.monotonic() - started)
+                self.metric("sweep_errors", 1)
+            self.metric("sweep_duration_seconds", time.monotonic() - started)
             next_sweep += SWEEP_SECONDS
             # If a sweep was slow, don't busy-loop to replay missed cycles.
             next_sweep = max(next_sweep, time.monotonic())

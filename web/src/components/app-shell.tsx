@@ -1,7 +1,6 @@
 import * as React from "react"
 import { Link, useRouterState } from "@tanstack/react-router"
 import {
-  ChartNoAxesColumnIcon,
   HistoryIcon,
   HomeIcon,
   MenuIcon,
@@ -62,12 +61,6 @@ export function useImmersive(active = true) {
 const NAV_ITEMS = [
   { to: "/", label: "Home", icon: HomeIcon, exact: true },
   { to: "/interviews", label: "History", icon: HistoryIcon, exact: false },
-  {
-    to: "/metrics",
-    label: "Metrics",
-    icon: ChartNoAxesColumnIcon,
-    exact: false,
-  },
   { to: "/settings", label: "Settings", icon: SettingsIcon, exact: false },
 ] as const
 

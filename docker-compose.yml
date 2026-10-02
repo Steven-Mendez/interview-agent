@@ -1,18 +1,23 @@
-# Full stack: FastAPI app + LiveKit worker + Postgres.
+# Full stack: FastAPI app + LiveKit worker + Postgres + Grafana (lgtm).
 #   docker compose up -d --build          # everything (needs .env with keys)
-#   docker compose up -d postgres         # database only (local uv dev mode)
+#   docker compose up -d postgres lgtm    # database and metrics (local uv dev mode)
+#   docker compose up -d lgtm             # Grafana only, on http://localhost:3001
 #
-# The Postgres host port only matters for dev mode and must match
-# DATABASE_URL in .env; inside the compose network the services
-# talk over the container ports directly (see x-app-env).
+# The Postgres and OTLP host ports only matter for dev mode and must match
+# DATABASE_URL and OTEL_EXPORTER_OTLP_ENDPOINT (http://localhost:4318) in
+# .env; inside the compose network the services talk over the container
+# ports directly (see x-app-env).
 
 # Shared by migrate/app/worker: secrets/tuning come from .env; the connection
 # URLs are overridden to point at the compose services instead of host ports.
+# Any OTLP headers in .env belong to the .env endpoint, not to lgtm.
 x-app-env: &app-env
   env_file: .env
   environment:
     DATABASE_URL: postgresql+asyncpg://interview:interview@postgres:5432/interview
     APP_BASE_URL: http://app:8000
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://lgtm:4318
+    OTEL_EXPORTER_OTLP_HEADERS: ""
 
 services:
   # One-shot: applies the schema before app/worker start, and exactly once
@@ -38,6 +43,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      lgtm:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/healthz')"]
       interval: 5s
@@ -60,6 +67,30 @@ services:
       app:
         # The worker calls the app (APP_BASE_URL) to auto-trigger evaluation.
         condition: service_healthy
+      lgtm:
+        condition: service_started
+
+  # Grafana, Prometheus and an OpenTelemetry collector in one container; the
+  # app and the worker push their metrics to it over OTLP/HTTP. Grafana lets
+  # anyone in as admin, which is the image's default for local use.
+  lgtm:
+    image: grafana/otel-lgtm:0.34.0
+    restart: unless-stopped
+    # No env_file: when OTEL_EXPORTER_OTLP_ENDPOINT is set, the image also
+    # forwards everything it receives there, and the .env value is this port.
+    environment:
+      # Native histograms (what histogram_quantile needs) are always on in this
+      # image's Prometheus 3.14, where --enable-feature=native-histograms is a
+      # no-op. This flag stores each OTLP series' start time as a 0 sample, so
+      # rate() and increase() also count the first observations of the new
+      # series every worker job starts.
+      PROMETHEUS_EXTRA_ARGS: --enable-feature=created-timestamp-zero-ingestion
+    ports:
+      - "3001:3000"
+      - "4318:4318"
+    volumes:
+      - ./infra/grafana/dashboards:/otel-lgtm/grafana/conf/provisioning/dashboards/custom:ro
+      - ./infra/grafana/provisioning.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/custom.yaml:ro
 
   postgres:
     image: postgres:16-alpine

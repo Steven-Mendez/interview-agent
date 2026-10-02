@@ -477,7 +477,7 @@ async def test_durable_ack_is_authoritative_after_rpc_cancellation(
         524,
         "audio/wav",
     )
-    received = await acknowledge_playback(
+    received, _first = await acknowledge_playback(
         postgres_sessionmaker,
         conversation_id,
         PlaybackAck.model_validate_json(ack(owner, status=status)),

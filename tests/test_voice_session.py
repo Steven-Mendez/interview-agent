@@ -22,6 +22,7 @@ from interview_agent.interview import db
 from interview_agent.interview.context import MAX_RESUME_CHARS
 from interview_agent.interview.dialogue import DialogueLLM
 from interview_agent.interview.workers import WorkerCoordinator, WorkerOwnershipError
+from interview_agent.observability import Telemetry
 from interview_agent.playback import closing_state
 
 
@@ -105,7 +106,7 @@ async def test_invalid_worker_context_marks_failure_closes_room_and_releases_eng
     ],
 )
 async def test_worker_reaches_session_start_with_a_real_unconnected_room(
-    monkeypatch, postgres_sessionmaker, reconnecting, displaced, recovering
+    monkeypatch, postgres_sessionmaker, recorded_metrics, reconnecting, displaced, recovering
 ):
     conversation_id = uuid.uuid4()
     async with postgres_sessionmaker() as transaction:
@@ -159,6 +160,19 @@ async def test_worker_reaches_session_start_with_a_real_unconnected_room(
         agent.db, "create_engine_and_sessionmaker", lambda *args: (engine, postgres_sessionmaker)
     )
     monkeypatch.setattr(agent, "_trigger_evaluation", AsyncMock())
+    exported = []
+
+    def flush(*args, **kwargs):
+        # What leaves the job's process when its interview ends.
+        exported.append(
+            {
+                name: len(recorded_metrics(f"interview_agent.{name}"))
+                for name in ("closing.playback_confirmed", "worker.ownership_lost")
+            }
+        )
+        return True
+
+    monkeypatch.setattr(agent.otel_metrics, "force_flush", flush)
     session = AgentSession(vad=None)
     # Provider/audio startup alone is doubled. Ownership, PostgreSQL fencing,
     # subscriptions and the pre-connect Room.local_participant guard are real.
@@ -207,6 +221,12 @@ async def test_worker_reaches_session_start_with_a_real_unconnected_room(
         assert await replacement.claim()
     await callbacks[0]()
     engine.dispose.assert_awaited_once()
+    # Every end path exports once, its last samples included.
+    assert exported == [
+        {"closing.playback_confirmed": 0, "worker.ownership_lost": 1}
+        if displaced
+        else {"closing.playback_confirmed": 1, "worker.ownership_lost": 0}
+    ]
     async with postgres_sessionmaker() as transaction:
         conversation = await db.get_conversation(transaction, conversation_id)
         if displaced:
@@ -231,6 +251,24 @@ async def test_worker_reaches_session_start_with_a_real_unconnected_room(
     if recovering:
         state = await closing_state(postgres_sessionmaker, conversation_id)
         assert 0 <= state["remaining_seconds"] <= 5
+
+
+async def test_end_of_interview_flush_waits_briefly_for_samples_in_flight(
+    recorded_metrics, monkeypatch
+):
+    exported = []
+
+    def flush(*args, **kwargs):
+        exported.append(len(recorded_metrics("interview_agent.worker.ownership_lost")))
+        return True
+
+    monkeypatch.setattr(agent.otel_metrics, "force_flush", flush)
+    # Deferred dimensions hold the sample back for a moment, as a busy loop would.
+    telemetry = Telemetry(None, uuid.uuid4(), settings, defer_dimensions=True)
+    telemetry.emit("worker", "ownership_lost", 1)
+    asyncio.get_running_loop().call_later(0.05, telemetry.resolve_dimensions, {})
+    await agent._flush_metrics(telemetry)
+    assert exported == [1]
 
 
 class LocalEndOfTurnDetector:

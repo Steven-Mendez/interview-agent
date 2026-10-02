@@ -174,7 +174,7 @@ class ClosingCoordinator:
             or data.get("attempt_id") != str(self.attempt_id)
         ):
             raise ValueError("Playback acknowledgement does not match this closure attempt")
-        result = await self._bounded(
+        result, _first = await self._bounded(
             acknowledge_playback(
                 self.sessionmaker, self.conversation_id, PlaybackAck.model_validate(data)
             ),

@@ -14,14 +14,22 @@ if os.environ.get("RUN_LIVE_LLM_TESTS") != "1":
 os.environ["LANGSMITH_API_KEY"] = ""
 os.environ["LANGSMITH_PROJECT"] = "interview-agent"
 os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
+# Nor to the developer's metrics collector; metric tests read their own
+# in-memory reader (the recorded_metrics fixture).
+os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = ""
+os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = ""
 
 import pytest
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.community.postgres import PostgresContainer
 
+from interview_agent import otel_metrics
+from interview_agent.config import Settings
 from interview_agent.interview import db
+from interview_agent.runtime import EXPECTED_REVISION
 
 
 @pytest.fixture(scope="session")
@@ -72,8 +80,35 @@ async def postgres_sessionmaker(integration_database_url):
         await connection.execute(
             text("CREATE TABLE alembic_version (version_num varchar(32) PRIMARY KEY)")
         )
-        await connection.execute(text("INSERT INTO alembic_version VALUES ('34ae6815db20')"))
+        await connection.execute(
+            text("INSERT INTO alembic_version VALUES (:revision)"), {"revision": EXPECTED_REVISION}
+        )
     try:
         yield sessionmaker
     finally:
         await engine.dispose()
+
+
+@pytest.fixture
+def recorded_metrics():
+    """This process's metrics in memory instead of OTLP. Calling the helper with
+    a full metric name (interview_agent.<component>.<name>) returns its data
+    points so far; recording is unconfigured again afterwards."""
+    reader = InMemoryMetricReader()
+    otel_metrics.configure(Settings(_env_file=None), "interview-agent-test", reader=reader)
+
+    def points(name: str) -> list:
+        data = reader.get_metrics_data()
+        return [
+            point
+            for resource in (data.resource_metrics if data else [])
+            for scope in resource.scope_metrics
+            for metric in scope.metrics
+            if metric.name == name
+            for point in metric.data.data_points
+        ]
+
+    try:
+        yield points
+    finally:
+        otel_metrics.shutdown()

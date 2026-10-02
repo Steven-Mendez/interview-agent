@@ -62,8 +62,8 @@ class MetadataFormatter(logging.Formatter):
     """Never stringify runtime arguments, extras or exception messages.
 
     Only reviewed literal application templates and bounded numeric fields are
-    emitted. Session identifiers remain in retained SQL metrics, not log files
-    that cannot participate in conversation cascade deletion.
+    emitted. Session identifiers stay in SQL, not in log files that cannot
+    participate in conversation cascade deletion.
     """
 
     def format(self, record: logging.LogRecord) -> str:

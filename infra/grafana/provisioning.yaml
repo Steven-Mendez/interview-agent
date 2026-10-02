@@ -1,0 +1,12 @@
+# Grafana dashboard provider for the local grafana/otel-lgtm container:
+# docker-compose.yml mounts this file and the dashboards/ directory next to it.
+apiVersion: 1
+
+providers:
+  - name: Interview Agent
+    type: file
+    folder: Interview Agent
+    folderUid: interview-agent
+    options:
+      path: /otel-lgtm/grafana/conf/provisioning/dashboards/custom
+      foldersFromFilesStructure: false

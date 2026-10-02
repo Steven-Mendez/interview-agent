@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from hashlib import sha256
 from typing import Any
 
@@ -26,10 +26,10 @@ from fastapi import APIRouter, Form, HTTPException, Query, Request, UploadFile
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from livekit import api
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import func, select, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from interview_agent import otel_metrics
 from interview_agent.closing import FAREWELLS
 from interview_agent.config import settings
 from interview_agent.interview import db
@@ -40,7 +40,6 @@ from interview_agent.interview.planner import run_planner
 from interview_agent.interview.seals import result_invalid, seal_invalid
 from interview_agent.interview.workers import reconnect_deadline
 from interview_agent.llm import summarize_usage
-from interview_agent.metrics import apply_filters, metrics_report, record_metric
 from interview_agent.observability import (
     LLMObserver,
     Telemetry,
@@ -89,47 +88,29 @@ async def acknowledge_farewell(request: Request, interview_id: uuid.UUID, body: 
     _verify_playback_participant(request, interview_id)
     try:
         async with asyncio.timeout(3):
-            result = await acknowledge_playback(_sessionmaker(request), interview_id, body)
+            result, first = await acknowledge_playback(_sessionmaker(request), interview_id, body)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="Interview not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except TimeoutError as exc:
         raise HTTPException(status_code=503, detail="Playback confirmation pending") from exc
-    if result.get("accepted") and body.audio_output is not None:
-        await _record_audio_output(request, interview_id, body, result.get("status"))
+    # Once per closing attempt: the browser repeats its ACK until one is accepted.
+    if first and body.audio_output is not None:
+        otel_metrics.record(
+            "browser",
+            "farewell_audio_output",
+            1,
+            {"audio_output": body.audio_output, "farewell_status": result["status"] or body.status},
+        )
     return result
-
-
-async def _record_audio_output(request, interview_id, body: PlaybackAck, status) -> None:
-    """One idempotent metric per closing attempt; never blocks the ACK."""
-    try:
-        async with asyncio.timeout(2), _sessionmaker(request)() as session:
-            await record_metric(
-                session,
-                db.MetricEvent(
-                    id=uuid.uuid5(
-                        uuid.NAMESPACE_URL,
-                        f"audio-output:{body.closing_id}:{body.attempt_id}",
-                    ),
-                    conversation_id=interview_id,
-                    component="browser",
-                    name="farewell_audio_output",
-                    value=1,
-                    dimensions={
-                        "audio_output": body.audio_output,
-                        "farewell_status": status or body.status,
-                    },
-                ),
-            )
-    except Exception:
-        logger.warning("Farewell audio output metric not recorded")
 
 
 class ResponseOnset(BaseModel):
     """Browser-side heuristic: candidate speech end to interviewer audio onset."""
 
     model_config = ConfigDict(extra="forbid")
+    # Fresh for every sample, which the browser never retries; only validated.
     sample_id: uuid.UUID
     seconds: float = Field(strict=True, ge=0, le=60, allow_inf_nan=False)
 
@@ -142,42 +123,45 @@ async def record_response_onset(request: Request, interview_id: uuid.UUID, body:
     """Decoded-audio timing in the browser; not loopback or physical audibility."""
     _verify_playback_participant(request, interview_id)
     async with asyncio.timeout(3), _sessionmaker(request)() as session:
-        conversation = await _load_or_404(session, interview_id)
-        recorded = await session.scalar(
-            select(func.count())
-            .select_from(db.MetricEvent)
-            .where(
-                db.MetricEvent.conversation_id == interview_id,
-                db.MetricEvent.name == "response_onset_seconds",
+        # One statement takes a slot below the cap, so concurrent samples cannot
+        # exceed it. Bookkeeping, not an interview change: updated_at stays.
+        claimed = (
+            await session.execute(
+                update(db.Conversation)
+                .where(
+                    db.Conversation.id == interview_id,
+                    db.Conversation.response_onset_samples < _MAX_ONSET_SAMPLES,
+                )
+                .values(
+                    response_onset_samples=db.Conversation.response_onset_samples + 1,
+                    updated_at=db.Conversation.updated_at,
+                )
+                .returning(db.Conversation.run_config)
             )
-        )
-        if recorded >= _MAX_ONSET_SAMPLES:
+        ).first()
+        if claimed is None:
+            exists = await session.scalar(
+                select(db.Conversation.id).where(db.Conversation.id == interview_id)
+            )
+            if exists is None:
+                raise HTTPException(status_code=404, detail="Interview not found")
             return {"accepted": False}
-        config = conversation.run_config or {}
-        try:
-            await record_metric(
-                session,
-                db.MetricEvent(
-                    id=uuid.uuid5(uuid.NAMESPACE_URL, f"onset:{interview_id}:{body.sample_id}"),
-                    conversation_id=interview_id,
-                    component="browser",
-                    name="response_onset_seconds",
-                    value=body.seconds,
-                    dimensions={
-                        "source": "browser_decoded_audio_rms",
-                        "graph_version": config.get("graph_version", "unknown"),
-                        "config_version": config.get("config_version", "unknown"),
-                        "language": config.get("language", "unknown"),
-                        "seniority": config.get("seniority", "unknown"),
-                        "length": config.get("interview_length", "unknown"),
-                        "model": (config.get("models") or {})
-                        .get("interviewer", {})
-                        .get("model", "unknown"),
-                    },
-                ),
-            )
-        except IntegrityError:
-            return {"accepted": True, "duplicate": True}
+        await session.commit()
+    config = claimed.run_config or {}
+    otel_metrics.record(
+        "browser",
+        "response_onset_seconds",
+        body.seconds,
+        {
+            "source": "browser_decoded_audio_rms",
+            "graph_version": config.get("graph_version", "unknown"),
+            "config_version": config.get("config_version", "unknown"),
+            "language": config.get("language", "unknown"),
+            "seniority": config.get("seniority", "unknown"),
+            "length": config.get("interview_length", "unknown"),
+            "model": (config.get("models") or {}).get("interviewer", {}).get("model", "unknown"),
+        },
+    )
     # Also on the interview's LangSmith trace, without delaying the browser.
     send_trace_feedback(
         _sessionmaker(request), settings, interview_id, "response_onset_seconds", body.seconds
@@ -1018,100 +1002,12 @@ async def _plan_and_persist(
         )
 
 
-@router.get("/metrics")
-async def get_metrics(
-    request: Request,
-    days: int = Query(default=30, ge=1, le=365),
-    graph_version: str | None = Query(default=None, max_length=128),
-    model: str | None = Query(default=None, max_length=128),
-    language: str | None = Query(default=None, max_length=16),
-    seniority: str | None = Query(default=None, max_length=16),
-    length: str | None = Query(default=None, max_length=16),
-):
-    filters = {
-        "graph_version": graph_version,
-        "model": model,
-        "language": language,
-        "seniority": seniority,
-        "length": length,
-    }
-    async with _sessionmaker(request)() as session:
-        return await metrics_report(session, days, filters)
-
-
 @router.get("/runtime")
 async def get_runtime_manifest(request: Request):
     manifest = getattr(request.app.state, "runtime_manifest", None)
     if manifest is None:
         raise HTTPException(status_code=503, detail="Startup configuration has not been recorded")
     return manifest
-
-
-@router.get("/metrics/manifests")
-async def get_process_manifests(request: Request):
-    async with _sessionmaker(request)() as session:
-        rows = await session.scalars(
-            select(db.ProcessManifest).order_by(db.ProcessManifest.created_at.desc()).limit(100)
-        )
-        return {"items": [row.snapshot for row in rows]}
-
-
-@router.get("/metrics/deletions")
-async def get_external_deletions(request: Request):
-    from interview_agent.privacy import deletion_report
-
-    async with _sessionmaker(request)() as session:
-        return await deletion_report(session)
-
-
-@router.get("/metrics/traces")
-async def get_metric_traces(
-    request: Request,
-    days: int = Query(default=30, ge=1, le=365),
-    trace_id: uuid.UUID | None = None,
-    limit: int = Query(default=100, ge=1, le=500),
-    graph_version: str | None = None,
-    model: str | None = None,
-    language: str | None = None,
-    seniority: str | None = None,
-    length: str | None = None,
-):
-    statement = apply_filters(
-        select(db.MetricEvent).where(
-            db.MetricEvent.created_at
-            >= datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-            - timedelta(days=days - 1)
-        ),
-        db.MetricEvent,
-        {
-            "graph_version": graph_version,
-            "model": model,
-            "language": language,
-            "seniority": seniority,
-            "length": length,
-        },
-    )
-    if trace_id is not None:
-        statement = statement.where(db.MetricEvent.dimensions["trace_id"].astext == str(trace_id))
-    statement = statement.order_by(db.MetricEvent.created_at.desc(), db.MetricEvent.id).limit(
-        limit + 1
-    )
-    async with _sessionmaker(request)() as session:
-        rows = (await session.scalars(statement)).all()
-    return {
-        "has_more": len(rows) > limit,
-        "items": [
-            {
-                "id": str(row.id),
-                "created_at": row.created_at.isoformat(),
-                "component": row.component,
-                "name": row.name,
-                "value": row.value,
-                "dimensions": row.dimensions,
-            }
-            for row in rows[:limit]
-        ],
-    }
 
 
 _HISTORY_STATUSES = (

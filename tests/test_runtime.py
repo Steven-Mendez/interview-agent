@@ -2,9 +2,11 @@
 
 import asyncio
 import json
+import os
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import asyncpg
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import select, update
@@ -17,6 +19,39 @@ from interview_agent.runtime import EXPECTED_REVISION, process_manifest, record_
 def test_configuration_rejects_reconnect_longer_than_drain():
     with pytest.raises(ValidationError, match="drain"):
         Settings(_env_file=None, WORKER_DRAIN_MINUTES=1, INTERVIEW_RECONNECT_SECONDS=120)
+
+
+async def test_engine_pings_pooled_connections_before_reusing_them():
+    # A suspended Neon compute drops idle connections; without the ping the
+    # first request after a pause would fail on a dead pooled connection.
+    engine, _ = db.create_engine_and_sessionmaker("postgresql+asyncpg://user:pass@db.invalid/app")
+    try:
+        assert engine.sync_engine.pool._pre_ping is True
+    finally:
+        await engine.dispose()
+
+
+async def test_engine_refuses_verify_full_without_a_ca_bundle(monkeypatch, tmp_path):
+    # infra/neon's DATABASE_URL asks for ssl=verify-full: with no PGSSLROOTCERT
+    # (and no ~/.postgresql/root.crt) asyncpg must fail before connecting rather
+    # than accept an unverified certificate as ssl=require would.
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    engine, _ = db.create_engine_and_sessionmaker(
+        "postgresql+asyncpg://user:pass@db.invalid/app?ssl=verify-full"
+    )
+    try:
+        with pytest.raises(asyncpg.exceptions.ClientConfigurationError, match="root certificate"):
+            async with engine.connect():
+                pass
+    finally:
+        await engine.dispose()
+
+
+def test_a_ca_bundle_is_available_for_verify_full_by_default():
+    # config defaults PGSSLROOTCERT, so a Neon DATABASE_URL connects on any
+    # host (FastAPI Cloud, the worker image, CI) without exporting it.
+    assert os.path.isfile(os.environ["PGSSLROOTCERT"])
 
 
 async def test_effective_manifest_distinguishes_defaults_process_snapshot_and_provider():

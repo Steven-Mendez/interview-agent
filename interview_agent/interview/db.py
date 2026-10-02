@@ -610,7 +610,9 @@ class GuestInterviewMonth(Base):
 def create_engine_and_sessionmaker(
     database_url: str,
 ) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:
-    engine = create_async_engine(database_url, pool_size=5, max_overflow=5)
+    # Neon closes idle connections when its compute suspends (after 5 minutes
+    # on the Free plan): ping on checkout so a dead pooled one is replaced.
+    engine = create_async_engine(database_url, pool_size=5, max_overflow=5, pool_pre_ping=True)
     return engine, async_sessionmaker(engine, expire_on_commit=False)
 
 

@@ -19,3 +19,4 @@ web/dist/
 web/.tanstack/
 web/.output/
 web/.env*
+infra/

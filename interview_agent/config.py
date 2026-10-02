@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import Annotated, Literal
 
+import certifi
 import langsmith
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -211,6 +212,12 @@ if settings.langsmith_api_key:
 for _name, _value in _mirrored.items():
     if _value and not os.environ.get(_name):
         os.environ[_name] = _value
+
+# asyncpg verifies the server for ssl=verify-full (infra/neon's DATABASE_URL)
+# only against PGSSLROOTCERT, never the system store, and refuses to connect
+# without one. certifi's bundle is there on every host (API, worker image, CI);
+# looser modes such as the local Postgres's never read it.
+os.environ.setdefault("PGSSLROOTCERT", certifi.where())
 
 # The only tracing switch: it overrides LANGSMITH_TRACING, so without a key
 # nothing is traced even if the environment asks for it.

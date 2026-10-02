@@ -58,3 +58,10 @@ recordings/
 node_modules/
 web/.tanstack/
 web/.output/
+
+# Terraform (infra/): provider caches, local state (it holds the database
+# password) and variable files. The lock files are tracked.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars

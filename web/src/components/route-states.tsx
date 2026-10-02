@@ -14,6 +14,9 @@ import { ApiError } from "@/lib/api"
 export function RouteError({ error, reset }: ErrorComponentProps) {
   const router = useRouter()
   const notFound = error instanceof ApiError && error.status === 404
+  // The router hands over whatever was thrown, which need not be an Error:
+  // anything without a message gets the generic line.
+  const message = error instanceof Error ? error.message : ""
   return (
     <PageShell center>
       <EmptyState
@@ -24,7 +27,7 @@ export function RouteError({ error, reset }: ErrorComponentProps) {
         description={
           notFound
             ? "It may have been removed, or the link is incomplete."
-            : `${error.message || "Something went wrong."} Your interviews and results are safe — try again, or go back home.`
+            : `${message || "Something went wrong."} Your interviews and results are safe — try again, or go back home.`
         }
         actions={
           <>

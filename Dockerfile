@@ -1,19 +1,26 @@
 # syntax=docker/dockerfile:1
-# One image, three services (see docker-compose.yml):
-#   migrate: alembic upgrade head (one-shot)
-#   app:     uvicorn interview_agent.server.app:app
-#   worker:  python main.py start
+# One Dockerfile, two images; each builds only the stages it needs:
+#   --target app   the API serving the built SPA. docker-compose.yml runs it
+#                  as `app` (uvicorn) and as `migrate` (alembic upgrade head).
+#   --target worker, or no --target: the LiveKit worker (python main.py start).
+#                  It is the last stage on purpose: LiveKit Cloud builds the
+#                  repository's Dockerfile without a target, so the default
+#                  image must be the worker, and BuildKit skips the Node stage
+#                  it never copies from.
 
-FROM node:22-alpine AS webbuilder
+FROM node:24-alpine AS webbuilder
 WORKDIR /web
 
-# corepack ships with the node:22 image and can pin/fetch the pnpm version
-# declared in package.json's "packageManager" field; fall back to a global
-# npm install if corepack can't verify/fetch it (e.g. signature service down).
-RUN corepack enable && (corepack prepare pnpm@10 --activate || npm i -g pnpm)
+# corepack ships with the node:24 image and fetches the pnpm version pinned
+# in package.json's "packageManager" field; fall back to a global npm install
+# of the same major if corepack can't verify/fetch it (e.g. signature service
+# down).
+RUN corepack enable && (corepack prepare pnpm@11 --activate || npm i -g pnpm@11)
 
 # Lockfile-only layer first so this only reinstalls when deps actually change.
-COPY web/package.json web/pnpm-lock.yaml ./
+# pnpm-workspace.yaml holds allowBuilds: pnpm 11 fails the install on any
+# dependency build script it was not told to run or skip.
+COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
     pnpm install --frozen-lockfile
 
@@ -40,7 +47,9 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-install-project
 
 
-FROM python:3.12-slim
+# Everything the two Python images share: the venv, the source and the
+# tiktoken files. No CMD: each image below says what it runs.
+FROM python:3.12-slim AS base
 
 RUN adduser --disabled-password --gecos "" --home /home/appuser appuser
 
@@ -69,7 +78,14 @@ tiktoken.get_encoding('o200k_base')"
 COPY pyproject.toml uv.lock alembic.ini main.py ./
 COPY alembic/ alembic/
 COPY interview_agent/ interview_agent/
+
+
+FROM base AS app
 # Built SPA (TanStack Start, SPA mode): must match app.py's _FRONTEND_DIR.
 COPY --from=webbuilder /web/dist/client web/dist/client
+CMD ["uvicorn", "interview_agent.server.app:app", "--host", "0.0.0.0", "--port", "8000"]
 
+
+# Last, so a build without --target produces it (see the header).
+FROM base AS worker
 CMD ["python", "main.py", "start"]

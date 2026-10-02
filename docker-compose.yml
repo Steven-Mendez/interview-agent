@@ -26,8 +26,11 @@ services:
   # One-shot: applies the schema before app/worker start, and exactly once
   # even if app is ever scaled to several replicas.
   migrate:
-    build: .
-    image: interview-agent
+    # The same image as app (both images carry alembic): one build for two.
+    build:
+      context: .
+      target: app
+    image: interview-agent-app
     <<: *app-env
     command: alembic upgrade head
     restart: "no"
@@ -36,8 +39,10 @@ services:
         condition: service_healthy
 
   app:
-    build: .
-    image: interview-agent
+    build:
+      context: .
+      target: app
+    image: interview-agent-app
     <<: *app-env
     command: uvicorn interview_agent.server.app:app --host 0.0.0.0 --port 8000
     restart: unless-stopped
@@ -56,8 +61,11 @@ services:
       start_period: 10s
 
   worker:
-    build: .
-    image: interview-agent
+    # Its own image without the web app (see the Dockerfile's header).
+    build:
+      context: .
+      target: worker
+    image: interview-agent-worker
     <<: *app-env
     command: python main.py start
     restart: unless-stopped

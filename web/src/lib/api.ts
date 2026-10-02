@@ -2,6 +2,7 @@
 // interview_agent/server/routes.py), all under API_BASE (lib/api-base).
 
 import { API_BASE } from "@/lib/api-base"
+import { watchApiFetch } from "@/lib/api-waking"
 import {
   forgetRefusedToken,
   getAccessToken,
@@ -348,6 +349,7 @@ export function setUnauthorizedHandler(handler: () => void): void {
 }
 
 export { suppressUnauthorizedRedirect } from "@/lib/redirect-suppression"
+export { useApiWaking, wakeApi } from "@/lib/api-waking"
 
 /** The only fetch. Adds the user's JWT unless the caller brought its own
  *  credential (the closing routes carry the LiveKit participant token). */
@@ -356,7 +358,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const send = (token: string | null) => {
     const headers = new Headers(init?.headers)
     if (token) headers.set("Authorization", `Bearer ${token}`)
-    return fetch(`${API_BASE}${path}`, { ...init, headers })
+    return watchApiFetch(fetch(`${API_BASE}${path}`, { ...init, headers }))
   }
   let token = ownCredential ? null : await getAccessToken()
   let res = await send(token)

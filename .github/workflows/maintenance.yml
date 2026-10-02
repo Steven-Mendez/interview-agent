@@ -1,0 +1,30 @@
+name: Maintenance
+
+# The retention purge and a lifecycle sweep, once a day. The API also purges
+# on its own daily loop, but a hosted API scaled to zero has no loop running;
+# this request wakes it and runs the same work. schedule only fires from the
+# default branch.
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    steps:
+      # API_ORIGIN is the API's origin without a trailing slash, e.g.
+      # https://xxx.fastapicloud.dev. An asleep API can take a while to boot,
+      # hence the retries and the generous timeout; running the work twice is
+      # harmless, so retrying a request that did arrive is too. -fsS prints
+      # the response and any error but never the request headers, so the
+      # token stays out of the log (no -v here).
+      - run: |
+          curl -fsS -X POST "$API_ORIGIN/api/internal/maintenance" \
+            -H "X-Internal-Token: $INTERNAL_API_TOKEN" \
+            --retry 3 --retry-delay 10 --retry-all-errors --max-time 60
+        env:
+          API_ORIGIN: ${{ secrets.API_ORIGIN }}
+          INTERNAL_API_TOKEN: ${{ secrets.INTERNAL_API_TOKEN }}

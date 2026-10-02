@@ -20,3 +20,13 @@ web/.tanstack/
 web/.output/
 web/.env*
 infra/
+
+# Docs, local secrets and the hosting platforms' own config: none of them
+# belong in an image. livekit.toml is read by the lk CLI, not by the worker.
+*.md
+secrets*.env
+.vercel/
+web/.vercel/
+.fastapicloud/
+.fastapicloudignore
+livekit.toml

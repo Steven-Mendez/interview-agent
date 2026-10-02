@@ -123,6 +123,23 @@ async def test_a_valid_neon_token_is_the_user(neon_auth, client):
     assert len(neon_auth) == 1
 
 
+async def test_empty_name_and_email_claims_are_none(neon_auth, client):
+    response = await client.get("/whoami", headers=bearer(token(email="", name="")))
+    assert response.json() == {"id": "user-synthetic", "email": None, "name": None}
+
+
+async def test_only_neon_accounts_name_the_sentry_user(local_accounts, client, monkeypatch):
+    reported = []
+    monkeypatch.setattr(auth.sentry_sdk, "set_user", reported.append)
+    signed_in = (await sign_in(client, "admin", ADMIN_PASSWORD)).json()["token"]
+    assert (await client.get("/whoami", headers=bearer(signed_in))).status_code == 200
+    # local:admin carries the username: its reports name nobody.
+    assert reported == [None]
+    use_neon_auth(monkeypatch)
+    assert (await client.get("/whoami", headers=bearer(token()))).status_code == 200
+    assert reported == [None, {"id": "user-synthetic"}]
+
+
 @pytest.mark.parametrize(
     "claims",
     [

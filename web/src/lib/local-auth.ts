@@ -21,14 +21,18 @@ export interface LocalSession {
 /** A sign-in the API refused, or one that could not reach it; the message
  *  is fit to show. */
 export class LocalSignInError extends Error {
-  constructor(message: string) {
+  /** The API has no local accounts (any more): ask it which sign-in it runs. */
+  readonly signInOff: boolean
+  constructor(message: string, signInOff = false) {
     super(message)
     this.name = "LocalSignInError"
+    this.signInOff = signInOff
   }
 }
 
 export const INVALID_CREDENTIALS = "Invalid username or password"
 export const SIGN_IN_UNAVAILABLE = "Could not sign in. Is the API running?"
+export const SIGN_IN_OFF = "The API no longer uses local accounts."
 export const STORAGE_BLOCKED =
   "Could not keep the session: browser storage is blocked."
 
@@ -155,6 +159,8 @@ export async function signIn(
   if (res.status === 401 || res.status === 422) {
     throw new LocalSignInError(INVALID_CREDENTIALS)
   }
+  // The dev login is off: the API restarted without LOCAL_ACCOUNTS.
+  if (res.status === 404) throw new LocalSignInError(SIGN_IN_OFF, true)
   if (!res.ok) throw new LocalSignInError(SIGN_IN_UNAVAILABLE)
   let body: unknown
   try {

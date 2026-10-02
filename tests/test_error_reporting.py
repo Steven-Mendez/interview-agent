@@ -94,7 +94,8 @@ async def test_failing_route_reports_one_event_without_body_headers_query_or_mes
     assert event["exception"]["values"][-1]["type"] == "ValueError"
     assert event["exception"]["values"][-1]["value"] == ""
     assert event["request"] == {"method": "POST", "url": "http://test/api/fail"}
-    assert event["user"] == {"id": "local-dev"}
+    # The request's user is the local developer: a local id names nobody.
+    assert "user" not in event
     assert event["tags"]["component"] == "api"
 
 

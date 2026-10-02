@@ -192,11 +192,11 @@ async function fetchFreshToken(): Promise<string | null> {
 /** The token the API verifies, or null when signed out or without sign-in.
  *
  * Outside a Neon build, the local account's token while it lasts (the API
- * ignores it when it has no sign-in). With Neon Auth, the JWT — never the session's own token — Neon Auth swaps it for the JWT, but only
- * getJWTToken says so. The SDK keeps the session (and so the JWT) in memory
- * and drops it on sign-out: calling this before every request costs no
- * round trip, except once a minute before the JWT expires, when concurrent
- * callers share one fetch of a fresh session. */
+ * ignores it when it has no sign-in). With Neon Auth, the JWT from
+ * getJWTToken, never the session's own opaque token. The SDK keeps the
+ * session (and so the JWT) in memory and drops it on sign-out: calling this
+ * before every request costs no round trip, except once a minute before the
+ * JWT expires, when concurrent callers share one fetch of a fresh session. */
 export async function getAccessToken(): Promise<string | null> {
   if (!adapter) return getLocalAccessToken()
   let token: string | null = null

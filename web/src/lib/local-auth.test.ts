@@ -117,11 +117,22 @@ describe("signIn", () => {
   })
 
   it("says the same of any other failure", async () => {
-    api(() => json(404, { detail: "Not Found" }))
+    api(() => json(500, { detail: "Internal Server Error" }))
     const { local } = await load()
     await expect(local.signIn("guest", "secret")).rejects.toThrow(
       "Could not sign in. Is the API running?"
     )
+  })
+
+  it("tells a dev login turned off (404) from an unreachable API", async () => {
+    api(() => json(404, { detail: "Not Found" }))
+    const { local } = await load()
+    const failure = await local.signIn("guest", "secret").catch((e) => e)
+    expect(failure).toBeInstanceOf(local.LocalSignInError)
+    expect(failure).toMatchObject({
+      message: "The API no longer uses local accounts.",
+      signInOff: true,
+    })
   })
 })
 

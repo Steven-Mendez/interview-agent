@@ -471,7 +471,8 @@ export interface Me {
   auth_provider: SignInMethod
   /** ISO-8601, UTC: when the API first saw the account. */
   created_at: string
-  /** ISO-8601, UTC; null until a later visit is recorded. */
+  /** ISO-8601, UTC: this visit, which /me records before answering (null
+   *  only for an account the admin list shows but that was never seen). */
   last_seen_at: string | null
 }
 

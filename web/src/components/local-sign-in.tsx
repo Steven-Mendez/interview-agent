@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button"
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
+import { resetAuthMode } from "@/lib/auth"
 import { LocalSignInError, SIGN_IN_UNAVAILABLE, signIn } from "@/lib/local-auth"
 
 /** The dev login: a local account's username and password (LOCAL_ACCOUNTS
@@ -27,6 +28,12 @@ export function LocalSignInForm({ redirectTo }: { redirectTo?: string }) {
     try {
       await signIn(username, password)
     } catch (caught) {
+      if (caught instanceof LocalSignInError && caught.signInOff) {
+        // Re-run this route's check: it sends the visitor home, or to the
+        // Neon notice, for whatever sign-in the API runs now.
+        resetAuthMode()
+        void router.invalidate()
+      }
       setError(
         caught instanceof LocalSignInError
           ? caught.message

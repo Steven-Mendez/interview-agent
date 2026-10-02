@@ -6,11 +6,17 @@ import type * as Router from "@tanstack/react-router"
 import type * as LocalAuth from "@/lib/local-auth"
 import { LocalSignInForm } from "./local-sign-in"
 
-const mocks = vi.hoisted(() => ({ navigate: vi.fn(), signIn: vi.fn() }))
+const mocks = vi.hoisted(() => ({
+  navigate: vi.fn(),
+  invalidate: vi.fn(),
+  signIn: vi.fn(),
+  resetAuthMode: vi.fn(),
+}))
 vi.mock("@tanstack/react-router", async (original) => ({
   ...(await original<typeof Router>()),
-  useRouter: () => ({ navigate: mocks.navigate }),
+  useRouter: () => ({ navigate: mocks.navigate, invalidate: mocks.invalidate }),
 }))
+vi.mock("@/lib/auth", () => ({ resetAuthMode: mocks.resetAuthMode }))
 vi.mock("@/lib/local-auth", async (original) => ({
   ...(await original<typeof LocalAuth>()),
   signIn: mocks.signIn,
@@ -67,6 +73,18 @@ describe("LocalSignInForm", () => {
     await vi.waitFor(() =>
       expect(mocks.navigate).toHaveBeenCalledWith({ href: "/", replace: true })
     )
+  })
+
+  it("asks the API's mode again when the dev login is off", async () => {
+    const { LocalSignInError, SIGN_IN_OFF } = await import("@/lib/local-auth")
+    mocks.signIn.mockRejectedValue(new LocalSignInError(SIGN_IN_OFF, true))
+    render(<LocalSignInForm />)
+    fillIn("guest", "secret")
+    const alert = await screen.findByRole("alert")
+    expect(alert.textContent).toContain(SIGN_IN_OFF)
+    expect(mocks.resetAuthMode).toHaveBeenCalledOnce()
+    expect(mocks.invalidate).toHaveBeenCalledOnce()
+    expect(mocks.navigate).not.toHaveBeenCalled()
   })
 
   it("shows why the sign-in failed and stays", async () => {

@@ -290,9 +290,10 @@ def _bearer_token(request: Request) -> str | None:
 
 async def current_user(request: Request) -> User:
     user = await _authenticate(request)
-    # This request's error reports name the account by its opaque id only
-    # (a no-op without Sentry).
-    sentry_sdk.set_user({"id": user.id})
+    # This request's error reports name a Neon account by its opaque id only
+    # (a no-op without Sentry). A local account's id carries its username, so
+    # its reports name nobody.
+    sentry_sdk.set_user({"id": user.id} if auth_provider(user) == "neon" else None)
     return user
 
 
@@ -320,10 +321,11 @@ async def _authenticate(request: Request) -> User:
     if not isinstance(subject, str) or not subject:
         raise _rejected("invalid_token")
     email, name = claims.get("email"), claims.get("name")
+    # An empty claim is no email or name, not a blank one.
     return User(
         subject,
-        email if isinstance(email, str) else None,
-        name if isinstance(name, str) else None,
+        email if isinstance(email, str) and email else None,
+        name if isinstance(name, str) and name else None,
     )
 
 

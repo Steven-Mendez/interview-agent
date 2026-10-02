@@ -33,9 +33,12 @@ import {
   useCanCallApi,
 } from "@/lib/auth"
 import { recentInterviewsQueryOptions } from "@/lib/queries"
+import { requireSession } from "@/lib/route-guards"
 import { pageHead } from "@/lib/head"
 
 export const Route = createFileRoute("/")({
+  // Like every page of the app: with sign-in on, the sign-in page first.
+  beforeLoad: ({ location }) => requireSession(location),
   head: () => pageHead(),
   component: HomePage,
 })
@@ -55,9 +58,10 @@ function errorMessage(error: unknown): string {
 }
 
 function HomePage() {
-  // The home page is public: interviews load once someone is signed in (or
-  // always, without sign-in). Until the mode and the session are known —
-  // the whole prerender — it looks the same as loading.
+  // With sign-in on, only a signed-in visitor gets here (the route's guard);
+  // "signed out" is the moment a sign-out takes before the guard runs again.
+  // Until the mode and the session are known — the whole prerender — it
+  // looks the same as loading.
   const mode = useAuthMode()
   // An API that cannot say how to sign in cannot list interviews either:
   // say so instead of loading for as long as it stays silent.

@@ -1,13 +1,12 @@
-import * as React from "react"
-import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router"
-import { useQueryClient } from "@tanstack/react-query"
-import { AuthView } from "@neondatabase/auth-ui"
-import { TriangleAlertIcon } from "lucide-react"
+import { createFileRoute, redirect } from "@tanstack/react-router"
 
-import { AuthViewsProvider } from "@/components/auth-views"
-import { LocalSignInForm } from "@/components/local-sign-in"
-import { EmptyState } from "@/components/ui/empty-state"
-import { PageShell } from "@/components/ui/page"
+import { SignInPage, SignInStatus } from "@/components/sign-in-page"
+import {
+  LocalSignIn,
+  LocalSignOut,
+  NeonAuthMissing,
+  NeonAuthViews,
+} from "@/components/sign-in-views"
 import {
   neonAuthConfigured,
   resetAuthMode,
@@ -15,7 +14,6 @@ import {
   safeRedirectPath,
   useAuthMode,
 } from "@/lib/auth"
-import { signOutLocal } from "@/lib/local-auth"
 import { pageHead } from "@/lib/head"
 
 interface AuthSearch {
@@ -30,8 +28,9 @@ const TITLES: Partial<Record<string, string>> = {
 }
 
 // Sign-in, sign-up, the OAuth callback and sign-out: Neon Auth's own views
-// in the neon mode, the dev login in the local one. Without sign-in (mode
-// none): back to the home page.
+// in the neon mode, the dev login in the local one — each on a full-screen
+// page of its own, without the app's chrome. Without sign-in (mode none):
+// back to the home page.
 export const Route = createFileRoute("/auth/$pathname")({
   validateSearch: (search: Record<string, unknown>): AuthSearch => ({
     redirectTo: safeRedirectPath(search.redirectTo),
@@ -64,38 +63,21 @@ function AuthPage() {
   const { pathname } = Route.useParams()
   const { redirectTo } = Route.useSearch()
   const mode = useAuthMode()
+  const leaving = pathname === "sign-out"
   return (
-    <PageShell center>
+    // Waving goodbye on the way out.
+    <SignInPage resting={leaving ? "greeting" : "idle"}>
       {mode === "neon" && neonAuthConfigured ? (
-        <AuthViewsProvider>
-          {/* Always set: without the prop AuthView reads the raw query
-              parameter itself and hands it to the OAuth flow unchecked. */}
-          <AuthView path={pathname} redirectTo={redirectTo ?? "/"} />
-        </AuthViewsProvider>
+        <NeonAuthViews pathname={pathname} redirectTo={redirectTo} />
       ) : mode === "neon" ? (
-        <EmptyState
-          icon={<TriangleAlertIcon />}
-          tone="warning"
-          title="Sign-in is not set up in this build"
-          description="This build has no VITE_NEON_AUTH_URL, but the API signs in with Neon Auth. Build the web app with the project's Neon Auth URL, or run the API with AUTH_MODE=local."
-        />
-      ) : mode === "local" && pathname === "sign-out" ? (
+        <NeonAuthMissing />
+      ) : mode === "local" && leaving ? (
         <LocalSignOut />
       ) : mode === "local" ? (
-        <LocalSignInForm redirectTo={redirectTo} />
-      ) : null}
-    </PageShell>
+        <LocalSignIn redirectTo={redirectTo} />
+      ) : (
+        <SignInStatus>Loading…</SignInStatus>
+      )}
+    </SignInPage>
   )
-}
-
-/** /auth/sign-out with a local account: drop it, and home. */
-function LocalSignOut() {
-  const navigate = useNavigate()
-  const queryClient = useQueryClient()
-  React.useEffect(() => {
-    signOutLocal()
-    queryClient.clear()
-    void navigate({ to: "/", replace: true })
-  }, [navigate, queryClient])
-  return null
 }

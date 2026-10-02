@@ -24,6 +24,12 @@ os.environ["SENTRY_ENVIRONMENT"] = "development"
 # Nor on the developer's accounts setup: no JWKS fetch, no admins, no shared
 # secret and no CORS unless a test configures them itself.
 os.environ["AUTH_MODE"] = "local"
+os.environ["LOCAL_ACCOUNTS"] = ""
+# A local database, so AUTH_MODE=local passes the API's startup guard even when
+# the developer's .env points at a remote one (tests use their own anyway).
+os.environ["DATABASE_URL"] = "postgresql+asyncpg://interview:interview@localhost:5432/interview"
+# A URL without a host connects to PGHOST, which the guard checks instead.
+os.environ.pop("PGHOST", None)
 os.environ["NEON_AUTH_URL"] = ""
 os.environ["INTERNAL_API_TOKEN"] = ""
 os.environ["ADMIN_USER_IDS"] = ""

@@ -46,7 +46,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from alembic import command
-from interview_agent.config import Settings
+from interview_agent.config import Settings, is_local_database
 from interview_agent.interview import db
 from interview_agent.runtime import validate_database_revision
 from interview_agent.voices import VOICES
@@ -343,6 +343,12 @@ async def journey(args):
         raise ValueError("LiveKit configuration is required")
     if not base.openai_api_key:
         raise ValueError("OpenAI configuration is required for real planner/evaluator calls")
+    # The API below runs with AUTH_MODE=local, which refuses to start against a
+    # remote database or in production: fail before anything is charged.
+    if not is_local_database(base.database_url) or (
+        base.sentry_environment.strip().lower() == "production"
+    ):
+        raise ValueError("The product journey needs a local DATABASE_URL in development")
     tag = uuid.uuid4().hex[:10]
     name = f"interview_benchmark_product_{tag}_test"
     database = make_url(base.database_url).set(database=name).render_as_string(hide_password=False)
@@ -388,6 +394,7 @@ async def journey(args):
         "APP_BASE_URL": f"http://127.0.0.1:{API_PORT}",
         # The browser drives the app without a login: the local user, unlimited.
         "AUTH_MODE": "local",
+        "LOCAL_ACCOUNTS": "",
         "ADMIN_USER_IDS": "local-dev",
         "WORKER_DRAIN_MINUTES": "1",
         "INTERVIEW_RECONNECT_SECONDS": "10",

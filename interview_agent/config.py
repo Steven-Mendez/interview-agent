@@ -2,17 +2,60 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
+import re
 from collections.abc import MutableMapping
-from typing import Annotated, Literal
+from typing import Annotated, Literal, NamedTuple
 from urllib.parse import parse_qs, urlsplit
 
 import certifi
 import langsmith
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
+from sqlalchemy.engine import make_url
 
 VERIFIED_STT_MODELS = frozenset({"assemblyai/universal-3-6-pro"})
+
+_LOCAL_USERNAME = re.compile(r"[a-z0-9_-]{1,32}")
+# Database hosts that can only be this machine or the compose network.
+_LOCAL_DATABASE_HOSTS = frozenset({"localhost", "postgres", "host.docker.internal"})
+
+
+class LocalAccount(NamedTuple):
+    username: str
+    password: str
+
+
+def _is_local_host(host: str | None) -> bool:
+    # No host, or a directory path (?host=/run/postgresql): a Unix socket.
+    if not host or host.startswith("/"):
+        return True
+    host = host.strip("[]").rstrip(".").lower()
+    if host in _LOCAL_DATABASE_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def is_local_database(database_url: str) -> bool:
+    """Whether DATABASE_URL can only reach this machine (or the compose network).
+
+    An unparsable URL (several hosts included) is not local; one without a
+    host is as local as the PGHOST environment variable asyncpg uses instead."""
+    try:
+        url = make_url(database_url)
+    except Exception:
+        return False
+    query_hosts = url.query.get("host", ())
+    if isinstance(query_hosts, str):
+        query_hosts = (query_hosts,)
+    if not url.host and not query_hosts:
+        # No host at all: asyncpg falls back to PGHOST before any Unix socket.
+        return _is_local_host(os.environ.get("PGHOST"))
+    return _is_local_host(url.host) and all(_is_local_host(host) for host in query_hosts)
 
 
 class Settings(BaseSettings):
@@ -21,6 +64,8 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",  # tolerate unrelated vars in .env
+        # A malformed value (LOCAL_ACCOUNTS: passwords) never lands in the error.
+        hide_input_in_errors=True,
     )
 
     # LLM (OpenAI via LangGraph)
@@ -109,8 +154,15 @@ class Settings(BaseSettings):
 
     # Accounts. "neon" (the default, so production never runs open by accident)
     # verifies Neon Auth JWTs against NEON_AUTH_URL's JWKS; "local" makes every
-    # request the fixed user "local-dev", for development without a login.
+    # request the fixed user "local-dev", for development without a login,
+    # unless LOCAL_ACCOUNTS lists accounts to sign in with.
     auth_mode: Literal["local", "neon"] = Field(default="neon", alias="AUTH_MODE")
+    # Development only (AUTH_MODE=local): comma-separated username:password
+    # entries, split on the first ":" (a password cannot contain commas). Each
+    # account's id is local:<username>; the API signs its own tokens for them.
+    local_accounts: Annotated[tuple[LocalAccount, ...], NoDecode] = Field(
+        default=(), alias="LOCAL_ACCOUNTS", repr=False
+    )
     neon_auth_url: str = Field(default="", alias="NEON_AUTH_URL")
     # Shared secret of server-to-server calls (the worker's evaluation trigger,
     # the scheduled maintenance); empty rejects every such call.
@@ -127,20 +179,28 @@ class Settings(BaseSettings):
         default=[], alias="CORS_ALLOWED_ORIGINS"
     )
 
+    @property
+    def local_accounts_active(self) -> bool:
+        """The dev login: AUTH_MODE=local with LOCAL_ACCOUNTS to sign in with."""
+        return self.auth_mode == "local" and bool(self.local_accounts)
+
     def require_keys(self, role: Literal["api", "worker"]) -> Settings:
         """Fail fast with a clear message if any required API key is missing.
 
         In neon mode the API verifies JWTs against NEON_AUTH_URL; both the API
-        and the worker (which sends it to /evaluate) need INTERNAL_API_TOKEN.
+        and the worker (which sends it to /evaluate) need INTERNAL_API_TOKEN,
+        as they do with local accounts, where /evaluate requires a user too.
+        The API refuses AUTH_MODE=local outside development.
         """
-        auth_keys = (
-            (
+        if self.auth_mode == "neon":
+            auth_keys: tuple[tuple[str, str], ...] = (
                 *((("NEON_AUTH_URL", self.neon_auth_url),) if role == "api" else ()),
                 ("INTERNAL_API_TOKEN", self.internal_api_token),
             )
-            if self.auth_mode == "neon"
-            else ()
-        )
+        elif self.local_accounts_active:
+            auth_keys = (("INTERNAL_API_TOKEN", self.internal_api_token),)
+        else:
+            auth_keys = ()
         missing = [
             name
             for name, value in (
@@ -154,12 +214,28 @@ class Settings(BaseSettings):
             if not value
         ]
         if missing:
-            hint = (
-                " (for local development set AUTH_MODE=local)"
-                if any(name in missing for name, _ in auth_keys)
-                else ""
-            )
+            hint = ""
+            if any(name in missing for name, _ in auth_keys):
+                hint = (
+                    " (LOCAL_ACCOUNTS needs it for the worker's evaluation trigger; "
+                    "generate one with: openssl rand -hex 32)"
+                    if self.local_accounts_active
+                    else " (for local development set AUTH_MODE=local)"
+                )
             raise RuntimeError(f"Missing variables in .env: {', '.join(missing)}{hint}.")
+        if role == "api" and self.auth_mode == "local":
+            # The database host is the real protection: production's is Neon.
+            # SENTRY_ENVIRONMENT only backs it up.
+            if self.sentry_environment.strip().lower() == "production":
+                raise RuntimeError(
+                    "AUTH_MODE=local is for development only: refusing to start "
+                    "with SENTRY_ENVIRONMENT=production."
+                )
+            if not is_local_database(self.database_url):
+                raise RuntimeError(
+                    "AUTH_MODE=local is for development only: refusing to start "
+                    "with a DATABASE_URL whose host is not local."
+                )
         return self
 
     @field_validator("stt_model")
@@ -182,6 +258,32 @@ class Settings(BaseSettings):
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
         return value
+
+    @field_validator("local_accounts", mode="before")
+    @classmethod
+    def _username_password_pairs(cls, value):
+        # Errors name the entry by position only: never its password.
+        if not isinstance(value, str):
+            return value
+        accounts: list[LocalAccount] = []
+        for position, entry in enumerate(
+            (item.strip() for item in value.split(",") if item.strip()), start=1
+        ):
+            username, separator, password = entry.partition(":")
+            if not separator or not password:
+                raise ValueError(
+                    f"LOCAL_ACCOUNTS entry {position} must be username:password "
+                    "with a non-empty password"
+                )
+            if not _LOCAL_USERNAME.fullmatch(username):
+                raise ValueError(
+                    f"LOCAL_ACCOUNTS entry {position}: usernames are 1-32 characters "
+                    "of a-z, 0-9, _ and -"
+                )
+            if any(account.username == username for account in accounts):
+                raise ValueError(f"LOCAL_ACCOUNTS entry {position} repeats a username")
+            accounts.append(LocalAccount(username, password))
+        return tuple(accounts)
 
     @field_validator("cors_allowed_origins")
     @classmethod

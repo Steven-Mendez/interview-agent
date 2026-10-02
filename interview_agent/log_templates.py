@@ -6,6 +6,7 @@ Never add candidate or generated content to this catalog.
 
 SAFE_LOG_TEMPLATES = frozenset(
     (
+        "AUTH_MODE=local is for development only",
         "Closing background task failed: %s",
         "Completion publication failed; persistent state remains available",
         "Could not persist evaluation failure",
@@ -71,6 +72,7 @@ SAFE_LOG_TEMPLATES = frozenset(
             "deduplication requires provider audio boundaries"
         ),
         "kept stt final: matching text but different audio boundaries",
+        "local sign-in rejected",
         "milestone status refresh failed for %s",
         "planning failed for %s",
         "refusing stale reconnect",

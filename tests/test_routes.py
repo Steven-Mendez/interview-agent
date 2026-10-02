@@ -23,7 +23,7 @@ from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import create_async_engine
 from test_auth import bearer, token, use_neon_auth
 
-from interview_agent.config import settings
+from interview_agent.config import LocalAccount, settings
 from interview_agent.interview import db
 from interview_agent.interview import resume as resume_ingestion
 from interview_agent.interview.context import MAX_JOB_OFFER_CHARS, MAX_RESUME_CHARS
@@ -42,7 +42,7 @@ from interview_agent.interview.models import (
 from interview_agent.interview.seals import ensure_seal
 from interview_agent.prompts import length_for
 from interview_agent.server import evaluations, routes
-from interview_agent.server.auth import User, current_user
+from interview_agent.server.auth import User, current_user, issue_local_token
 from interview_agent.voices import VOICES
 
 # The route tests' default caller: the local developer, listed as an admin (as
@@ -2569,6 +2569,43 @@ async def test_the_worker_evaluates_with_the_internal_token_alone(
     assert response.status_code == 202
     acting_user["user"] = DEVELOPER
     assert (await _settled(client, interview_id))["status"] == "evaluated"
+
+
+async def test_the_worker_evaluates_a_local_accounts_interview_with_the_internal_token(
+    client_and_sessionmaker, acting_user, monkeypatch
+):
+    # The dev login: every user route needs a local token, but the worker's
+    # trigger carries only the internal one.
+    client, sessionmaker = client_and_sessionmaker
+    monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
+    monkeypatch.setattr(settings, "auth_mode", "local")
+    monkeypatch.setattr(
+        settings, "local_accounts", (LocalAccount("guest", "synthetic-guest-password"),)
+    )
+    monkeypatch.setattr(settings, "internal_api_token", "synthetic-internal-token")
+    interview_id = await _seed_finished_interview(sessionmaker)
+    async with sessionmaker() as session:
+        await session.execute(
+            update(db.Conversation)
+            .where(db.Conversation.id == interview_id)
+            .values(owner_id="local:guest")
+        )
+        await session.commit()
+    url = f"/api/interviews/{interview_id}/evaluate?automatic=true"
+    acting_user["user"] = None
+    assert (await client.post(url)).status_code == 401
+    assert (await client.post(url, headers={"X-Internal-Token": "wrong"})).status_code == 401
+    response = await client.post(url, headers={"X-Internal-Token": "synthetic-internal-token"})
+    assert response.status_code == 202
+    guest, _ = issue_local_token(User("local:guest", None, "guest"))
+    deadline = asyncio.get_running_loop().time() + 5
+    while True:
+        body = (await client.get(f"/api/interviews/{interview_id}", headers=bearer(guest))).json()
+        if body["status"] not in ("completed", "evaluating"):
+            break
+        assert asyncio.get_running_loop().time() < deadline, f"still {body['status']}"
+        await asyncio.sleep(0.01)
+    assert body["status"] == "evaluated"
 
 
 async def test_settings_belong_to_each_user(client_and_sessionmaker, acting_user):

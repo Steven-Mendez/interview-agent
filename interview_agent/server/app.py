@@ -22,6 +22,8 @@ from interview_agent.config import settings
 from interview_agent.interview.db import create_engine_and_sessionmaker
 from interview_agent.logging_config import setup_file_logging
 from interview_agent.runtime import process_manifest, record_manifest, validate_database_revision
+from interview_agent.server import auth_routes
+from interview_agent.server.auth import warn_local_mode
 from interview_agent.server.evaluations import EvaluationRunner
 from interview_agent.server.reconciliation import LifecycleSweeper
 from interview_agent.server.retention import purge_expired
@@ -77,6 +79,7 @@ async def lifespan(app: FastAPI):
     log_path = setup_file_logging("logs/server.log")
 
     settings.require_keys("api")
+    warn_local_mode()
     otel_metrics.configure(settings, "interview-agent-api")
     engine, sessionmaker = create_engine_and_sessionmaker(settings.database_url)
     try:
@@ -152,6 +155,7 @@ app = FastAPI(title="interview-agent", lifespan=lifespan)
 # At creation: Starlette refuses new middleware once the app has started.
 add_cors(app, settings.cors_allowed_origins)
 app.include_router(router, prefix="/api")
+app.include_router(auth_routes.router, prefix="/api")
 # Mounted last so /api/* wins over static files. SpaStaticFiles falls back to
 # the shell for client-side routes so refreshes/deep links keep working.
 # Backend-only dev without a `cd web && pnpm build` still gets the API.

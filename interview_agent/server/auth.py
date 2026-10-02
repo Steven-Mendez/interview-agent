@@ -1,4 +1,4 @@
-"""Who is calling: Neon Auth users (JWT), the local developer, or another server.
+"""Who is calling: Neon Auth users (JWT), local accounts, or another server.
 
 Neon Auth signs its JWTs with EdDSA and publishes the public keys at
 `{NEON_AUTH_URL}/.well-known/jwks.json`; the token's issuer and audience are
@@ -7,17 +7,23 @@ browser signs in again); keys that cannot be fetched are a 503. Admins are
 listed in ADMIN_USER_IDS by `sub`: the token's own `role` claim is never
 read. Server-to-server calls (the worker's evaluation trigger, the scheduled
 maintenance) carry INTERNAL_API_TOKEN in X-Internal-Token instead of a user.
+
+AUTH_MODE=local is development only (config refuses it with a remote database):
+without LOCAL_ACCOUNTS every request is the local developer; with them, users
+sign in (auth_routes) and the API verifies its own HS256 tokens, never Neon's.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Annotated
+from datetime import UTC, datetime, timedelta
+from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
 import jwt
@@ -29,6 +35,12 @@ from interview_agent.config import settings
 logger = logging.getLogger("interview_agent.server")
 
 LOCAL_USER_ID = "local-dev"
+LOCAL_ACCOUNT_PREFIX = "local:"
+LOCAL_TOKEN_ISSUER = "interview-agent-local"
+LOCAL_TOKEN_LIFETIME = timedelta(hours=12)
+# Compared against when the username is unknown, so the time a sign-in takes
+# does not tell which usernames exist.
+_NO_ACCOUNT_DIGEST = hashlib.sha256(b"interview-agent-no-such-account").digest()
 
 
 @dataclass(frozen=True)
@@ -171,6 +183,94 @@ def _verify(token: str) -> dict:
     )
 
 
+def auth_mode() -> Literal["none", "local", "neon"]:
+    """How users sign in: Neon Auth, local accounts, or not at all."""
+    if settings.auth_mode == "neon":
+        return "neon"
+    return "local" if settings.local_accounts else "none"
+
+
+def warn_local_mode() -> None:
+    if settings.auth_mode == "local":
+        logger.warning("AUTH_MODE=local is for development only")
+
+
+def _local_signing_key() -> bytes:
+    # Derived from the accounts themselves: tokens survive restarts and
+    # --reload, and changing any password invalidates every token. The shared
+    # secret (required with accounts) keeps a token from being an offline
+    # oracle for guessing the other accounts' passwords.
+    accounts = ",".join(
+        f"{account.username}:{account.password}" for account in settings.local_accounts
+    )
+    return hashlib.sha256(
+        b"interview-agent-local-jwt\0"
+        + settings.internal_api_token.encode("utf-8", "surrogatepass")
+        + b"\0"
+        + accounts.encode("utf-8", "surrogatepass")
+    ).digest()
+
+
+def _digest(password: str) -> bytes:
+    # surrogatepass: a lone surrogate is a wrong password, not an encoding error.
+    return hashlib.sha256(password.encode("utf-8", "surrogatepass")).digest()
+
+
+def verify_local_credentials(username: str, password: str) -> User | None:
+    """The local account these credentials sign in as, if any."""
+    expected = next(
+        (account.password for account in settings.local_accounts if account.username == username),
+        None,
+    )
+    matches = hmac.compare_digest(
+        _digest(password), _digest(expected) if expected is not None else _NO_ACCOUNT_DIGEST
+    )
+    if expected is None or not matches:
+        return None
+    return User(LOCAL_ACCOUNT_PREFIX + username, None, username)
+
+
+def issue_local_token(user: User) -> tuple[str, datetime]:
+    """A signed token for a local account and when it expires."""
+    issued = datetime.now(UTC).replace(microsecond=0)
+    expires = issued + LOCAL_TOKEN_LIFETIME
+    claims = {
+        "iss": LOCAL_TOKEN_ISSUER,
+        "aud": LOCAL_TOKEN_ISSUER,
+        "sub": user.id,
+        "name": user.name,
+        "iat": issued,
+        "exp": expires,
+    }
+    return jwt.encode(claims, _local_signing_key(), algorithm="HS256"), expires
+
+
+def _verify_local(token: str) -> User:
+    claims = jwt.decode(
+        token,
+        _local_signing_key(),
+        algorithms=["HS256"],
+        issuer=LOCAL_TOKEN_ISSUER,
+        audience=LOCAL_TOKEN_ISSUER,
+        options={"require": ["exp", "iat", "sub", "iss", "aud"]},
+    )
+    subject = claims["sub"]
+    username = subject.removeprefix(LOCAL_ACCOUNT_PREFIX) if isinstance(subject, str) else ""
+    # The account must still be listed, not just have been when it signed in.
+    if subject != LOCAL_ACCOUNT_PREFIX + username or not any(
+        account.username == username for account in settings.local_accounts
+    ):
+        raise jwt.InvalidTokenError("Unknown local account")
+    return User(subject, None, username)
+
+
+def _bearer_token(request: Request) -> str | None:
+    scheme, _, token = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
 async def current_user(request: Request) -> User:
     user = await _authenticate(request)
     # This request's error reports name the account by its opaque id only
@@ -180,13 +280,21 @@ async def current_user(request: Request) -> User:
 
 
 async def _authenticate(request: Request) -> User:
-    if settings.auth_mode == "local":
+    mode = auth_mode()
+    if mode == "none":
         return User(LOCAL_USER_ID, None, "Local developer")
-    scheme, _, token = request.headers.get("authorization", "").partition(" ")
-    if scheme.lower() != "bearer" or not token.strip() or not settings.neon_auth_url:
+    token = _bearer_token(request)
+    if token is None:
+        raise _unauthorized()
+    if mode == "local":
+        try:
+            return _verify_local(token)
+        except Exception:
+            raise _unauthorized() from None
+    if not settings.neon_auth_url:
         raise _unauthorized()
     try:
-        claims = await asyncio.to_thread(_verify, token.strip())
+        claims = await asyncio.to_thread(_verify, token)
     except _KeysUnavailableError:
         raise _unavailable() from None
     except Exception:

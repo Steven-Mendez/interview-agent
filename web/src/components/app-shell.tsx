@@ -405,11 +405,21 @@ function AppShell({
   children: React.ReactNode
 }) {
   const [drawerOpen, setDrawerOpen] = React.useState(false)
+  // The chrome is for someone allowed in: without sign-in, or signed in.
+  // Until that is known (the prerendered page, a visit's first moments) and
+  // while a guard sends a visitor to sign in, the page has none — so no top
+  // bar or navigation shows on the way to the sign-in page.
+  const mode = useAuthMode()
+  const { user } = useAuth()
+  const allowed =
+    mode === "none" || ((mode === "local" || mode === "neon") && user !== null)
+  const chrome = !immersive && allowed
   // The children always sit at the same position in this tree whatever the
   // mode; only the chrome around them comes and goes.
   return (
     <div
       data-immersive={immersive}
+      data-chrome={chrome}
       className="flex min-h-svh flex-col bg-background"
     >
       <a
@@ -418,23 +428,21 @@ function AppShell({
       >
         Skip to content
       </a>
-      {!immersive && <TopBar onMenu={() => setDrawerOpen(true)} />}
+      {chrome && <TopBar onMenu={() => setDrawerOpen(true)} />}
       <div className="flex min-h-0 flex-1">
-        {!immersive && <SideNav />}
+        {chrome && <SideNav />}
         <main
           id="main"
           className={cn(
             "@container/main flex min-w-0 flex-1 flex-col",
-            !immersive &&
+            chrome &&
               "md:mr-4 md:mb-4 md:rounded-2xl md:bg-card md:shadow-[inset_0_0_0_1px_var(--border)] dark:md:bg-card"
           )}
         >
           {children}
         </main>
       </div>
-      {!immersive && (
-        <NavDrawer open={drawerOpen} onOpenChange={setDrawerOpen} />
-      )}
+      {chrome && <NavDrawer open={drawerOpen} onOpenChange={setDrawerOpen} />}
     </div>
   )
 }

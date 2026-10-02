@@ -52,7 +52,7 @@ from livekit.plugins import silero
 from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor, TracerProvider
 from sqlalchemy import func, select
 
-from interview_agent import otel_metrics
+from interview_agent import error_reporting, otel_metrics
 from interview_agent.closing import ClosingCoordinator
 from interview_agent.config import settings
 from interview_agent.interview import db
@@ -139,7 +139,9 @@ def langsmith_voice_processor(settings) -> LiveKitLangSmithSpanProcessor | None:
 def prewarm(proc: JobProcess) -> None:
     """Load the Silero VAD once per worker process so every job reuses it,
     bind LiveKit's spans to LangSmith before the first job starts any, and give
-    the process its own metrics provider (the parent running run() has none)."""
+    the process its own metrics provider (the parent running run() has none)
+    and its own error reporting."""
+    error_reporting.configure(settings, "worker")
     proc.userdata["vad"] = silero.VAD.load()
     proc.userdata["langsmith_processor"] = langsmith_voice_processor(settings)
     otel_metrics.configure(settings, "interview-agent-worker")
@@ -512,6 +514,15 @@ async def _flush_metrics(telemetry: Telemetry) -> None:
         logger.warning("Metrics flush did not complete")
 
 
+_ERRORS_FLUSH_SECONDS = 2
+
+
+async def _flush_error_reports() -> None:
+    """Errors logged while the interview ended are still queued when the job's
+    process exits: send them, off the event loop and bounded."""
+    await asyncio.to_thread(error_reporting.flush, _ERRORS_FLUSH_SECONDS)
+
+
 _TRACES_FLUSH_SECONDS = 5
 
 
@@ -557,6 +568,7 @@ async def _run_interview(ctx: JobContext, conversation_id: uuid.UUID) -> None:
         if isinstance(exc, asyncio.CancelledError):
             raise
         logger.exception("Interview job initialization failed")
+        await _flush_error_reports()
         ctx.shutdown(reason="worker_initialization_failed")
 
 
@@ -1017,6 +1029,7 @@ async def _run_interview_job(ctx, conversation_id, engine, sessionmaker, startup
                     await engine.dispose()
             except Exception:
                 logger.warning("Worker engine disposal did not complete")
+            await _flush_error_reports()
 
     startup_cleanup.append(_on_shutdown)
     ctx.add_shutdown_callback(_on_shutdown)
@@ -1152,6 +1165,7 @@ async def entrypoint(ctx: JobContext) -> None:
 
 def run() -> None:
     """Entry point for the LiveKit CLI."""
+    error_reporting.configure(settings, "worker")
     original_logging_setup = sdk_cli.setup_logging
 
     def private_logging_setup(*args, **kwargs):

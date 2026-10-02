@@ -3,9 +3,12 @@ import { createRouter as createTanStackRouter } from "@tanstack/react-router"
 import { setupRouterSsrQueryIntegration } from "@tanstack/react-router-ssr-query"
 
 import { RouteError, RoutePending } from "@/components/route-states"
+import { captureRouteError, initErrorReporting } from "@/lib/error-reporting"
 import { routeTree } from "./routeTree.gen"
 
 export function getRouter() {
+  // Browser only and only with a DSN: a no-op while the shell is prerendered.
+  initErrorReporting()
   const queryClient = new QueryClient()
 
   const router = createTanStackRouter({
@@ -17,6 +20,7 @@ export function getRouter() {
     defaultPreloadStaleTime: 0,
     defaultErrorComponent: RouteError,
     defaultPendingComponent: RoutePending,
+    defaultOnCatch: (error) => captureRouteError(error),
   })
 
   // Exposes `queryClient` on the router context (used by route loaders via

@@ -17,7 +17,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 
-from interview_agent import otel_metrics
+from interview_agent import error_reporting, otel_metrics
 from interview_agent.config import settings
 from interview_agent.interview.db import create_engine_and_sessionmaker
 from interview_agent.logging_config import setup_file_logging
@@ -146,6 +146,8 @@ def add_cors(application: FastAPI, origins: list[str]) -> None:
     )
 
 
+# Before the app exists, so Sentry's Starlette/FastAPI integration wraps it.
+error_reporting.configure(settings, "api")
 app = FastAPI(title="interview-agent", lifespan=lifespan)
 # At creation: Starlette refuses new middleware once the app has started.
 add_cors(app, settings.cors_allowed_origins)

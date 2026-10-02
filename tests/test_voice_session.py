@@ -180,6 +180,8 @@ async def test_worker_reaches_session_start_with_a_real_unconnected_room(
         return True
 
     monkeypatch.setattr(agent.otel_metrics, "force_flush", flush)
+    flushed_errors = []
+    monkeypatch.setattr(agent.error_reporting, "flush", flushed_errors.append)
     session = AgentSession(vad=None)
     # Provider/audio startup alone is doubled. Ownership, PostgreSQL fencing,
     # subscriptions and the pre-connect Room.local_participant guard are real.
@@ -232,6 +234,8 @@ async def test_worker_reaches_session_start_with_a_real_unconnected_room(
         assert await replacement.claim()
     await callbacks[0]()
     engine.dispose.assert_awaited_once()
+    # Errors logged while it ended leave before the job's process exits.
+    assert flushed_errors == [agent._ERRORS_FLUSH_SECONDS]
     # Every end path exports once, its last samples included.
     assert exported == [
         {"closing.playback_confirmed": 0, "worker.ownership_lost": 1}

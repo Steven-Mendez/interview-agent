@@ -17,6 +17,10 @@ os.environ["LANGSMITH_ENDPOINT"] = "https://api.smith.langchain.com"
 # in-memory reader (the recorded_metrics fixture).
 os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = ""
 os.environ["OTEL_EXPORTER_OTLP_HEADERS"] = ""
+# Nor to the developer's Sentry project; error reporting tests capture events
+# with their own in-memory transport.
+os.environ["SENTRY_DSN"] = ""
+os.environ["SENTRY_ENVIRONMENT"] = "development"
 # Nor on the developer's accounts setup: no JWKS fetch, no admins, no shared
 # secret and no CORS unless a test configures them itself.
 os.environ["AUTH_MODE"] = "local"

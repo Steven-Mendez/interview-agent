@@ -19,6 +19,7 @@ from typing import Annotated
 from urllib.parse import urlsplit
 
 import jwt
+import sentry_sdk
 from fastapi import Depends, HTTPException, Request
 
 from interview_agent.config import settings
@@ -106,6 +107,14 @@ def _verify(token: str) -> dict:
 
 
 async def current_user(request: Request) -> User:
+    user = await _authenticate(request)
+    # This request's error reports name the account by its opaque id only
+    # (a no-op without Sentry).
+    sentry_sdk.set_user({"id": user.id})
+    return user
+
+
+async def _authenticate(request: Request) -> User:
     if settings.auth_mode == "local":
         return User(LOCAL_USER_ID, None, "Local developer")
     scheme, _, token = request.headers.get("authorization", "").partition(" ")

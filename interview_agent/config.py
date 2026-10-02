@@ -93,6 +93,10 @@ class Settings(BaseSettings):
         default="", alias="OTEL_EXPORTER_OTLP_HEADERS", repr=False
     )
     closing_timeout_seconds: int = Field(default=20, alias="CLOSING_TIMEOUT_SECONDS", ge=5, le=60)
+    # Error reports without interview content (see error_reporting); empty
+    # DSN: nothing is reported.
+    sentry_dsn: str = Field(default="", alias="SENTRY_DSN", repr=False)
+    sentry_environment: str = Field(default="development", alias="SENTRY_ENVIRONMENT")
 
     # LiveKit: key/secret auth the Inference gateway (STT/TTS); the server URL
     # is where the worker and the browser join interview rooms.

@@ -18,9 +18,9 @@ jobs:
       # API_ORIGIN is the API's origin without a trailing slash, e.g.
       # https://xxx.fastapicloud.dev. An asleep API can take a while to boot,
       # hence the retries and the generous timeout; running the work twice is
-      # harmless, so retrying a request that did arrive is too. -fsS prints the response
-      # and any error but never the request headers, so the token stays out of
-      # the log (no -v here).
+      # harmless, so retrying a request that did arrive is too. -fsS prints
+      # the response and any error but never the request headers, so the
+      # token stays out of the log (no -v here).
       - run: |
           curl -fsS -X POST "$API_ORIGIN/api/internal/maintenance" \
             -H "X-Internal-Token: $INTERNAL_API_TOKEN" \

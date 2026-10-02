@@ -4,8 +4,9 @@ Terraform for the managed services: the Postgres database on Neon (`neon/`)
 and the dashboards on Grafana Cloud (`grafana/`). Each directory is its own
 Terraform root with local state. The dashboards in `grafana/dashboards/` are
 the same files the local `lgtm` container provisions. The application side
-(the API, the web app and the worker, and the workflow that deploys them) is
-in the README's [Deploy](../README.md#deploy) section.
+(the API, the web app and the worker, and the workflows that deploy the API
+and the worker and run the daily maintenance) is in the README's
+[Deploy](../README.md#deploy) section.
 
 ## Prerequisites
 

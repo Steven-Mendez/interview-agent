@@ -10,7 +10,9 @@ name: Deploy
 # branches from even queueing a run, and each job's `if` checks the rest:
 # a successful CI run of a push to main. A pull request from a fork whose
 # branch is also called main carries head_branch == 'main' too, hence the
-# event check: a push run only ever comes from this repository.
+# event check: a push run only ever comes from this repository. A manual run
+# (workflow_dispatch) deploys only from main, and deploys the head of main as
+# it is, without waiting for CI.
 on:
   workflow_run:
     workflows: [CI]
@@ -29,8 +31,11 @@ permissions:
 
 jobs:
   migrate:
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push')
+    if: (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
+    # A migration waiting on a lock the live API holds must fail, not hold
+    # the deploy group (and every deploy queued behind it) for hours.
+    timeout-minutes: 15
     steps:
       # For workflow_run, github.sha is the default branch's latest commit,
       # which may be newer than the one CI tested: deploy exactly that one.
@@ -40,7 +45,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --no-dev --frozen
+      - run: uv sync --no-dev --locked
       # alembic/env.py reads DATABASE_URL through interview_agent.config, which
       # also points PGSSLROOTCERT at certifi's bundle for Neon's verify-full
       # URL. --no-sync: a plain `uv run` would add the dev group back.
@@ -50,8 +55,9 @@ jobs:
 
   api:
     needs: migrate
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push')
+    if: (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,7 +66,7 @@ jobs:
         with:
           enable-cache: true
       # With the dev group: `fastapi deploy` comes from fastapi-cloud-cli.
-      - run: uv sync --frozen
+      - run: uv sync --locked
       # A deploy token and the app's id: no login, no prompt (the CLI fails
       # instead of asking when CI is set). It uploads what .fastapicloudignore
       # lets through and waits for the deployment, so a failed build fails
@@ -69,11 +75,19 @@ jobs:
         env:
           FASTAPI_CLOUD_TOKEN: ${{ secrets.FASTAPI_CLOUD_TOKEN }}
           FASTAPI_CLOUD_APP_ID: ${{ secrets.FASTAPI_CLOUD_APP_ID }}
+      # The CLI exits 0 when it cannot confirm the final status, so ask the
+      # API itself: /api/healthz answers only while the app is up and reaches
+      # the database. The retries cover an API still booting after the deploy
+      # or from zero; an app that never comes up fails the job.
+      - run: curl -fsS --retry 10 --retry-delay 6 --retry-all-errors --max-time 60 "$API_ORIGIN/api/healthz"
+        env:
+          API_ORIGIN: ${{ secrets.API_ORIGIN }}
 
   worker:
     needs: migrate
-    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push')
+    if: (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       LK_VERSION: 2.18.8
       # sha256 of lk_2.18.8_linux_amd64.tar.gz, from the release's checksums.txt.
@@ -83,13 +97,15 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       # livekit.toml names the LiveKit Cloud agent to update; `lk agent create`
-      # writes it on the first deployment, done by hand. Until it is committed
-      # there is nothing to deploy to. hashFiles is not available in a job's
-      # `if`, so each step checks it. A warning rather than a notice: the worker
-      # checks the schema revision too, so one created by hand but not yet
-      # tracked here refuses every interview once `migrate` has moved the schema.
+      # writes it on the first deployment, done by hand, and it is committed.
+      # A checkout without it (a fresh setup before that first deployment, or
+      # a branch that dropped it) has nothing to deploy to, so each step
+      # checks it: hashFiles is not available in a job's `if`. A warning
+      # rather than a notice: the worker checks the schema revision too, so a
+      # worker left on its old code refuses every interview once `migrate`
+      # has moved the schema.
       - if: hashFiles('livekit.toml') == ''
-        run: echo "::warning::No livekit.toml, so the worker was not deployed. A worker created by hand stays on its old code and, if this run migrated the schema, refuses interviews until 'lk agent deploy' runs. Commit livekit.toml to deploy it from here."
+        run: echo "::warning::No livekit.toml in this checkout, so the worker was not deployed. A worker created by hand stays on its old code and, if this run migrated the schema, refuses interviews until 'lk agent deploy' runs. Commit livekit.toml to deploy it from here."
       # The same release archive the official installer (get.livekit.io/cli)
       # downloads, but a fixed version checked against a fixed hash: that
       # script always takes the latest release.

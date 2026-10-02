@@ -37,7 +37,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync
+      - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       # The live-LLM calibration test runs only with RUN_LIVE_LLM_TESTS=1.

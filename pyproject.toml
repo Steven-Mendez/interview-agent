@@ -43,7 +43,8 @@ dependencies = [
 [project.scripts]
 agent = "main:main"
 
-# `fastapi dev` / `fastapi run` / `fastapi deploy` without a path argument.
+# What `fastapi dev` and `fastapi run` load without a path argument, and what
+# FastAPI Cloud runs.
 [tool.fastapi]
 entrypoint = "interview_agent.server.app:app"
 

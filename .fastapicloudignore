@@ -2,10 +2,11 @@
 # already drops .env, .venv, caches, logs and build outputs; `!pattern` would
 # un-ignore). The API needs only interview_agent/, alembic/ with alembic.ini,
 # main.py, pyproject.toml and uv.lock; the rest below is the web app, the
-# worker's container, Terraform, tests, scripts and docs. Two files stay on
-# purpose: .python-version, so the platform builds with the same interpreter
-# as the local venv and the Docker image, and README.md, because pyproject's
-# `readme` points at it and the build on the platform reads it.
+# worker's container and its LiveKit Cloud agent (livekit.toml), Terraform,
+# tests, scripts and docs. Two files stay on purpose: .python-version, so
+# the platform builds with the same interpreter as the local venv and the
+# Docker image, and README.md, because pyproject's `readme` points at it and
+# the build on the platform reads it.
 web/
 infra/
 tests/
@@ -14,6 +15,7 @@ scripts/
 Dockerfile
 docker-compose.yml
 .dockerignore
+livekit.toml
 .env
 .env.*
 secrets*.env

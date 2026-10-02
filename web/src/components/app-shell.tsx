@@ -35,8 +35,13 @@ import {
 import { Spinner } from "@/components/ui/spinner"
 import { useMe } from "@/hooks/use-me"
 import { useSignOut } from "@/hooks/use-sign-out"
-import { useApiWaking } from "@/lib/api"
-import { safeRedirectPath, useAuth, useAuthMode } from "@/lib/auth"
+import { useApiWaking, wakeApi } from "@/lib/api"
+import {
+  neonAuthConfigured,
+  safeRedirectPath,
+  useAuth,
+  useAuthMode,
+} from "@/lib/auth"
 import type { AuthUser } from "@/lib/auth"
 import { cn } from "@/lib/utils"
 
@@ -408,9 +413,15 @@ const API_WAKING_MESSAGE = "Starting the server, this can take a few seconds…"
  *  page, so it never hides content or a control, and goes once the API
  *  answers. The live region stays mounted, and visible while empty (it
  *  takes no space then), so screen readers announce the message when it
- *  appears: a region hidden until then is not in the tree to announce. */
+ *  appears: a region hidden until then is not in the tree to announce.
+ *  A Neon build sends the API nothing before sign-in (it never asks GET
+ *  /auth/config), so the notice wakes it on load: the API boots while the
+ *  visitor signs in, not after. */
 function ApiWakingNotice() {
   const waking = useApiWaking()
+  React.useEffect(() => {
+    if (neonAuthConfigured) wakeApi()
+  }, [])
   return (
     <div role="status" className="flex justify-center">
       {waking && (

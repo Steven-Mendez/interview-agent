@@ -125,27 +125,41 @@ describe("resolveAuthMode", () => {
 })
 
 describe("the cold-start notice", () => {
-  it("turns on while GET /auth/config goes unanswered, off when it answers", async () => {
+  it("probes the API while GET /auth/config goes unanswered", async () => {
     vi.useFakeTimers()
     try {
       let answer!: (res: Response) => void
-      fetchMock.mockReturnValueOnce(
-        new Promise<Response>((resolve) => {
-          answer = resolve
-        })
-      )
+      let answerProbe!: (res: Response) => void
+      fetchMock
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            answer = resolve
+          })
+        )
+        .mockReturnValueOnce(
+          new Promise<Response>((resolve) => {
+            answerProbe = resolve
+          })
+        )
       const auth = await loadAuth()
       // The same fresh module instance auth.ts watches its fetch with.
       const waking = await import("@/lib/api-waking")
       const mode = auth.resolveAuthMode()
       await vi.advanceTimersByTimeAsync(3_999)
-      expect(waking.isApiWaking()).toBe(false)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
       await vi.advanceTimersByTimeAsync(1)
+      expect(fetchMock).toHaveBeenLastCalledWith(
+        "/api/healthz",
+        expect.anything()
+      )
+      await vi.advanceTimersByTimeAsync(1_000)
       expect(waking.isApiWaking()).toBe(true)
 
+      answerProbe(new Response(JSON.stringify({ status: "ok" })))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(waking.isApiWaking()).toBe(false)
       answer(config("local"))
       expect(await mode).toBe("local")
-      expect(waking.isApiWaking()).toBe(false)
     } finally {
       vi.useRealTimers()
     }

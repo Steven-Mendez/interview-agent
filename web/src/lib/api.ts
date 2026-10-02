@@ -349,7 +349,7 @@ export function setUnauthorizedHandler(handler: () => void): void {
 }
 
 export { suppressUnauthorizedRedirect } from "@/lib/redirect-suppression"
-export { useApiWaking } from "@/lib/api-waking"
+export { useApiWaking, wakeApi } from "@/lib/api-waking"
 
 /** The only fetch. Adds the user's JWT unless the caller brought its own
  *  credential (the closing routes carry the LiveKit participant token). */

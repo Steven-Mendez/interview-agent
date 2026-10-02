@@ -1,0 +1,115 @@
+name: Deploy
+
+# After CI passes on a push to main, and by hand. The schema goes first: the
+# API refuses to start on a database revision other than the one its code
+# expects (runtime.EXPECTED_REVISION), so the migration must land before the
+# new code. The API and the worker then deploy in parallel.
+#
+# workflow_run only fires once this file is on the default branch, and it
+# fires for CI runs on every branch and event; the branches filter keeps other
+# branches from even queueing a run, and each job's `if` checks the rest:
+# a successful CI run of a push to main. A pull request from a fork whose
+# branch is also called main carries head_branch == 'main' too, hence the
+# event check: a push run only ever comes from this repository.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time, and never cut one short: a migration or an upload
+# stopped halfway is worse than a newer commit waiting a few minutes.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    steps:
+      # For workflow_run, github.sha is the default branch's latest commit,
+      # which may be newer than the one CI tested: deploy exactly that one.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --no-dev --frozen
+      # alembic/env.py reads DATABASE_URL through interview_agent.config, which
+      # also points PGSSLROOTCERT at certifi's bundle for Neon's verify-full
+      # URL. --no-sync: a plain `uv run` would add the dev group back.
+      - run: uv run --no-sync alembic upgrade head
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+  api:
+    needs: migrate
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      # With the dev group: `fastapi deploy` comes from fastapi-cloud-cli.
+      - run: uv sync --frozen
+      # A deploy token and the app's id: no login, no prompt (the CLI fails
+      # instead of asking when CI is set). It uploads what .fastapicloudignore
+      # lets through and waits for the deployment, so a failed build fails
+      # this job. The app's variables live on FastAPI Cloud, not here.
+      - run: uv run --no-sync fastapi deploy
+        env:
+          FASTAPI_CLOUD_TOKEN: ${{ secrets.FASTAPI_CLOUD_TOKEN }}
+          FASTAPI_CLOUD_APP_ID: ${{ secrets.FASTAPI_CLOUD_APP_ID }}
+
+  worker:
+    needs: migrate
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    env:
+      LK_VERSION: 2.18.8
+      # sha256 of lk_2.18.8_linux_amd64.tar.gz, from the release's checksums.txt.
+      LK_SHA256: 3e0977d0385d2f220d7f455105ac52f8035f79e70aecdf70b6dc054179905c7c
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      # livekit.toml names the LiveKit Cloud agent to update; `lk agent create`
+      # writes it on the first deployment, done by hand. Until it is committed
+      # there is nothing to deploy to. hashFiles is not available in a job's
+      # `if`, so each step checks it. A warning rather than a notice: the worker
+      # checks the schema revision too, so one created by hand but not yet
+      # tracked here refuses every interview once `migrate` has moved the schema.
+      - if: hashFiles('livekit.toml') == ''
+        run: echo "::warning::No livekit.toml, so the worker was not deployed. A worker created by hand stays on its old code and, if this run migrated the schema, refuses interviews until 'lk agent deploy' runs. Commit livekit.toml to deploy it from here."
+      # The same release archive the official installer (get.livekit.io/cli)
+      # downloads, but a fixed version checked against a fixed hash: that
+      # script always takes the latest release.
+      - if: hashFiles('livekit.toml') != ''
+        run: |
+          archive="lk_${LK_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/livekit/livekit-cli/releases/download/v${LK_VERSION}/${archive}"
+          echo "${LK_SHA256}  $RUNNER_TEMP/$archive" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" lk
+          sudo install -m 0755 "$RUNNER_TEMP/lk" /usr/local/bin/lk
+          lk --version
+      # The LIVEKIT_* variables pick the project (they win over any saved
+      # one) and livekit.toml the agent; LiveKit Cloud builds the Dockerfile,
+      # whose last stage is the worker. stdin is not a terminal here, so the
+      # CLI never prompts. The worker's own variables are not passed here: they
+      # are the agent's secrets on LiveKit Cloud (`lk agent update-secrets`).
+      - if: hashFiles('livekit.toml') != ''
+        run: lk agent deploy
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}

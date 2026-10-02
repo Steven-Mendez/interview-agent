@@ -94,8 +94,31 @@ Set `AUTH_MODE=local` in `.env` for local development (`.env.example` does; the 
 
 Who is an admin is decided by `ADMIN_USER_IDS` alone: a comma-separated list of user ids (the JWT `sub`; `local:<username>` for a local account) read when the API starts. Admins have no interview quota and see the user list; everyone else is a guest, with `LIFETIME_INTERVIEWS_PER_USER` interviews each and `GUEST_INTERVIEWS_PER_MONTH` between them. Nothing in the token or in Neon Auth grants the role, so an account cannot promote itself. To add an admin: they sign in once, you read their id from `/admin/users` (or from `user_profiles`), add it to the variable and restart the API. A Neon Auth user keeps the same id everywhere the same Neon Auth project is used, so the id found in development is the one to put in production.
 
-For a deployment: the Postgres database on Neon (with Neon Auth) and the Grafana Cloud dashboards are provisioned with Terraform under `infra/` — [`infra/README.md`](infra/README.md) has the steps, and where `NEON_AUTH_URL` comes from. The frontend builds with its own variables, listed in `web/.env.example`: `VITE_NEON_AUTH_URL` for the Neon Auth sign-in, `VITE_API_BASE_URL` when the API lives on another origin, `VITE_SENTRY_DSN` for browser error reports. On the server side, `.env.example` documents the optional `SENTRY_DSN` and `SENTRY_ENVIRONMENT` (error reports without interview content), `CORS_ALLOWED_ORIGINS` (when the web app is served from a different origin) and the `OTEL_EXPORTER_OTLP_*` settings for Grafana Cloud.
-
 Tests need only Docker running: `uv run pytest` starts a throwaway Postgres 16 container for the session and removes it afterwards (no `.env`, no running database). To use an existing database instead, set `TEST_DATABASE_URL` to one whose name ends in `_test` (CI does this with its service container).
 
 > **Note on language and voice:** the interview language, the agent's name and its voice are set in the in-app Settings screen (not in `.env`). Speech recognition and synthesis are pinned to the configured language; the voice catalog lives in `interview_agent/voices.py`.
+
+## Deploy
+
+Each piece runs on a managed service:
+
+- **The API** on [FastAPI Cloud](https://fastapicloud.com). `fastapi deploy` (from the dev group) takes the entrypoint from `[tool.fastapi]` in `pyproject.toml` and uploads only what `.fastapicloudignore` lets through. Its variables are set with `fastapi cloud env set`, with `LOG_DIR` empty: the filesystem there is ephemeral, so the logs go to the console only. An idle API scales to zero, and the web app says so while the first request wakes it.
+- **The web app** on [Vercel](https://vercel.com), as a project with Root Directory `web`; `web/vercel.json` holds the build settings and the rewrite a SPA needs. Its build variables, listed in `web/.env.example`, are `VITE_API_BASE_URL` (the API's origin followed by `/api`), `VITE_NEON_AUTH_URL` and `VITE_SENTRY_DSN`; they are baked into the bundle, so changing one takes a new build.
+- **The worker** on [LiveKit Cloud](https://cloud.livekit.io), built from the Dockerfile's last stage. The first deployment is by hand: `lk agent create --secrets-file <file>` with the worker's variables as the agent's secrets, where `DATABASE_URL`, `INTERNAL_API_TOKEN`, `APP_BASE_URL` and `LIVEKIT_AGENT_NAME` take the API's values (LiveKit Cloud supplies `LIVEKIT_URL`, `LIVEKIT_API_KEY` and `LIVEKIT_API_SECRET` itself). It writes `livekit.toml`, which names the agent; commit it before the next push to `main`. Until it is in the repository the workflow below cannot deploy the worker, and since the worker also checks the schema revision, a migration would leave it refusing every interview until you run `lk agent deploy` by hand.
+- **Postgres with Neon Auth** on Neon and **the dashboards** on Grafana Cloud, provisioned with Terraform under `infra/`: [`infra/README.md`](infra/README.md) has the steps, and where `NEON_AUTH_URL` comes from.
+
+From then on, `main` deploys itself. Once CI passes on a push to `main` (or when run by hand from the Actions tab), `.github/workflows/deploy.yml` checks out the commit CI tested and applies the migrations to Neon first: the API refuses to start on a schema revision other than the one its code expects, so the schema must be ahead of the code. Then it deploys the API and the worker in parallel; the worker's job does nothing until `livekit.toml` is in the repository. The web app is not part of it: Vercel's Git integration builds it on its own. The workflow needs these repository secrets: `DATABASE_URL` (Neon's, from `infra/neon`), `FASTAPI_CLOUD_TOKEN` (a deploy token) and `FASTAPI_CLOUD_APP_ID`, and `LIVEKIT_URL`, `LIVEKIT_API_KEY` and `LIVEKIT_API_SECRET` for the LiveKit Cloud project.
+
+`.github/workflows/maintenance.yml` calls `POST /api/internal/maintenance` every day at 04:00 UTC: the retention purge and a sweep of the interviews' lifecycle. The API also purges on its own daily loop, but an API scaled to zero runs no loop. It needs two more secrets: `API_ORIGIN` (the API's origin, without a trailing slash) and `INTERNAL_API_TOKEN` (the API's own value).
+
+The API's production variables differ from `.env` in these (`.env.example` documents each one):
+
+- `DATABASE_URL` is Neon's, the `database_url` output of `infra/neon` (the direct host, not the pooler).
+- `INTERNAL_API_TOKEN` is a fresh random value (`openssl rand -hex 32`). Neon mode requires it, and the API, the worker's secrets and the `INTERNAL_API_TOKEN` repository secret must all hold the same one: the worker sends it to start the evaluation, the daily maintenance call sends it, and the API checks it.
+- `AUTH_MODE=neon` with `NEON_AUTH_URL`, and `ADMIN_USER_IDS` listing Neon Auth ids.
+- `CORS_ALLOWED_ORIGINS` with the Vercel origin, since the web app calls the API from another origin.
+- `APP_BASE_URL` with the API's own origin: the worker calls it to start the evaluation, so the worker gets the same value.
+- `SENTRY_DSN` with `SENTRY_ENVIRONMENT=production`, `LOG_DIR` empty, and the Grafana Cloud `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS`.
+- A `LIVEKIT_AGENT_NAME` of its own, such as `interviewer-prod`, set identically in the API and the worker, so a developer's local worker on the same LiveKit project never picks up a production interview.
+
+After the first deployment, trust the Vercel origin in Neon Auth (`neon neon-auth domain add`, see [`infra/README.md`](infra/README.md)) and add it to the authorized JavaScript origins of the Google OAuth app.

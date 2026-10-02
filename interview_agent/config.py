@@ -6,6 +6,7 @@ import ipaddress
 import os
 import re
 from collections.abc import MutableMapping
+from pathlib import Path
 from typing import Annotated, Literal, NamedTuple
 from urllib.parse import parse_qs, urlsplit
 
@@ -145,6 +146,10 @@ class Settings(BaseSettings):
     # DSN: nothing is reported.
     sentry_dsn: str = Field(default="", alias="SENTRY_DSN", repr=False)
     sentry_environment: str = Field(default="development", alias="SENTRY_ENVIRONMENT")
+    # Directory of the rotating metadata-only log files (server.log for the
+    # API, agent.log for the worker). Empty: console only, for hosts whose
+    # filesystem is read-only or gone with the next deploy (FastAPI Cloud).
+    log_dir: str = Field(default="logs", alias="LOG_DIR")
 
     # LiveKit: key/secret auth the Inference gateway (STT/TTS); the server URL
     # is where the worker and the browser join interview rooms.
@@ -183,6 +188,12 @@ class Settings(BaseSettings):
     def local_accounts_active(self) -> bool:
         """The dev login: AUTH_MODE=local with LOCAL_ACCOUNTS to sign in with."""
         return self.auth_mode == "local" and bool(self.local_accounts)
+
+    def log_file(self, name: str) -> Path | None:
+        """Where this process's log file goes: LOG_DIR/name, or None when
+        LOG_DIR is empty (console only)."""
+        log_dir = self.log_dir.strip()
+        return Path(log_dir) / name if log_dir else None
 
     def require_keys(self, role: Literal["api", "worker"]) -> Settings:
         """Fail fast with a clear message if any required API key is missing.

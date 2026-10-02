@@ -126,23 +126,41 @@ def protect_log_handlers() -> None:
         handler.setFormatter(formatter)
 
 
-def setup_file_logging(path: str = "logs/agent.log", level: int = logging.INFO) -> Path:
-    """Install metadata formatters on existing outputs and a private rotating file."""
-    log_path = Path(path)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+def setup_file_logging(
+    path: str | Path | None = "logs/agent.log", level: int = logging.INFO
+) -> Path | None:
+    """Install metadata formatters on existing outputs and a private rotating file.
+
+    No path (LOG_DIR empty) means console only. A directory that cannot be
+    created or a file that cannot be opened (a read-only or ephemeral host
+    filesystem) also leaves the console as the only output, with a warning,
+    rather than keeping the process from starting: the console still carries
+    the same metadata-only lines.
+    """
     root = logging.getLogger()
     protect_log_handlers()
-    formatter = MetadataFormatter()
     for handler in root.handlers:
         if getattr(handler, "_tag", None) == _HANDLER_TAG:
             return Path(handler.baseFilename)
-    handler = PrivateRotatingFileHandler(
-        log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
-    )
+    if path is None:
+        return None
+    log_path = Path(path)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = PrivateRotatingFileHandler(
+            log_path, maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+        )
+    except OSError:
+        # The path is not logged: it is configuration, and this message must
+        # stay a reviewed template (see log_templates).
+        logging.getLogger(__name__).warning(
+            "file logging unavailable: log directory not writable; console only"
+        )
+        return None
     handler.namer = _rotated_name
     handler.setLevel(level)
     handler._tag = _HANDLER_TAG
-    handler.setFormatter(formatter)
+    handler.setFormatter(MetadataFormatter())
     root.addHandler(handler)
     if root.level == logging.NOTSET or root.level > level:
         root.setLevel(level)

@@ -6,12 +6,16 @@ Usage:
 """
 
 from interview_agent.agent import run
+from interview_agent.config import settings
 from interview_agent.logging_config import setup_file_logging
 
 
 def main() -> None:
-    log_path = setup_file_logging()
-    print(f"[interview-agent] Writing logs to {log_path.resolve()}")
+    log_path = setup_file_logging(settings.log_file("agent.log"))
+    if log_path is None:
+        print("[interview-agent] Logs: console only")
+    else:
+        print(f"[interview-agent] Writing logs to {log_path.resolve()}")
     run()
 
 

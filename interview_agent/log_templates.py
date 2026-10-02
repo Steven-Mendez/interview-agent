@@ -61,6 +61,7 @@ SAFE_LOG_TEMPLATES = frozenset(
         "failed to persist interviewer token usage",
         "failed to persist transcript item",
         "failed to record candidate_left",
+        "file logging unavailable: log directory not writable; console only",
         "finishing interview %s (%s)",
         "healthz failed: %s",
         "idle timeout for %s",

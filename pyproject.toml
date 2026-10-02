@@ -17,6 +17,11 @@ dependencies = [
     # Config
     "pydantic-settings>=2.0",
     "fastapi>=0.139.0",
+    # The `fastapi` command (`fastapi run` with the entrypoint in
+    # [tool.fastapi] below), a runtime dependency so it also exists where the
+    # app is installed without the dev group, as on FastAPI Cloud. The deploy
+    # commands come from the dev-only fastapi-cloud-cli.
+    "fastapi-cli>=0.0.32",
     "uvicorn[standard]>=0.50.1",
     "python-multipart>=0.0.32",
     "markitdown[pdf]>=0.1.6",
@@ -38,12 +43,17 @@ dependencies = [
 [project.scripts]
 agent = "main:main"
 
+# `fastapi dev` / `fastapi run` / `fastapi deploy` without a path argument.
+[tool.fastapi]
+entrypoint = "interview_agent.server.app:app"
+
 [dependency-groups]
 dev = [
     "ruff>=0.14",
     "pytest>=8",
     "pytest-asyncio>=1.0",
     "testcontainers[postgres]>=4.15.0",
+    "fastapi-cloud-cli>=0.26.0",
 ]
 
 [tool.ruff]

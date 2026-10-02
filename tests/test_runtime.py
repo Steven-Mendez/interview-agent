@@ -221,8 +221,10 @@ async def test_schema_guard_rejects_stale_revision_before_any_session_starts(pos
 
 
 async def test_api_lifespan_records_effective_manifest_and_shutdowns_without_provider_calls(
-    postgres_sessionmaker, monkeypatch
+    postgres_sessionmaker, monkeypatch, caplog
 ):
+    import logging
+
     from fastapi import FastAPI
     from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 
@@ -233,6 +235,24 @@ async def test_api_lifespan_records_effective_manifest_and_shutdowns_without_pro
     monkeypatch.setattr(
         server_app, "create_engine_and_sessionmaker", lambda *args: (engine, postgres_sessionmaker)
     )
+    # Production's LOG_DIR= (empty): the startup must hand setup_file_logging
+    # no path, add no file handler and say so in the ready line. Checked here
+    # because the lifespan needs the database the fixture provides.
+    monkeypatch.setattr(server_app.settings, "log_dir", "")
+    log_paths, file_logging = [], server_app.setup_file_logging
+
+    def recording_file_logging(path, *args, **kwargs):
+        log_paths.append(path)
+        return file_logging(path, *args, **kwargs)
+
+    monkeypatch.setattr(server_app, "setup_file_logging", recording_file_logging)
+
+    def file_handlers():
+        root = logging.getLogger()
+        return [h for h in root.handlers if getattr(h, "_tag", None) == "interview_agent_file_log"]
+
+    file_handlers_before = len(file_handlers())
+    caplog.set_level(logging.INFO, logger="interview_agent.server")
     monkeypatch.setattr(server_app.settings, "openai_api_key", "synthetic-test-key")
     monkeypatch.setattr(server_app.settings, "livekit_api_key", "synthetic-test-key")
     monkeypatch.setattr(server_app.settings, "livekit_api_secret", "synthetic-test-secret")
@@ -259,6 +279,10 @@ async def test_api_lifespan_records_effective_manifest_and_shutdowns_without_pro
             row = (await session.scalars(select(db.ProcessManifest))).one()
             assert row.role == "api" and row.snapshot["provider_calls_performed"] is False
         assert application.state.evaluations.running == 0
+        assert log_paths == [None]
+        assert len(file_handlers()) == file_handlers_before
+        ready = next(r for r in caplog.records if r.msg == "server ready")
+        assert ready.log_file == "console only"
     assert services == ["interview-agent-api"]
     # Shut down with the process: later samples go nowhere.
     otel_metrics.record("server", "after_shutdown", 1)

@@ -78,10 +78,11 @@ async def _purge_loop(sessionmaker) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Same rotating-file setup as the worker, in its own file. INFO on the
-    # console: uvicorn only wires its own loggers, not the app's.
+    # Same rotating-file setup as the worker, in its own file under LOG_DIR
+    # (none when it is empty, as in production). INFO on the console: uvicorn
+    # only wires its own loggers, not the app's.
     logging.basicConfig(level=logging.INFO)  # no-op if handlers already exist
-    log_path = setup_file_logging("logs/server.log")
+    log_path = setup_file_logging(settings.log_file("server.log"))
 
     settings.require_keys("api")
     warn_local_mode()
@@ -95,7 +96,7 @@ async def lifespan(app: FastAPI):
     logger.info(
         "server ready",
         extra={
-            "log_file": str(log_path),
+            "log_file": str(log_path) if log_path else "console only",
             "max_concurrent_interviews": settings.max_concurrent_interviews,
         },
     )

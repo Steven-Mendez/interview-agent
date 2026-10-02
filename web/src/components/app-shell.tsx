@@ -32,8 +32,10 @@ import {
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
+import { Spinner } from "@/components/ui/spinner"
 import { useMe } from "@/hooks/use-me"
 import { useSignOut } from "@/hooks/use-sign-out"
+import { useApiWaking } from "@/lib/api"
 import { safeRedirectPath, useAuth, useAuthMode } from "@/lib/auth"
 import type { AuthUser } from "@/lib/auth"
 import { cn } from "@/lib/utils"
@@ -397,6 +399,30 @@ function TopBar({ onMenu }: { onMenu: () => void }) {
   )
 }
 
+// ---- Cold start ---------------------------------------------------------------
+
+const API_WAKING_MESSAGE = "Starting the server, this can take a few seconds…"
+
+/** While the API boots after idling: a small notice above the page, on
+ *  every page including sign-in. It sits in the flow rather than over the
+ *  page, so it never hides content or a control, and goes once the API
+ *  answers. The live region stays mounted, and visible while empty (it
+ *  takes no space then), so screen readers announce the message when it
+ *  appears: a region hidden until then is not in the tree to announce. */
+function ApiWakingNotice() {
+  const waking = useApiWaking()
+  return (
+    <div role="status" className="flex justify-center">
+      {waking && (
+        <p className="mx-4 mt-3 flex items-center gap-3 rounded-md bg-inverse-surface px-4 py-2 text-sm text-inverse-foreground shadow-e2">
+          <Spinner className="text-inverse-foreground" />
+          {API_WAKING_MESSAGE}
+        </p>
+      )}
+    </div>
+  )
+}
+
 function AppShell({
   immersive,
   children,
@@ -428,6 +454,7 @@ function AppShell({
       >
         Skip to content
       </a>
+      <ApiWakingNotice />
       {chrome && <TopBar onMenu={() => setDrawerOpen(true)} />}
       <div className="flex min-h-0 flex-1">
         {chrome && <SideNav />}

@@ -65,3 +65,8 @@ web/.output/
 *.tfstate
 *.tfstate.*
 *.tfvars
+
+# Hosting CLIs' local project links (vercel link, fastapi deploy).
+.vercel/
+web/.vercel/
+.fastapicloud/

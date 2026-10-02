@@ -124,6 +124,34 @@ describe("resolveAuthMode", () => {
   })
 })
 
+describe("the cold-start notice", () => {
+  it("turns on while GET /auth/config goes unanswered, off when it answers", async () => {
+    vi.useFakeTimers()
+    try {
+      let answer!: (res: Response) => void
+      fetchMock.mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          answer = resolve
+        })
+      )
+      const auth = await loadAuth()
+      // The same fresh module instance auth.ts watches its fetch with.
+      const waking = await import("@/lib/api-waking")
+      const mode = auth.resolveAuthMode()
+      await vi.advanceTimersByTimeAsync(3_999)
+      expect(waking.isApiWaking()).toBe(false)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(waking.isApiWaking()).toBe(true)
+
+      answer(config("local"))
+      expect(await mode).toBe("local")
+      expect(waking.isApiWaking()).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
 describe("useAuthMode", () => {
   it("is unknown until the API answers, and keeps asking a silent one", async () => {
     vi.useFakeTimers()

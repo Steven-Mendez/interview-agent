@@ -2,6 +2,7 @@ import * as React from "react"
 import { BetterAuthReactAdapter } from "@neondatabase/neon-js/auth/react/adapters"
 
 import { API_BASE } from "@/lib/api-base"
+import { watchApiFetch } from "@/lib/api-waking"
 import {
   getLocalAccessToken,
   getLocalSession,
@@ -71,7 +72,8 @@ function subscribeMode(listener: () => void) {
 async function fetchAuthMode(): Promise<AuthMode> {
   let mode: unknown
   try {
-    const res = await fetch(`${API_BASE}/auth/config`)
+    // Usually a visit's first request, so the one that finds the API asleep.
+    const res = await watchApiFetch(fetch(`${API_BASE}/auth/config`))
     if (!res.ok) throw new Error()
     mode = ((await res.json()) as { mode?: unknown } | null)?.mode
   } catch {

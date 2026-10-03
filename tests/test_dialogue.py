@@ -806,7 +806,9 @@ async def test_cancelled_worker_reservation_survives_replacement_and_exhaustion(
 async def test_repair_inherits_remaining_deadline_and_no_more_requests_after_expiry(
     postgres_sessionmaker, monkeypatch
 ):
-    monkeypatch.setattr(turns, "DECISION_SECONDS", 0.35)
+    # Hosted PostgreSQL runners need headroom for admission and preparation:
+    # expiring before repair starts would test a different path altogether.
+    monkeypatch.setattr(turns, "DECISION_SECONDS", 1.0)
 
     async def answer(context, call):
         await asyncio.sleep(0.2 if call == 1 else 2)
@@ -816,7 +818,7 @@ async def test_repair_inherits_remaining_deadline_and_no_more_requests_after_exp
     started = time.monotonic()
     with pytest.raises(turns.TurnDecisionError, match="deadline"):
         await graph.run_turn("slow-turn")
-    assert time.monotonic() - started < 1.5
+    assert time.monotonic() - started < 2.0
     options = [call.kwargs for call in dialogue.build_chat_model.call_args_list]
     assert [item["max_retries"] for item in options] == [1, 1]
     assert options[1]["timeout_seconds"] < options[0]["timeout_seconds"] - 0.15

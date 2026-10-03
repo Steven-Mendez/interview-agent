@@ -57,6 +57,27 @@ const LEVEL_INTERVAL_MS = 100
 
 type Device = "microphone" | "camera"
 
+// Every stream getUserMedia has handed the preview and nobody has stopped
+// yet, across all mounted previews. The per-instance bookkeeping (the
+// generation counter, streamRef) already stops each stream it knows about;
+// this is the backstop for one it lost track of, because a camera left
+// running with no element showing it reads to the candidate as being
+// recorded, and nothing on the page can turn it off.
+const openStreams = new Set<MediaStream>()
+
+function stopStream(stream: MediaStream | null | undefined) {
+  if (!stream) return
+  stream.getTracks().forEach((track) => track.stop())
+  openStreams.delete(stream)
+}
+
+/** Stops every capture the device preview opened, wherever it lives. The
+ *  preview calls it on unmount; exported so a page that owns the preview can
+ *  release it on its own way out too. */
+export function stopAllPreviewStreams() {
+  for (const stream of [...openStreams]) stopStream(stream)
+}
+
 const DEVICE_LABEL: Record<Device, string> = {
   microphone: "Microphone",
   camera: "Camera",
@@ -137,7 +158,7 @@ export function useDevicePreview(): DevicePreview {
     releasedRef.current = false
     micHandedOverRef.current = false
     stopMeter()
-    streamRef.current?.getTracks().forEach((track) => track.stop())
+    stopStream(streamRef.current)
     streamRef.current = null
     setStream(null)
     setStatus("idle")
@@ -187,7 +208,11 @@ export function useDevicePreview(): DevicePreview {
     (nextMicId: string, nextCamId: string, wantCamera: boolean) => {
       if (disposedRef.current) return
       const generation = ++generationRef.current
-      const stale = () => generation !== generationRef.current
+      // Disposed counts as stale on its own, not only through the generation
+      // bump in the unmount cleanup: a stream that lands after the page is
+      // gone must be stopped however the counter moved since.
+      const stale = () =>
+        disposedRef.current || generation !== generationRef.current
       void (async () => {
         // Typed as always present, but absent in practice on an insecure
         // origin — which is exactly the case worth explaining to the user.
@@ -203,7 +228,7 @@ export function useDevicePreview(): DevicePreview {
         if (!withAudio && !wantCamera) {
           // Camera off while the interview holds the microphone: drop the
           // video and leave everything else as it is.
-          streamRef.current?.getTracks().forEach((track) => track.stop())
+          stopStream(streamRef.current)
           streamRef.current = null
           setStream(null)
           setCameraOn(false)
@@ -231,6 +256,10 @@ export function useDevicePreview(): DevicePreview {
               audio: withAudio ? audio : false,
               video: wantCamera ? video : false,
             })
+            // Registered the moment it exists, before any check that might
+            // return early: from here on it is either the live preview or
+            // stopped.
+            openStreams.add(next)
           } catch (err) {
             if (!withAudio) {
               // Video only: the microphone is not part of this request, so
@@ -249,6 +278,7 @@ export function useDevicePreview(): DevicePreview {
             console.error("[app] camera preview failed:", err)
             cameraError = messageFor(err, "camera")
             next = await media.getUserMedia({ audio })
+            openStreams.add(next)
           }
         } catch (err) {
           if (stale()) return
@@ -264,13 +294,13 @@ export function useDevicePreview(): DevicePreview {
         if (stale()) {
           // Superseded while the prompt was up (a newer pick, a release, or
           // the panel is gone): nobody owns this stream, so stop it here.
-          next.getTracks().forEach((track) => track.stop())
+          stopStream(next)
           return
         }
 
         // Swap only after the new stream exists: a failed switch leaves the
         // working preview running instead of a black panel.
-        streamRef.current?.getTracks().forEach((track) => track.stop())
+        stopStream(streamRef.current)
         streamRef.current = next
         releasedRef.current = false
         setStream(next)
@@ -363,8 +393,11 @@ export function useDevicePreview(): DevicePreview {
   }, [open, micId, camId])
 
   // Release the camera and the microphone on unmount — navigating away must
-  // never leave the recording indicator on. Bumping the generation covers
-  // the prompt still open at that moment: its stream is stopped on arrival.
+  // never leave the recording indicator on. Bumping the generation (and
+  // disposedRef) covers the prompt still open at that moment: its stream is
+  // stopped on arrival. Only one preview is ever mounted (the interview
+  // page's), so stopping every stream the preview opened is safe here, and it
+  // also catches one this instance's refs no longer point at.
   React.useEffect(() => {
     disposedRef.current = false
     return () => {
@@ -378,7 +411,9 @@ export function useDevicePreview(): DevicePreview {
       meterRef.current = null
       void audioContextRef.current?.close().catch(() => {})
       audioContextRef.current = null
-      streamRef.current?.getTracks().forEach((track) => track.stop())
+      stopStream(streamRef.current)
+      streamRef.current = null
+      stopAllPreviewStreams()
     }
   }, [])
 

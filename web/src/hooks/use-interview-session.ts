@@ -1,6 +1,6 @@
 import * as React from "react"
 import { Room, RoomEvent, RpcError } from "livekit-client"
-import type { TextStreamHandler } from "livekit-client"
+import type { LocalTrack, TextStreamHandler } from "livekit-client"
 
 import {
   getInterviewToken,
@@ -100,6 +100,15 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : "Something went wrong."
 }
 
+// Room.disconnect() stops the tracks it unpublishes, but it first waits on the
+// server's leave, and a track that was still being published when it ran is
+// not on its list. Stopping the local tracks directly releases the microphone
+// at once whatever the disconnect does.
+function stopLocalTracks(room: Room) {
+  for (const publication of room.localParticipant.getTrackPublications())
+    publication.track?.stop()
+}
+
 export function useInterviewSession(interviewId: string): InterviewSession {
   const [phase, setPhase] = React.useState<SessionPhase>("idle")
   const [error, setError] = React.useState<string | null>(null)
@@ -113,6 +122,28 @@ export function useInterviewSession(interviewId: string): InterviewSession {
     React.useState(false)
   const farewellRef = React.useRef<FarewellPlayback | null>(null)
   const stopOnsetRef = React.useRef<(() => void) | null>(null)
+  // The farewell plays through this AudioContext, created and resumed inside
+  // the clicks that start and end the interview: Safari only lets a context
+  // make sound once a user gesture resumed it, and the clip arrives seconds
+  // after any click, too late for a media element's play() to count as one.
+  const farewellAudioRef = React.useRef<AudioContext | null>(null)
+  const unlockFarewellAudio = React.useCallback(() => {
+    let context = farewellAudioRef.current
+    if (!context || context.state === "closed") {
+      try {
+        context = new AudioContext()
+      } catch {
+        // No Web Audio: the farewell falls back to a media element.
+        return
+      }
+      farewellAudioRef.current = context
+    }
+    if (context.state !== "running") void context.resume().catch(() => {})
+  }, [])
+  const closeFarewellAudio = React.useCallback(() => {
+    void farewellAudioRef.current?.close().catch(() => {})
+    farewellAudioRef.current = null
+  }, [])
 
   // Refs for the transcription bookkeeping — mutated imperatively inside the
   // stream handlers.
@@ -324,6 +355,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
       // Start from a user action. Microphone acquisition also lets LiveKit
       // attempt audio playback; the UI offers recovery if it stays blocked.
       if (phaseRef.current !== "idle") return
+      unlockFarewellAudio()
 
       void (async () => {
         setPhase("connecting")
@@ -331,6 +363,12 @@ export function useInterviewSession(interviewId: string): InterviewSession {
         setError(null)
         let r: Room | null = null
         let handedOver = false
+        // The microphone tracks this start opened, published or not.
+        let micTracks: LocalTrack[] = []
+        // Read through a call: the page can go away during any await below,
+        // and a plain `disposedRef.current` would stay narrowed to false by
+        // the first check.
+        const pageGone = () => disposedRef.current
         try {
           const {
             server_url,
@@ -354,6 +392,10 @@ export function useInterviewSession(interviewId: string): InterviewSession {
               autoGainControl: true,
             },
             publishDefaults: { dtx: true },
+            // The SDK's default today; spelled out because leaving the room
+            // must release the microphone, whatever a later version defaults
+            // to.
+            stopLocalTrackOnUnpublish: true,
             // Interviewer audio and the farewell clip follow the same output.
             ...(options?.audioOutputDeviceId
               ? { audioOutput: { deviceId: options.audioOutputDeviceId } }
@@ -391,14 +433,18 @@ export function useInterviewSession(interviewId: string): InterviewSession {
                 // close the room (a server-reconciled end).
                 stopOnsetRef.current?.()
                 stopOnsetRef.current = null
+                closeFarewellAudio()
                 cancelTranscriptions()
+                if (roomRef.current) stopLocalTracks(roomRef.current)
                 void roomRef.current?.disconnect()
               },
               onBlocked: setFarewellBlocked,
               onError: setError,
               onRecoveryPending: () => setClosingRecoveryPending(true),
             },
-            token
+            token,
+            undefined,
+            () => farewellAudioRef.current
           )
           // Until start() hands the room to the UI, a disconnect is a start
           // failure and the catch below owns the phase — including the
@@ -429,20 +475,63 @@ export function useInterviewSession(interviewId: string): InterviewSession {
           })
 
           await r.connect(server_url, token)
+          // Navigated away while connecting: never open a microphone for a
+          // page that is gone.
+          if (pageGone()) {
+            void r.disconnect()
+            return
+          }
           // Only now, with a room to publish into, does the pre-join check
           // let go of the microphone: a 409/429 on the token or a failed
           // connect returns to a check that is still running.
           handedOver = true
           options?.beforePublish?.()
-          if (
-            !farewellRef.current.isClosing &&
-            !farewellRef.current.isFinished
-          ) {
-            await r.localParticipant.setMicrophoneEnabled(true)
+          const farewell = farewellRef.current
+          // Read through a call: it changes during the awaits below.
+          const farewellBegun = () => farewell.isClosing || farewell.isFinished
+          if (!farewellBegun()) {
+            // Opened and published in two steps rather than through
+            // setMicrophoneEnabled(true), so the page can be checked in
+            // between. The permission prompt may still be open here: if the
+            // candidate leaves before answering it, the unmount's disconnect
+            // runs first, and a track then handed to publishTrack on a
+            // closed room waits for a reconnect that never comes, capturing
+            // for 15 s until the SDK's timeout stops it. createTracks still
+            // applies the room's audioCaptureDefaults and tags the track as
+            // the microphone.
+            micTracks = await r.localParticipant.createTracks({ audio: true })
+            if (pageGone()) {
+              micTracks.forEach((track) => track.stop())
+              void r.disconnect()
+              return
+            }
+            // The same wait applies when the line dropped during the prompt:
+            // fail now, and the catch below stops the track.
+            if (link.lost) {
+              throw new Error(
+                "The connection dropped before the interview started."
+              )
+            }
+            const participant = r.localParticipant
+            await Promise.all(
+              micTracks.map((track) => participant.publishTrack(track))
+            )
             // Muted in the pre-join check: published, so unmuting in the
-            // room is instant, but silent until the candidate says so.
-            if (options?.startMuted)
+            // room is instant, but silent until the candidate says so. The
+            // farewell's own mute finds no publication while the track is
+            // still publishing, so a closing that began meanwhile is honored
+            // here too.
+            if (options?.startMuted || farewellBegun())
               await r.localParticipant.setMicrophoneEnabled(false)
+          }
+          // Navigated away while the microphone was publishing or muting:
+          // stop it here too rather than rely on the unmount's disconnect
+          // having seen the publication.
+          if (pageGone()) {
+            micTracks.forEach((track) => track.stop())
+            stopLocalTracks(r)
+            void r.disconnect()
+            return
           }
           if (link.lost) {
             throw new Error(
@@ -470,6 +559,10 @@ export function useInterviewSession(interviewId: string): InterviewSession {
           // otherwise stay joined — agent dispatched, nobody left to hang
           // up — behind a panel that says idle. A no-op on a room that
           // never connected.
+          // A track whose publish failed is on no publication list, so it is
+          // stopped by hand.
+          micTracks.forEach((track) => track.stop())
+          if (r) stopLocalTracks(r)
           void r?.disconnect()
           phaseRef.current = "idle"
           setPhase("idle")
@@ -485,12 +578,17 @@ export function useInterviewSession(interviewId: string): InterviewSession {
       setBubbleText,
       finalizeBubble,
       cancelTranscriptions,
+      unlockFarewellAudio,
+      closeFarewellAudio,
     ]
   )
 
   const requestEnd = React.useCallback(() => {
     const r = roomRef.current
     if (!r || phaseRef.current !== "live") return
+    // The confirm click: renews the farewell context's gesture if the
+    // browser suspended it during the interview.
+    unlockFarewellAudio()
     const agent = [...r.remoteParticipants.values()].find(
       (participant) => participant.isAgent
     )
@@ -518,7 +616,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
         // closing. Keep the independent API supervision and its fixed deadline.
       }
     )
-  }, [])
+  }, [unlockFarewellAudio])
 
   const resumeFarewell = React.useCallback(() => {
     void farewellRef.current?.resume()
@@ -559,9 +657,11 @@ export function useInterviewSession(interviewId: string): InterviewSession {
       stopOnsetRef.current?.()
       cancelTranscriptions()
       farewellRef.current?.dispose()
+      closeFarewellAudio()
+      if (roomRef.current) stopLocalTracks(roomRef.current)
       void roomRef.current?.disconnect()
     }
-  }, [cancelTranscriptions])
+  }, [cancelTranscriptions, closeFarewellAudio])
 
   return {
     phase,

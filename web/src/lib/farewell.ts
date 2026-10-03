@@ -1,11 +1,75 @@
 import { RoomEvent } from "livekit-client"
 import type { ByteStreamReader, Room } from "livekit-client"
 import { acknowledgeFarewell, getClosingState } from "./api"
-import type { PlaybackAcknowledgement } from "./api"
+import type { PlaybackAcknowledgement, PlaybackErrorKind } from "./api"
+import { captureRouteError } from "./error-reporting"
 
 const CONTROL_TOPIC = "interview.control"
 const AUDIO_TOPIC = "interview.farewell_audio"
 const MAX_CLIP_BYTES = 5_000_000
+// How long a suspended AudioContext gets to start outside a gesture. Safari
+// leaves resume() pending until the next click instead of rejecting it.
+const RESUME_WAIT_MS = 500
+
+// Kinds the API accepts; anything else is reported as "other". Names and
+// codes only: a browser's error message can describe the media it failed on.
+const DOM_ERROR_KINDS: ReadonlySet<string> = new Set([
+  "NotAllowedError",
+  "NotSupportedError",
+  "AbortError",
+  "NotFoundError",
+  "EncodingError",
+  "InvalidStateError",
+  "SecurityError",
+])
+const MEDIA_ERROR_KINDS: Record<number, PlaybackErrorKind> = {
+  1: "MEDIA_ERR_ABORTED",
+  2: "MEDIA_ERR_NETWORK",
+  3: "MEDIA_ERR_DECODE",
+  4: "MEDIA_ERR_SRC_NOT_SUPPORTED",
+}
+
+/** Why playback failed, as a bounded category the API and Sentry can keep. */
+export function playbackErrorKind(error: unknown): PlaybackErrorKind {
+  if (error && typeof error === "object") {
+    const { name, code } = error as { name?: unknown; code?: unknown }
+    if (typeof name === "string" && DOM_ERROR_KINDS.has(name))
+      return name as PlaybackErrorKind
+    // A media element reports through `audio.error`: a MediaError, which has
+    // a numeric code and no name.
+    if (typeof code === "number" && typeof name !== "string")
+      return MEDIA_ERROR_KINDS[code] ?? "other"
+  }
+  return "other"
+}
+
+/** A Sentry report whose type carries the kind: the scrubber drops messages. */
+class FarewellPlaybackError extends Error {
+  constructor(kind: PlaybackErrorKind) {
+    super(kind)
+    this.name = `FarewellPlaybackError[${kind}]`
+  }
+}
+
+/** The clip's exact bytes. Byte stream chunks are views into larger packets
+ *  (protobuf decodes `bytes` with subarray), so each is copied by its own
+ *  offset and length, never through its underlying buffer. */
+export function joinChunks(chunks: ReadonlyArray<Uint8Array>) {
+  const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0)
+  const bytes = new Uint8Array(size)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return bytes
+}
+
+// Chrome can route a whole AudioContext to a chosen output; Safari cannot,
+// and the DOM typings do not declare it yet.
+type RoutableAudioContext = AudioContext & {
+  setSinkId?: (sinkId: string) => Promise<void>
+}
 
 type FarewellStatus =
   "pending" | "played" | "failed" | "timeout" | "not_possible"
@@ -30,6 +94,9 @@ export class FarewellPlayback {
   private attempt: Attempt | null = null
   private audio: HTMLAudioElement | null = null
   private audioUrl: string | null = null
+  // The Web Audio path: a decoded clip waits here until its context runs.
+  private clip: { context: AudioContext; buffer: AudioBuffer } | null = null
+  private source: AudioBufferSourceNode | null = null
   private readAbort: AbortController | null = null
   private timer: ReturnType<typeof setTimeout> | null = null
   private received = false
@@ -56,12 +123,16 @@ export class FarewellPlayback {
     private conversationId: string,
     private callbacks: Callbacks,
     private participantToken: string,
-    private makeAudio: () => HTMLAudioElement = () => new Audio()
+    private makeAudio: () => HTMLAudioElement = () => new Audio(),
+    /** The session's AudioContext, created and resumed from a click: Safari
+     *  only lets a context started by a user gesture make sound later. */
+    private audioContext: () => RoutableAudioContext | null = () => null
   ) {
     room.on(RoomEvent.DataReceived, this.onControl)
     room.registerByteStreamHandler(AUDIO_TOPIC, (reader, participant) => {
       void this.receive(reader, participant.identity).catch(() => {
-        this.failPlayback("Could not receive the farewell audio.")
+        // The byte stream broke or arrived short: no media error to name.
+        this.failPlayback("Could not receive the farewell audio.", "stream")
       })
     })
   }
@@ -311,25 +382,30 @@ export class FarewellPlayback {
     this.readAbort = new AbortController()
     const chunks = await reader.readAll({ signal: this.readAbort.signal })
     if (this.shouldIgnoreAudio()) return
-    const size = chunks.reduce((total, chunk) => total + chunk.byteLength, 0)
-    if (size !== reader.info.size) throw new Error("Incomplete farewell clip")
-    const blob = new Blob(
-      chunks.map((chunk) => new Uint8Array(chunk).buffer),
-      {
-        type: "audio/wav",
-      }
+    const bytes = joinChunks(chunks)
+    if (bytes.byteLength !== reader.info.size)
+      throw new Error("Incomplete farewell clip")
+    const output = this.room.options.audioOutput?.deviceId
+    if (await this.prepareDecoded(bytes, output)) {
+      await this.resume()
+      return
+    }
+    if (this.shouldIgnoreAudio()) return
+    this.audioUrl = URL.createObjectURL(
+      new Blob([bytes], { type: "audio/wav" })
     )
-    this.audioUrl = URL.createObjectURL(blob)
     const audio = this.makeAudio()
     this.audio = audio
     audio.src = this.audioUrl
-    const output = this.room.options.audioOutput?.deviceId
     if (output && typeof audio.setSinkId === "function") {
       try {
         await audio.setSinkId(output)
         this.audioOutput = "selected"
-      } catch {
-        this.failPlayback("Could not use the selected audio output.")
+      } catch (error) {
+        this.failPlayback(
+          "Could not use the selected audio output.",
+          playbackErrorKind(error)
+        )
         return
       }
     }
@@ -337,15 +413,52 @@ export class FarewellPlayback {
       if (this.startedAt === null) this.startedAt = performance.now()
       this.callbacks.onBlocked(false)
     }
-    audio.onended = () => {
-      if (this.finished || this.disposed || this.expired) return
-      this.played = true
-      if (this.timer) clearTimeout(this.timer)
-      void this.confirmPlayed()
-    }
+    audio.onended = () => this.onClipEnded()
     audio.onerror = () =>
-      this.failPlayback("Could not play the farewell audio.")
+      this.failPlayback(
+        "Could not play the farewell audio.",
+        playbackErrorKind(audio.error)
+      )
     await this.resume()
+  }
+
+  /** Decodes the clip for the session's AudioContext. False leaves the media
+   *  element to play it: no context, an output the context cannot route to,
+   *  or bytes this browser's decoder refuses. */
+  private async prepareDecoded(bytes: Uint8Array, output: string | undefined) {
+    const context = this.audioContext()
+    if (!context || context.state === "closed") return false
+    if (output && typeof context.setSinkId !== "function") return false
+    let buffer: AudioBuffer
+    try {
+      // decodeAudioData detaches what it is given: decode a copy, so the
+      // element fallback still has the bytes.
+      buffer = await context.decodeAudioData(bytes.slice().buffer)
+    } catch {
+      return false
+    }
+    if (this.shouldIgnoreAudio()) return false
+    if (output && context.setSinkId) {
+      try {
+        await context.setSinkId(output)
+        this.audioOutput = "selected"
+      } catch (error) {
+        this.failPlayback(
+          "Could not use the selected audio output.",
+          playbackErrorKind(error)
+        )
+        return true
+      }
+    }
+    this.clip = { context, buffer }
+    return true
+  }
+
+  private onClipEnded() {
+    if (this.finished || this.disposed || this.expired) return
+    this.played = true
+    if (this.timer) clearTimeout(this.timer)
+    void this.confirmPlayed()
   }
 
   private async confirmPlayed() {
@@ -358,8 +471,12 @@ export class FarewellPlayback {
     // keeps the independent transcript seal barrier and the original deadline.
   }
 
+  /** Starts the clip; also the "Enable audio" click, whose gesture is what
+   *  lets a suspended context or a blocked element start. */
   async resume() {
-    if (!this.audio || this.finished || this.expired || this.disposed) return
+    if (this.finished || this.expired || this.disposed) return
+    if (this.clip) return this.startDecoded(this.clip)
+    if (!this.audio) return
     try {
       await this.audio.play()
       this.callbacks.onBlocked(false)
@@ -367,24 +484,82 @@ export class FarewellPlayback {
       if (error instanceof DOMException && error.name === "NotAllowedError") {
         this.callbacks.onBlocked(true)
       } else {
-        this.failPlayback("Could not play the farewell audio.")
+        this.failPlayback(
+          "Could not play the farewell audio.",
+          playbackErrorKind(error)
+        )
       }
     }
   }
 
-  private failPlayback(message: string) {
+  private async startDecoded(clip: {
+    context: AudioContext
+    buffer: AudioBuffer
+  }) {
+    if (this.source) return
+    const { context } = clip
+    if (context.state !== "running") {
+      // Called synchronously from a click, this is the gesture Safari needs.
+      const resumed = context.resume().then(
+        () => true,
+        () => false
+      )
+      await Promise.race([
+        resumed,
+        new Promise((resolve) => setTimeout(resolve, RESUME_WAIT_MS)),
+      ])
+      // A click may have started the clip while this call waited.
+      if (
+        this.clip !== clip ||
+        this.isPlayingClip() ||
+        this.shouldIgnoreAudio()
+      )
+        return
+      if ((context.state as string) !== "running") {
+        // Autoplay was refused, as play()'s NotAllowedError would say.
+        this.callbacks.onBlocked(true)
+        return
+      }
+    }
+    const source = context.createBufferSource()
+    source.buffer = clip.buffer
+    source.connect(context.destination)
+    source.onended = () => this.onClipEnded()
+    try {
+      source.start()
+    } catch (error) {
+      this.failPlayback(
+        "Could not play the farewell audio.",
+        playbackErrorKind(error)
+      )
+      return
+    }
+    this.source = source
+    if (this.startedAt === null) this.startedAt = performance.now()
+    this.callbacks.onBlocked(false)
+  }
+
+  private isPlayingClip() {
+    return this.source !== null
+  }
+
+  private failPlayback(message: string, kind: PlaybackErrorKind) {
     if (this.disposed || this.finished || this.expired || this.played) return
     if (this.timer) clearTimeout(this.timer)
     this.expired = true
     this.stopAudio()
     this.callbacks.onBlocked(false)
     this.callbacks.onError(message)
-    void this.acknowledge("failed")
+    captureRouteError(new FarewellPlaybackError(kind))
+    void this.acknowledge("failed", kind)
     if (this.pendingCompletion && this.sealed)
       this.complete(this.pendingCompletion)
   }
 
-  private async acknowledge(status: "played" | "failed" | "timeout") {
+  private async acknowledge(
+    status: "played" | "failed" | "timeout",
+    errorKind?: PlaybackErrorKind
+  ) {
     if (!this.attempt || this.disposed) return
     if (this.pendingAck?.status !== "played") {
       this.pendingAck = {
@@ -397,6 +572,7 @@ export class FarewellPlayback {
             ? null
             : (performance.now() - this.startedAt) / 1000,
         audio_output: this.audioOutput,
+        ...(status === "failed" && errorKind ? { error_kind: errorKind } : {}),
       }
     }
     return this.flushAck(3)
@@ -404,7 +580,7 @@ export class FarewellPlayback {
 
   private async flushAck(attempts = 1) {
     if (!this.pendingAck || this.ackInFlight || this.shouldStopPolling()) return
-    const data = this.pendingAck
+    let data = this.pendingAck
     this.ackInFlight = true
     try {
       for (let i = 0; i < attempts; i++) {
@@ -429,7 +605,18 @@ export class FarewellPlayback {
             }
             return result
           }
-        } catch {
+        } catch (error) {
+          // An API deployed before `error_kind` existed refuses the unknown
+          // field (422): the outcome matters more than its reason.
+          if (
+            data.error_kind &&
+            (error as { status?: unknown } | null)?.status === 422 &&
+            this.pendingAck === data
+          ) {
+            const { error_kind: _dropped, ...plain } = data
+            data = plain
+            this.pendingAck = data
+          }
           // The next poll retries the same ended evidence after a brief outage.
         }
         if (i < attempts - 1)
@@ -528,7 +715,11 @@ export class FarewellPlayback {
       this.complete(value)
       return
     }
-    if (!this.played && !this.expired && (this.audio || value === "played")) {
+    if (
+      !this.played &&
+      !this.expired &&
+      (this.audio || this.clip || value === "played")
+    ) {
       this.pendingCompletion = value
       return
     }
@@ -558,6 +749,18 @@ export class FarewellPlayback {
 
   private stopAudio() {
     this.readAbort?.abort()
+    if (this.source) {
+      this.source.onended = null
+      try {
+        this.source.stop()
+      } catch {
+        // Never started or already stopped: nothing is playing either way.
+      }
+      this.source.disconnect()
+      this.source = null
+    }
+    // The context belongs to the session, which closes it.
+    this.clip = null
     if (this.audio) {
       this.audio.onended = null
       this.audio.onplaying = null

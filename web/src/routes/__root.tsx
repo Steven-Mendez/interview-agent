@@ -7,13 +7,10 @@ import { TanStackRouterDevtoolsPanel } from "@tanstack/react-router-devtools"
 import { TanStackDevtools } from "@tanstack/react-devtools"
 import type { QueryClient } from "@tanstack/react-query"
 
-import { Mascot } from "@/components/mascot"
 import { AuthProvider } from "@/components/auth-provider"
+import { NotFound } from "@/components/not-found"
 import { ShellProvider } from "@/components/app-shell"
 import { ThemeProvider } from "@/components/theme-provider"
-import { EmptyState } from "@/components/ui/empty-state"
-import { LinkButton } from "@/components/ui/link-button"
-import { PageShell } from "@/components/ui/page"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
 
@@ -47,16 +44,8 @@ export const Route = createRootRouteWithContext<RouterContext>()({
       { rel: "manifest", href: "/manifest.json" },
     ],
   }),
-  notFoundComponent: () => (
-    <PageShell center>
-      <EmptyState
-        illustration={<Mascot state="thinking" className="w-36" />}
-        title="This page doesn’t exist"
-        description="The link may be out of date, or the interview was removed."
-        actions={<LinkButton to="/">Back to Home</LinkButton>}
-      />
-    </PageShell>
-  ),
+  // Also the root's boundary for a notFound() thrown while rendering a page.
+  notFoundComponent: NotFound,
   shellComponent: RootDocument,
 })
 

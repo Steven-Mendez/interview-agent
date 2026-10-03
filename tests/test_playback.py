@@ -248,6 +248,60 @@ async def test_api_records_the_used_output_once_per_attempt_without_device_names
     assert dict(point.attributes) == {"audio_output": "selected", "farewell_status": "pending"}
 
 
+async def test_a_failed_ack_records_why_once_as_a_category_without_its_message(
+    postgres_sessionmaker, monkeypatch, recorded_metrics, caplog
+):
+    from interview_agent.log_templates import SAFE_LOG_TEMPLATES
+
+    monkeypatch.setattr(settings, "livekit_api_key", "playback-test-key")
+    monkeypatch.setattr(settings, "livekit_api_secret", "playback-test-secret-at-least-32-bytes")
+    conversation_id, _owner, ack = await attempt(postgres_sessionmaker)
+    app = FastAPI()
+    app.state.sessionmaker = postgres_sessionmaker
+    app.include_router(router, prefix="/api")
+    headers = {"Authorization": f"Bearer {candidate_token(conversation_id)}"}
+    failed = ack.model_dump(mode="json") | {
+        "status": "failed",
+        "audio_output": "default",
+        "error_kind": "NotSupportedError",
+    }
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        path = f"/api/interviews/{conversation_id}/closing/ack"
+        # A browser message, or a kind outside the reviewed categories, is refused.
+        for refused in ("The operation is not supported.", "QuotaExceededError"):
+            body = failed | {"error_kind": refused}
+            assert (await client.post(path, headers=headers, json=body)).status_code == 422
+        with caplog.at_level("WARNING", logger="interview_agent.server"):
+            for _repeat in range(2):
+                response = await client.post(path, headers=headers, json=failed)
+                assert response.status_code == 200
+                assert response.json()["status"] == "failed"
+    (point,) = recorded_metrics("interview_agent.browser.farewell_playback_errors")
+    assert point.count == 1
+    assert dict(point.attributes) == {"error_type": "NotSupportedError"}
+    template = "Browser could not play the farewell"
+    assert [record.msg for record in caplog.records] == [template]
+    assert template in SAFE_LOG_TEMPLATES
+
+
+async def test_an_ack_without_a_failure_records_no_error_kind(
+    postgres_sessionmaker, monkeypatch, recorded_metrics
+):
+    monkeypatch.setattr(settings, "livekit_api_key", "playback-test-key")
+    monkeypatch.setattr(settings, "livekit_api_secret", "playback-test-secret-at-least-32-bytes")
+    conversation_id, _owner, ack = await attempt(postgres_sessionmaker)
+    app = FastAPI()
+    app.state.sessionmaker = postgres_sessionmaker
+    app.include_router(router, prefix="/api")
+    headers = {"Authorization": f"Bearer {candidate_token(conversation_id)}"}
+    # A kind sent along with a played ACK says nothing about a failure.
+    played = ack.model_dump(mode="json") | {"error_kind": "AbortError"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        path = f"/api/interviews/{conversation_id}/closing/ack"
+        assert (await client.post(path, headers=headers, json=played)).status_code == 200
+    assert recorded_metrics("interview_agent.browser.farewell_playback_errors") == []
+
+
 async def test_browser_response_onset_is_authenticated_bounded_and_capped(
     postgres_sessionmaker, monkeypatch, recorded_metrics
 ):

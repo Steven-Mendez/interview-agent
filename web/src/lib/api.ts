@@ -388,6 +388,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T
 }
 
+/** Why the browser could not play the farewell: a DOMException name, a
+ *  media element error code, a broken byte stream, or "other". Never a
+ *  message. */
+export type PlaybackErrorKind =
+  | "NotAllowedError"
+  | "NotSupportedError"
+  | "AbortError"
+  | "NotFoundError"
+  | "EncodingError"
+  | "InvalidStateError"
+  | "SecurityError"
+  | "MEDIA_ERR_ABORTED"
+  | "MEDIA_ERR_NETWORK"
+  | "MEDIA_ERR_DECODE"
+  | "MEDIA_ERR_SRC_NOT_SUPPORTED"
+  | "stream"
+  | "other"
+
 export interface PlaybackAcknowledgement {
   closing_id: string
   stream_id: string
@@ -396,6 +414,8 @@ export interface PlaybackAcknowledgement {
   duration_seconds: number | null
   /** The pre-join choice, or the browser default; never a guessed device. */
   audio_output?: "selected" | "default"
+  /** Only with `failed`. */
+  error_kind?: PlaybackErrorKind
 }
 
 export interface ClosingState {

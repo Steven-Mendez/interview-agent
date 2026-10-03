@@ -124,6 +124,17 @@ function SessionRoom({
   const [micMuted, setMicMuted] = React.useState(false)
   const { phase, start } = session
 
+  // Back in the preparation room after the microphone was handed to LiveKit
+  // (the connection dropped mid-interview): the room is gone and its track
+  // with it, so the check takes the microphone back. Without this the check
+  // stays in its hand-over mode, where opening it captures the camera alone
+  // and never reaches "ready", so the camera runs with no self-view showing
+  // it. A no-op when nothing was handed over.
+  const { reclaimMic } = preview
+  React.useEffect(() => {
+    if (phase === "idle") reclaimMic()
+  }, [phase, reclaimMic])
+
   if (phase === "live" || phase === "closing") {
     return session.room ? (
       <LiveRoom session={session} interview={interview} preview={preview} />

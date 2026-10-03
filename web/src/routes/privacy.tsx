@@ -15,7 +15,8 @@ const CONTACT_EMAIL = "stevenampaiz@gmail.com"
 // here, so it must open for someone who has never signed in. Every claim
 // below follows what the code does (the tables in interview/db.py, the
 // retention purge, the voice pipeline in agent.py, the Sentry and metrics
-// filters); change the text when that behavior changes.
+// filters, and the LangSmith tracing production runs with LANGSMITH_API_KEY
+// set); change the text when that behavior changes.
 export const Route = createFileRoute("/privacy")({
   head: () => pageHead("Privacy policy"),
   component: PrivacyPage,
@@ -85,8 +86,15 @@ function PrivacyPage() {
               website is served by Vercel.
             </p>
             <p>
-              The app keeps no audio: it stores the transcript only, and it
-              starts each session with LiveKit&apos;s recording turned off.
+              Each interview session is recorded: the candidate and the
+              interviewer, in stereo. The recording, your resume text, the job
+              offer, the interview plan, the prompts sent to the models, the
+              transcript and the evaluation are sent to LangSmith,
+              LangChain&apos;s tracing service, so the owner can inspect and
+              improve how the interviewer works. LangSmith keeps them under its
+              own retention: 14 days by default, up to 400 days with extended
+              retention, and longer for anything copied into a dataset. The
+              app&apos;s own 30-day deletion does not reach that copy.
             </p>
           </Section>
           <Section title="How long it is kept">
@@ -105,7 +113,8 @@ function PrivacyPage() {
               locates the failure (the error type and where in the code it
               happened); they carry no interview content, no error messages and
               no request bodies, and identify your account only by its opaque
-              id. No third-party tracing of interview content is enabled.
+              id. Interview content is also sent to LangSmith, as described
+              under Voice and AI processing.
             </p>
           </Section>
           <Section title="Cookies and local storage">

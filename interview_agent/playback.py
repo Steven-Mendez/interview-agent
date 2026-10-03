@@ -12,6 +12,25 @@ from interview_agent.interview import db
 
 MAX_CLIP_BYTES = 5_000_000
 
+# Why a browser could not play the farewell: a DOMException name, a media
+# element error code, a broken byte stream, or "other". Categories the browser
+# maps to, never an error message, which can describe the media.
+PlaybackErrorKind = Literal[
+    "NotAllowedError",
+    "NotSupportedError",
+    "AbortError",
+    "NotFoundError",
+    "EncodingError",
+    "InvalidStateError",
+    "SecurityError",
+    "MEDIA_ERR_ABORTED",
+    "MEDIA_ERR_NETWORK",
+    "MEDIA_ERR_DECODE",
+    "MEDIA_ERR_SRC_NOT_SUPPORTED",
+    "stream",
+    "other",
+]
+
 
 class PlaybackAck(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -25,6 +44,9 @@ class PlaybackAck(BaseModel):
     # Which output the browser used, never a device name it cannot verify:
     # the device chosen before joining, or the browser's default output.
     audio_output: Literal["selected", "default"] | None = None
+    # Only meaningful with `failed`. Not stored: the closing record has no
+    # place for it; the route turns it into a metric category.
+    error_kind: PlaybackErrorKind | None = None
 
 
 def _matches(conv, ack):

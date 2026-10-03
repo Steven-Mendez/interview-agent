@@ -122,6 +122,13 @@ async def acknowledge_farewell(request: Request, interview_id: uuid.UUID, body: 
             1,
             {"audio_output": body.audio_output, "farewell_status": result["status"] or body.status},
         )
+    # Why playback failed, once per attempt: a reviewed category, which the
+    # log line cannot carry (templates are never expanded) and the metric can.
+    if first and body.status == "failed" and body.error_kind is not None:
+        otel_metrics.record(
+            "browser", "farewell_playback_errors", 1, {"error_type": body.error_kind}
+        )
+        logger.warning("Browser could not play the farewell")
     return result
 
 

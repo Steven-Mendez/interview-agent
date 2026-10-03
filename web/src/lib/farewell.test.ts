@@ -2,16 +2,19 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { RoomEvent } from "livekit-client"
 import type { ByteStreamReader, Room } from "livekit-client"
-import { FarewellPlayback } from "./farewell"
+import { FarewellPlayback, joinChunks, playbackErrorKind } from "./farewell"
 import { acknowledgeFarewell, getClosingState } from "./api"
+import { captureRouteError } from "./error-reporting"
 
 vi.mock("./api", () => ({
   acknowledgeFarewell: vi.fn(),
   getClosingState: vi.fn(),
 }))
+vi.mock("./error-reporting", () => ({ captureRouteError: vi.fn() }))
 
 class AudioDouble {
   src = ""
+  error: { code: number } | null = null
   onended: (() => void) | null = null
   onplaying: (() => void) | null = null
   onerror: (() => void) | null = null
@@ -21,7 +24,48 @@ class AudioDouble {
   setSinkId = vi.fn().mockResolvedValue(undefined)
 }
 
-function fixture() {
+/** A minimal AudioContext: decoding, one buffer source, and a state that
+ *  only a resume() the test allows can change. */
+class AudioContextDouble {
+  state: AudioContextState = "running"
+  destination = {}
+  allowResume = true
+  sources: Array<{
+    buffer: unknown
+    onended: (() => void) | null
+    connect: ReturnType<typeof vi.fn>
+    disconnect: ReturnType<typeof vi.fn>
+    start: ReturnType<typeof vi.fn>
+    stop: ReturnType<typeof vi.fn>
+  }> = []
+  decoded: Array<ArrayBuffer> = []
+  decodeAudioData = vi.fn((data: ArrayBuffer) => {
+    this.decoded.push(data)
+    return Promise.resolve({ duration: 3 })
+  })
+  resume = vi.fn(() => {
+    if (!this.allowResume) return new Promise<void>(() => {})
+    this.state = "running"
+    return Promise.resolve()
+  })
+  createBufferSource = vi.fn(() => {
+    const source = {
+      buffer: null as unknown,
+      onended: null as (() => void) | null,
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      start: vi.fn(),
+      stop: vi.fn(),
+    }
+    this.sources.push(source)
+    return source
+  })
+}
+
+function fixture(
+  chunks: Array<Uint8Array> = [new Uint8Array([1, 2, 3, 4])],
+  context: AudioContextDouble | null = null
+) {
   const listeners = new Map<string, (...args: unknown[]) => void>()
   const handlers = new Map<
     string,
@@ -58,7 +102,8 @@ function fixture() {
     "conversation",
     callbacks,
     "candidate-token",
-    makeAudio
+    makeAudio,
+    () => context as unknown as AudioContext | null
   )
   const control = (event: string, extra = {}, identity = "agent") =>
     listeners.get(RoomEvent.DataReceived)!(
@@ -83,7 +128,7 @@ function fixture() {
       info: {
         id: "stream",
         mimeType: "audio/wav",
-        size: 4,
+        size: chunks.reduce((total, chunk) => total + chunk.byteLength, 0),
         attributes: {
           conversation_id: "conversation",
           closing_id: "closing",
@@ -91,7 +136,7 @@ function fixture() {
         },
         ...extra,
       },
-      readAll: vi.fn().mockResolvedValue([new Uint8Array([1, 2, 3, 4])]),
+      readAll: vi.fn().mockResolvedValue(chunks),
     }
     handlers.get("interview.farewell_audio")!(
       reader as unknown as ByteStreamReader,
@@ -106,6 +151,7 @@ function fixture() {
 
 beforeEach(() => {
   vi.useFakeTimers()
+  vi.mocked(captureRouteError).mockReset()
   vi.mocked(acknowledgeFarewell)
     .mockReset()
     .mockResolvedValue({ accepted: true })
@@ -549,5 +595,208 @@ describe("finite farewell playback", () => {
       "default"
     )
     plain.playback.dispose()
+  })
+})
+
+describe("why playback failed and how the clip plays", () => {
+  const lastAck = () => vi.mocked(acknowledgeFarewell).mock.calls.at(-1)![2]
+
+  it("reports a NotSupportedError rejection as failed, with its kind", async () => {
+    const f = fixture()
+    f.audio.play.mockRejectedValueOnce(
+      new DOMException("The operation is not supported.", "NotSupportedError")
+    )
+    f.control("closing")
+    await f.receive()
+    expect(f.callbacks.onBlocked).not.toHaveBeenCalledWith(true)
+    expect(acknowledgeFarewell).toHaveBeenCalledOnce()
+    expect(lastAck()).toMatchObject({
+      status: "failed",
+      error_kind: "NotSupportedError",
+    })
+    // Sentry gets the kind in the error's type; its message is scrubbed.
+    const reported = vi.mocked(captureRouteError).mock.calls[0][0] as Error
+    expect(reported.name).toBe("FarewellPlaybackError[NotSupportedError]")
+    expect(JSON.stringify(lastAck())).not.toContain("not supported.")
+    f.playback.dispose()
+  })
+
+  it("still treats NotAllowedError as blocked autoplay, not a failure", async () => {
+    const f = fixture()
+    f.audio.play.mockRejectedValueOnce(
+      new DOMException("Blocked", "NotAllowedError")
+    )
+    f.control("closing")
+    await f.receive()
+    expect(f.callbacks.onBlocked).toHaveBeenLastCalledWith(true)
+    expect(acknowledgeFarewell).not.toHaveBeenCalled()
+    expect(captureRouteError).not.toHaveBeenCalled()
+    f.playback.dispose()
+  })
+
+  it("names a media element error by its code", async () => {
+    const f = fixture()
+    f.control("closing")
+    await f.receive()
+    f.audio.error = { code: 4 }
+    f.audio.onerror?.()
+    expect(lastAck()).toMatchObject({
+      status: "failed",
+      error_kind: "MEDIA_ERR_SRC_NOT_SUPPORTED",
+    })
+    f.playback.dispose()
+  })
+
+  it("names a broken byte stream without a media error", async () => {
+    const f = fixture()
+    f.control("closing")
+    await f.receive({ size: 8 })
+    expect(lastAck()).toMatchObject({ status: "failed", error_kind: "stream" })
+    f.playback.dispose()
+  })
+
+  it("never sends a kind with a played or timed-out ACK", async () => {
+    const f = fixture()
+    f.control("closing")
+    await f.receive()
+    await vi.advanceTimersByTimeAsync(20_000)
+    expect(lastAck().status).toBe("timeout")
+    expect(lastAck()).not.toHaveProperty("error_kind")
+    f.playback.dispose()
+  })
+
+  it("drops the kind when an older API refuses the field", async () => {
+    vi.mocked(acknowledgeFarewell)
+      .mockRejectedValueOnce(
+        Object.assign(new Error("HTTP 422"), { status: 422 })
+      )
+      .mockResolvedValue({ accepted: true, status: "failed" })
+    const f = fixture()
+    f.audio.play.mockRejectedValueOnce(
+      new DOMException("Unsupported", "NotSupportedError")
+    )
+    f.control("closing")
+    await f.receive()
+    await vi.advanceTimersByTimeAsync(200)
+    const bodies = vi.mocked(acknowledgeFarewell).mock.calls.map((c) => c[2])
+    expect(bodies[0].error_kind).toBe("NotSupportedError")
+    expect(bodies[1]).not.toHaveProperty("error_kind")
+    expect(bodies[1].status).toBe("failed")
+    f.playback.dispose()
+  })
+
+  it("maps only names and codes, never messages", () => {
+    expect(playbackErrorKind(new DOMException("x", "AbortError"))).toBe(
+      "AbortError"
+    )
+    expect(playbackErrorKind(new DOMException("x", "OperationError"))).toBe(
+      "other"
+    )
+    expect(playbackErrorKind({ code: 3 })).toBe("MEDIA_ERR_DECODE")
+    expect(playbackErrorKind(new Error("NotSupportedError"))).toBe("other")
+    expect(playbackErrorKind(null)).toBe("other")
+  })
+
+  it("builds the clip from each chunk's own bytes, not its packet buffer", async () => {
+    // Byte stream chunks are views into the decoded packet, at an offset.
+    const packet = new Uint8Array([0xee, 0xee, 82, 73, 70, 70, 0xee])
+    const chunk = packet.subarray(2, 6)
+    expect(chunk.byteOffset).toBe(2)
+    expect([...joinChunks([chunk, new Uint8Array([1, 2])])]).toEqual([
+      82, 73, 70, 70, 1, 2,
+    ])
+    const f = fixture([chunk])
+    f.control("closing")
+    await f.receive()
+    const blob = vi.mocked(URL.createObjectURL).mock.calls[0][0] as Blob
+    expect(blob.type).toBe("audio/wav")
+    expect(blob.size).toBe(4)
+    const bytes = new Uint8Array(await blob.arrayBuffer())
+    expect([...bytes]).toEqual([82, 73, 70, 70])
+    f.playback.dispose()
+  })
+
+  it("plays a decoded clip through the session's AudioContext", async () => {
+    const context = new AudioContextDouble()
+    const f = fixture([new Uint8Array([1, 2, 3, 4])], context)
+    f.room.options = {} as typeof f.room.options
+    f.control("closing")
+    await f.receive()
+    expect(f.makeAudio).not.toHaveBeenCalled()
+    expect([...new Uint8Array(context.decoded[0])]).toEqual([1, 2, 3, 4])
+    const [source] = context.sources
+    expect(source.buffer).toEqual({ duration: 3 })
+    expect(source.connect).toHaveBeenCalledWith(context.destination)
+    expect(source.start).toHaveBeenCalledOnce()
+    expect(f.callbacks.onCompleted).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(2500)
+    source.onended?.()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(vi.mocked(acknowledgeFarewell).mock.calls[0][2]).toMatchObject({
+      status: "played",
+      audio_output: "default",
+    })
+    expect(
+      vi.mocked(acknowledgeFarewell).mock.calls[0][2].duration_seconds
+    ).toBeGreaterThanOrEqual(2.5)
+    f.playback.acceptPersistedState("completed", "closing", "played", true)
+    expect(f.callbacks.onCompleted).toHaveBeenCalledWith("played")
+    // Completion stops the source without counting that stop as an ending.
+    expect(source.stop).toHaveBeenCalled()
+    expect(acknowledgeFarewell).toHaveBeenCalledOnce()
+    f.playback.dispose()
+  })
+
+  it("shows Enable audio for a suspended context, and the click plays it", async () => {
+    const context = new AudioContextDouble()
+    context.state = "suspended"
+    context.allowResume = false
+    const f = fixture([new Uint8Array([1, 2, 3, 4])], context)
+    f.room.options = {} as typeof f.room.options
+    f.control("closing")
+    await f.receive()
+    await vi.advanceTimersByTimeAsync(500)
+    expect(f.callbacks.onBlocked).toHaveBeenLastCalledWith(true)
+    expect(context.sources).toHaveLength(0)
+    expect(acknowledgeFarewell).not.toHaveBeenCalled()
+    // The click's gesture lets the context resume.
+    context.allowResume = true
+    await f.playback.resume()
+    expect(context.sources).toHaveLength(1)
+    expect(context.sources[0].start).toHaveBeenCalledOnce()
+    expect(f.callbacks.onBlocked).toHaveBeenLastCalledWith(false)
+    context.sources[0].onended?.()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(lastAck().status).toBe("played")
+    f.playback.dispose()
+  })
+
+  it("keeps the media element for an output the context cannot route to", async () => {
+    // Safari can route a media element to a chosen speaker, not a context.
+    const context = new AudioContextDouble()
+    const f = fixture([new Uint8Array([1, 2, 3, 4])], context)
+    f.control("closing")
+    await f.receive()
+    expect(context.decodeAudioData).not.toHaveBeenCalled()
+    expect(f.audio.setSinkId).toHaveBeenCalledWith("chosen-speaker")
+    expect(f.audio.play).toHaveBeenCalledOnce()
+    f.playback.dispose()
+  })
+
+  it("falls back to the media element when the decoder refuses the clip", async () => {
+    const context = new AudioContextDouble()
+    context.decodeAudioData.mockRejectedValueOnce(
+      new DOMException("Unable to decode", "EncodingError")
+    )
+    const f = fixture([new Uint8Array([1, 2, 3, 4])], context)
+    f.room.options = {} as typeof f.room.options
+    f.control("closing")
+    await f.receive()
+    expect(context.sources).toHaveLength(0)
+    expect(f.audio.play).toHaveBeenCalledOnce()
+    f.audio.onended?.()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(lastAck().status).toBe("played")
+    f.playback.dispose()
   })
 })

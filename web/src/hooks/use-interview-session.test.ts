@@ -5,10 +5,19 @@ import { RoomEvent, RpcError } from "livekit-client"
 import type { TextStreamHandler, TextStreamReader } from "livekit-client"
 import type * as LiveKit from "livekit-client"
 
+import type * as Farewell from "@/lib/farewell"
+import { FarewellPlayback } from "@/lib/farewell"
 import { useInterviewSession } from "./use-interview-session"
 
 const mocks = vi.hoisted(() => {
   const rooms: MockRoom[] = []
+  // Set by a test to hold the room's connect or the microphone's opening
+  // until it says so.
+  const gates: {
+    connect: Promise<void> | null
+    microphone: Promise<void> | null
+  } = { connect: null, microphone: null }
+  type MockTrack = { stop: ReturnType<typeof vi.fn<() => void>> }
   class MockRoom {
     handlers = new Map<string, TextStreamHandler>()
     remoteParticipants = new Map([
@@ -16,13 +25,58 @@ const mocks = vi.hoisted(() => {
     ])
     options = {}
     listeners = new Map<string, Array<() => void>>()
+    // What the hook passed to `new Room(...)`.
+    init: unknown
+    // Local publications: enabling the microphone publishes one track, the
+    // way the SDK does, so the tests can see whether it was stopped.
+    publications: Array<{ track: MockTrack }> = []
+    // Every track createTracks handed out, published or not.
+    created: MockTrack[] = []
+    disconnected = false
     localParticipant = {
-      setMicrophoneEnabled: vi.fn().mockResolvedValue(undefined),
+      // Enabling goes through createTracks and publishTrack, as the SDK's
+      // does, so it shares their permission gate and closed-room publish.
+      setMicrophoneEnabled: vi.fn(async (enabled: boolean) => {
+        if (!enabled || this.publications.length > 0) return
+        const tracks = await this.localParticipant.createTracks({ audio: true })
+        await Promise.all(
+          tracks.map((track) => this.localParticipant.publishTrack(track))
+        )
+      }),
+      createTracks: vi.fn<
+        (options: { audio: boolean }) => Promise<MockTrack[]>
+      >(async () => {
+        // An unanswered permission prompt holds the track back.
+        if (gates.microphone) await gates.microphone
+        const track = { stop: vi.fn() }
+        this.created.push(track)
+        return [track]
+      }),
+      // As livekit-client 2.20 does: on a room that is no longer connected
+      // the publish waits for a reconnect, and only its 15 s timeout stops
+      // the track.
+      publishTrack: vi.fn<(track: MockTrack) => Promise<unknown>>((track) => {
+        if (this.disconnected)
+          return new Promise((_, reject) =>
+            setTimeout(() => {
+              track.stop()
+              reject(new Error("publishing rejected as engine not connected"))
+            }, 15_000)
+          )
+        this.publications.push({ track })
+        return Promise.resolve({ track })
+      }),
       performRpc: vi.fn().mockResolvedValue('{"accepted":true}'),
+      getTrackPublications: () => this.publications,
     }
-    connect = vi.fn().mockResolvedValue(undefined)
-    disconnect = vi.fn().mockResolvedValue(undefined)
-    constructor() {
+    connect = vi.fn(async () => {
+      if (gates.connect) await gates.connect
+    })
+    disconnect = vi.fn(async () => {
+      this.disconnected = true
+    })
+    constructor(init?: unknown) {
+      this.init = init
       rooms.push(this)
     }
     registerTextStreamHandler(topic: string, handler: TextStreamHandler) {
@@ -56,12 +110,33 @@ const mocks = vi.hoisted(() => {
   // Holds of suppressUnauthorizedRedirect() not released yet.
   const redirectHolds = { count: 0 }
 
-  return { rooms, Room: MockRoom, redirectHolds }
+  // Constructor arguments of every FarewellPlayback the hook builds.
+  const farewells: unknown[][] = []
+
+  return { rooms, Room: MockRoom, redirectHolds, farewells, gates }
 })
 
 vi.mock("livekit-client", async (original) => ({
   ...(await original<typeof LiveKit>()),
   Room: mocks.Room,
+}))
+// The real playback, recording how the hook wires it.
+vi.mock("@/lib/farewell", async (original) => {
+  const actual = await original<typeof Farewell>()
+  class RecordingFarewellPlayback extends actual.FarewellPlayback {
+    constructor(
+      ...args: ConstructorParameters<typeof actual.FarewellPlayback>
+    ) {
+      super(...args)
+      mocks.farewells.push(args)
+    }
+  }
+  return { ...actual, FarewellPlayback: RecordingFarewellPlayback }
+})
+// The response-onset watcher opens its own AudioContext; these tests count
+// only the farewell's, so the watcher stays out of the way.
+vi.mock("@/lib/response-onset", () => ({
+  watchResponseOnset: () => () => {},
 }))
 vi.mock("@/lib/api", () => ({
   acknowledgeFarewell: vi.fn().mockResolvedValue({ accepted: true }),
@@ -138,6 +213,9 @@ const flush = async () => {
 
 beforeEach(() => {
   mocks.rooms.length = 0
+  mocks.farewells.length = 0
+  mocks.gates.connect = null
+  mocks.gates.microphone = null
   vi.useFakeTimers()
   vi.spyOn(console, "log").mockImplementation(() => {})
   vi.spyOn(console, "warn").mockImplementation(() => {})
@@ -163,8 +241,14 @@ describe("interview transcription lifecycle", () => {
       hook.result.current.start({ startMuted: true })
       await flush()
     })
-    const mic = mocks.rooms[0].localParticipant.setMicrophoneEnabled
-    expect(mic.mock.calls).toEqual([[true], [false]])
+    const participant = mocks.rooms[0].localParticipant
+    expect(participant.createTracks).toHaveBeenCalledWith({ audio: true })
+    expect(participant.publishTrack).toHaveBeenCalledOnce()
+    // Published first, then muted: unmuting in the room is instant.
+    expect(participant.setMicrophoneEnabled.mock.calls).toEqual([[false]])
+    expect(participant.publishTrack.mock.invocationCallOrder[0]).toBeLessThan(
+      participant.setMicrophoneEnabled.mock.invocationCallOrder[0]
+    )
     expect(hook.result.current.phase).toBe("live")
     hook.unmount()
   })
@@ -637,5 +721,294 @@ describe("interview transcription lifecycle", () => {
     expect(reader.signal?.aborted).toBe(true)
     expect(room.disconnect).toHaveBeenCalled()
     expect(vi.getTimerCount()).toBe(0)
+  })
+})
+
+// The microphone is the one capture device the room owns: every way out of
+// the interview must stop its track, not just hope the disconnect does.
+describe("microphone release", () => {
+  it("asks the room to stop its tracks on unpublish, not just the default", async () => {
+    const { room, unmount } = await connected()
+    expect(room.init).toMatchObject({ stopLocalTrackOnUnpublish: true })
+    unmount()
+  })
+
+  it("stops the microphone track when the page goes away mid-interview", async () => {
+    const { room, unmount } = await connected()
+    const mic = room.publications[0].track
+    expect(mic.stop).not.toHaveBeenCalled()
+    unmount()
+    expect(mic.stop).toHaveBeenCalled()
+    expect(room.disconnect).toHaveBeenCalled()
+  })
+
+  it("stops the microphone track when the interview ends", async () => {
+    const { result, room, unmount } = await connected()
+    const mic = room.publications[0].track
+    await act(async () => {
+      result.current.requestEnd()
+      await flush()
+    })
+    await act(async () => {
+      result.current.syncClosingState("completed", null, "not_possible", true)
+      await flush()
+    })
+    expect(result.current.phase).toBe("ended")
+    expect(mic.stop).toHaveBeenCalled()
+    unmount()
+  })
+
+  it("stops a microphone that opens after the page went away", async () => {
+    // The permission prompt was still open when the candidate left: the
+    // track only exists once they answer it, after the unmount's disconnect.
+    let answer!: () => void
+    mocks.gates.microphone = new Promise<void>((resolve) => {
+      answer = resolve
+    })
+    const hook = renderHook(() => useInterviewSession("test"))
+    await act(async () => {
+      hook.result.current.start()
+      await flush()
+    })
+    const room = mocks.rooms[0]
+    expect(room.localParticipant.createTracks).toHaveBeenCalledWith({
+      audio: true,
+    })
+    hook.unmount()
+    expect(room.disconnect).toHaveBeenCalled()
+
+    await act(async () => {
+      answer()
+      await flush()
+    })
+    // Stopped at once, not when the SDK's 15 s publish timeout would have:
+    // no timer has run yet.
+    expect(room.created).toHaveLength(1)
+    expect(room.created[0].stop).toHaveBeenCalledOnce()
+    expect(room.localParticipant.publishTrack).not.toHaveBeenCalled()
+    expect(room.publications).toHaveLength(0)
+  })
+
+  it("stops a microphone that opens after the connection dropped", async () => {
+    // A publish on a dropped room would wait 15 s for a reconnect, capturing
+    // all along: the start fails at once instead.
+    let answer!: () => void
+    mocks.gates.microphone = new Promise<void>((resolve) => {
+      answer = resolve
+    })
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const hook = renderHook(() => useInterviewSession("test"))
+    await act(async () => {
+      hook.result.current.start()
+      await flush()
+    })
+    const room = mocks.rooms[0]
+    room.disconnected = true
+    room.emit(RoomEvent.Disconnected)
+    await act(async () => {
+      answer()
+      await flush()
+    })
+    expect(room.created[0].stop).toHaveBeenCalled()
+    expect(room.localParticipant.publishTrack).not.toHaveBeenCalled()
+    expect(hook.result.current.phase).toBe("idle")
+    hook.unmount()
+  })
+
+  it("stops a microphone whose publish failed", async () => {
+    // A failed publish leaves the track on no publication list, where the
+    // disconnect would never find it.
+    let connect!: () => void
+    mocks.gates.connect = new Promise<void>((resolve) => {
+      connect = resolve
+    })
+    const hook = renderHook(() => useInterviewSession("test"))
+    await act(async () => {
+      hook.result.current.start()
+      await flush()
+    })
+    const room = mocks.rooms[0]
+    room.localParticipant.publishTrack.mockRejectedValueOnce(
+      new Error("publish failed")
+    )
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    await act(async () => {
+      connect()
+      await flush()
+    })
+    expect(room.localParticipant.publishTrack).toHaveBeenCalledOnce()
+    expect(room.created[0].stop).toHaveBeenCalled()
+    expect(room.disconnect).toHaveBeenCalled()
+    expect(hook.result.current.phase).toBe("idle")
+    hook.unmount()
+  })
+
+  it("mutes a microphone whose publish finished after the closing began", async () => {
+    // The farewell mutes the microphone when the closing starts, but a track
+    // still publishing has no publication for that mute to find.
+    let connect!: () => void
+    mocks.gates.connect = new Promise<void>((resolve) => {
+      connect = resolve
+    })
+    let closing = false
+    vi.spyOn(
+      Object.getPrototypeOf(FarewellPlayback.prototype) as FarewellPlayback,
+      "isClosing",
+      "get"
+    ).mockImplementation(() => closing)
+    const hook = renderHook(() => useInterviewSession("test"))
+    await act(async () => {
+      hook.result.current.start()
+      await flush()
+    })
+    const room = mocks.rooms[0]
+    let publish!: () => void
+    room.localParticipant.publishTrack.mockImplementationOnce(
+      (track) =>
+        new Promise((resolve) => {
+          publish = () => {
+            room.publications.push({ track })
+            resolve({ track })
+          }
+        })
+    )
+    await act(async () => {
+      connect()
+      await flush()
+    })
+    expect(room.localParticipant.publishTrack).toHaveBeenCalledOnce()
+    expect(room.localParticipant.setMicrophoneEnabled).not.toHaveBeenCalled()
+    closing = true
+    await act(async () => {
+      publish()
+      await flush()
+    })
+    expect(room.localParticipant.setMicrophoneEnabled).toHaveBeenCalledWith(
+      false
+    )
+    hook.unmount()
+  })
+
+  it("never opens the microphone when the page went away while connecting", async () => {
+    let connect!: () => void
+    mocks.gates.connect = new Promise<void>((resolve) => {
+      connect = resolve
+    })
+    const beforePublish = vi.fn()
+    const hook = renderHook(() => useInterviewSession("test"))
+    await act(async () => {
+      hook.result.current.start({ beforePublish })
+      await flush()
+    })
+    const room = mocks.rooms[0]
+    hook.unmount()
+
+    await act(async () => {
+      connect()
+      await flush()
+    })
+    expect(room.localParticipant.setMicrophoneEnabled).not.toHaveBeenCalled()
+    expect(room.localParticipant.createTracks).not.toHaveBeenCalled()
+    expect(beforePublish).not.toHaveBeenCalled()
+    expect(room.publications).toHaveLength(0)
+  })
+})
+
+// Safari only lets an AudioContext make sound once a user gesture resumed
+// it, so the farewell's context must be created and resumed synchronously
+// inside the Join and End clicks; an await before it would lose the gesture.
+describe("farewell audio unlock", () => {
+  const contexts: AudioContextDouble[] = []
+  class AudioContextDouble {
+    state: AudioContextState = "suspended"
+    resume = vi.fn(() => {
+      this.state = "running"
+      return Promise.resolve()
+    })
+    close = vi.fn(() => {
+      this.state = "closed"
+      return Promise.resolve()
+    })
+    constructor() {
+      contexts.push(this)
+    }
+  }
+
+  beforeEach(() => {
+    contexts.length = 0
+    vi.stubGlobal("AudioContext", AudioContextDouble)
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  const farewellContext = () => {
+    const getter = mocks.farewells[0]?.[5] as () => AudioContext | null
+    return getter()
+  }
+
+  it("creates and resumes the context inside the Join click", async () => {
+    const hook = renderHook(() => useInterviewSession("test"))
+    await act(async () => {
+      hook.result.current.start()
+      // Before any await: still inside the click's user activation.
+      expect(contexts).toHaveLength(1)
+      expect(contexts[0].resume).toHaveBeenCalledOnce()
+      await flush()
+    })
+    expect(hook.result.current.phase).toBe("live")
+    // The playback plays through that same context.
+    expect(mocks.farewells).toHaveLength(1)
+    expect(farewellContext()).toBe(contexts[0])
+    hook.unmount()
+  })
+
+  it("resumes the same context again in the End click if it was suspended", async () => {
+    const { result, unmount } = await connected()
+    expect(contexts[0].state).toBe("running")
+    // The browser suspended it during the interview.
+    contexts[0].state = "suspended"
+    act(() => {
+      result.current.requestEnd()
+      expect(contexts[0].resume).toHaveBeenCalledTimes(2)
+    })
+    await act(async () => {
+      await flush()
+    })
+    expect(contexts).toHaveLength(1)
+    expect(farewellContext()).toBe(contexts[0])
+    unmount()
+  })
+
+  it("leaves a running context alone in the End click", async () => {
+    const { result, unmount } = await connected()
+    await act(async () => {
+      result.current.requestEnd()
+      await flush()
+    })
+    expect(contexts).toHaveLength(1)
+    expect(contexts[0].resume).toHaveBeenCalledOnce()
+    unmount()
+  })
+
+  it("closes the context when the interview ends", async () => {
+    const { result, unmount } = await connected()
+    await act(async () => {
+      result.current.syncClosingState("completed", null, "not_possible", true)
+      await flush()
+    })
+    expect(result.current.phase).toBe("ended")
+    expect(contexts[0].close).toHaveBeenCalledOnce()
+    expect(farewellContext()).toBeNull()
+    unmount()
+    expect(contexts[0].close).toHaveBeenCalledOnce()
+  })
+
+  it("closes the context when the page goes away mid-interview", async () => {
+    const { unmount } = await connected()
+    expect(contexts[0].close).not.toHaveBeenCalled()
+    unmount()
+    expect(contexts[0].close).toHaveBeenCalledOnce()
+    expect(farewellContext()).toBeNull()
   })
 })

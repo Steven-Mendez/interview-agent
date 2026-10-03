@@ -3,7 +3,7 @@ import * as React from "react"
 import { act, renderHook } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { useDevicePreview } from "./use-device-preview"
+import { stopAllPreviewStreams, useDevicePreview } from "./use-device-preview"
 
 // jsdom has no MediaStream, AudioContext or navigator.mediaDevices: the
 // stream is a duck-typed stand-in, the meter gives up on the missing
@@ -311,4 +311,311 @@ describe("useDevicePreview", () => {
     expect(result.current.status).toBe("ready")
     expect(result.current.error).toMatch(/camera is already in use/)
   })
+})
+
+// Leaving the preparation room must leave no camera or microphone running,
+// whatever was in flight: these walk each way a stream could outlive it.
+describe("useDevicePreview capture release", () => {
+  const live = (...tracks: FakeTrack[]) =>
+    tracks.filter((track) => track.readyState === "live")
+
+  it("stops a camera granted after a hand-over cancelled the prompt and the page is gone", async () => {
+    // The failing run: the prompt was still open at Start, the session took
+    // the microphone, the candidate left, and only then allowed the prompt.
+    const pending = deferred<MediaStream>()
+    getUserMedia.mockReturnValueOnce(pending.promise)
+    const { result, unmount } = renderHook(() => useDevicePreview())
+    act(() => result.current.request(true))
+    act(() => result.current.releaseMic())
+    unmount()
+
+    const audio = fakeTrack("audio", "m")
+    const video = fakeTrack("video", "c")
+    pending.resolve(fakeStream([audio, video]))
+    await settle()
+    expect(live(audio, video)).toEqual([])
+  })
+
+  it("stops the self-view a hand-over left running when the page goes away", async () => {
+    const audio = fakeTrack("audio", "m")
+    const video = fakeTrack("video", "c")
+    getUserMedia.mockResolvedValueOnce(fakeStream([audio, video]))
+    const { result, unmount } = renderHook(() => useDevicePreview())
+    await act(async () => {
+      result.current.request(true)
+      await settle()
+    })
+    act(() => result.current.releaseMic())
+    // The camera stays on through the interview on purpose…
+    expect(live(audio, video)).toEqual([video])
+    unmount()
+    // …and not a moment past it.
+    expect(live(audio, video)).toEqual([])
+  })
+
+  it("stops the camera opened during the interview when the page goes away", async () => {
+    getUserMedia.mockResolvedValueOnce(fakeStream([fakeTrack("audio", "m")]))
+    const { result, unmount } = renderHook(() => useDevicePreview())
+    await act(async () => {
+      result.current.request()
+      await settle()
+    })
+    act(() => result.current.releaseMic())
+    const video = fakeTrack("video", "c")
+    getUserMedia.mockResolvedValueOnce(fakeStream([video]))
+    await act(async () => {
+      result.current.toggleCamera()
+      await settle()
+    })
+    expect(result.current.cameraOn).toBe(true)
+    unmount()
+    expect(video.stop).toHaveBeenCalled()
+  })
+
+  it("never leaves the previous camera running when switching, in either order", async () => {
+    const first = [fakeTrack("audio", "m"), fakeTrack("video", "a")]
+    getUserMedia.mockResolvedValueOnce(fakeStream(first))
+    const { result, unmount } = renderHook(() => useDevicePreview())
+    await act(async () => {
+      result.current.selectCam("a")
+      await settle()
+    })
+    expect(live(...first)).toEqual(first)
+
+    // Two quick picks, answered out of order: only the last one survives.
+    const toB = deferred<MediaStream>()
+    const toC = deferred<MediaStream>()
+    getUserMedia
+      .mockReturnValueOnce(toB.promise)
+      .mockReturnValueOnce(toC.promise)
+    act(() => result.current.selectCam("b"))
+    act(() => result.current.selectCam("c"))
+    const third = [fakeTrack("audio", "m"), fakeTrack("video", "c")]
+    await act(async () => {
+      toC.resolve(fakeStream(third))
+      await settle()
+    })
+    const second = [fakeTrack("audio", "m"), fakeTrack("video", "b")]
+    await act(async () => {
+      toB.resolve(fakeStream(second))
+      await settle()
+    })
+    expect(live(...first, ...second, ...third)).toEqual(third)
+    expect(result.current.camId).toBe("c")
+
+    unmount()
+    expect(live(...third)).toEqual([])
+  })
+
+  it("stops the audio-only fallback when it arrives after the page is gone", async () => {
+    const fallback = deferred<MediaStream>()
+    getUserMedia
+      .mockRejectedValueOnce(domError("NotReadableError"))
+      .mockReturnValueOnce(fallback.promise)
+    const { result, unmount } = renderHook(() => useDevicePreview())
+    await act(async () => {
+      result.current.request(true)
+      await settle()
+    })
+    expect(getUserMedia).toHaveBeenCalledTimes(2)
+    unmount()
+
+    const audio = fakeTrack("audio", "m")
+    fallback.resolve(fakeStream([audio]))
+    await settle()
+    expect(audio.stop).toHaveBeenCalled()
+  })
+
+  it("stops a stream granted after a StrictMode remount and a real unmount", async () => {
+    const pending = deferred<MediaStream>()
+    getUserMedia.mockReturnValueOnce(pending.promise)
+    const { result, unmount } = renderHook(() => useDevicePreview(), {
+      reactStrictMode: true,
+    })
+    // Asked after the development double mount settled, as the panel does.
+    act(() => result.current.request(true))
+    unmount()
+
+    const audio = fakeTrack("audio", "m")
+    const video = fakeTrack("video", "c")
+    pending.resolve(fakeStream([audio, video]))
+    await settle()
+    expect(live(audio, video)).toEqual([])
+  })
+
+  it("reopens the full check once a hand-over that captured nothing is taken back", async () => {
+    // The page relies on this when the room drops mid-interview: without
+    // reclaimMic the next request would open the camera alone.
+    const pending = deferred<MediaStream>()
+    getUserMedia.mockReturnValueOnce(pending.promise)
+    const { result } = renderHook(() => useDevicePreview())
+    act(() => result.current.request(true))
+    act(() => result.current.releaseMic())
+    act(() => result.current.reclaimMic())
+
+    getUserMedia.mockResolvedValueOnce(
+      fakeStream([fakeTrack("audio", "m"), fakeTrack("video", "c")])
+    )
+    await act(async () => {
+      result.current.request(true)
+      await settle()
+    })
+    expect(getUserMedia).toHaveBeenLastCalledWith({ audio: true, video: true })
+    expect(result.current.status).toBe("ready")
+    expect(result.current.cameraOn).toBe(true)
+  })
+
+  it("releases every stream the preview opened, not only the unmounting one's", async () => {
+    // The backstop: a stream a preview's own refs no longer point at is
+    // still on the module's list, and leaving stops it.
+    const orphan = [fakeTrack("audio", "m"), fakeTrack("video", "c")]
+    getUserMedia.mockResolvedValueOnce(fakeStream(orphan))
+    const other = renderHook(() => useDevicePreview())
+    await act(async () => {
+      other.result.current.request(true)
+      await settle()
+    })
+    const { unmount } = renderHook(() => useDevicePreview())
+    unmount()
+    expect(live(...orphan)).toEqual([])
+
+    const again = [fakeTrack("audio", "m")]
+    getUserMedia.mockResolvedValueOnce(fakeStream(again))
+    await act(async () => {
+      other.result.current.request(false)
+      await settle()
+    })
+    stopAllPreviewStreams()
+    expect(live(...again)).toEqual([])
+    other.unmount()
+  })
+
+  // 120 seeds of 12 steps, each waiting a real macrotask: about 2-3 s here,
+  // so a slower CI runner needs room past vitest's 5 s default.
+  it(
+    "leaves nothing running after any sequence of picks, answers and unmount",
+    {
+      timeout: 30_000,
+    },
+    async () => {
+      // A seeded walk over every action and every order the prompts can be
+      // answered in. While mounted, the only live tracks are the shown
+      // stream's; after unmount (and every late answer), none are.
+      type Pending = {
+        constraints: MediaStreamConstraints
+        resolve: (stream: MediaStream) => void
+        reject: (error: unknown) => void
+      }
+      let random = 0
+      const next = () => {
+        random = (random * 1103515245 + 12345) & 0x7fffffff
+        return random / 0x7fffffff
+      }
+      const failures: string[] = []
+      for (let seed = 1; seed <= 120; seed++) {
+        random = seed
+        const tracks: FakeTrack[] = []
+        const queue: Pending[] = []
+        const trail: string[] = []
+        getUserMedia.mockReset()
+        getUserMedia.mockImplementation(
+          (constraints) =>
+            new Promise<MediaStream>((resolve, reject) =>
+              queue.push({ constraints, resolve, reject })
+            )
+        )
+        const answer = (pending: Pending) => {
+          const kinds: FakeTrack["kind"][] = []
+          if (pending.constraints.audio) kinds.push("audio")
+          if (pending.constraints.video) kinds.push("video")
+          const opened = kinds.map((kind) => fakeTrack(kind, kind))
+          tracks.push(...opened)
+          pending.resolve(fakeStream(opened))
+        }
+        const hook = renderHook(() => useDevicePreview())
+        // An object, not a let: the flag flips inside act's callback.
+        const page = { mounted: true }
+        for (let step = 0; step < 12; step++) {
+          const roll = Math.floor(next() * 11)
+          const preview = hook.result.current
+          await act(async () => {
+            if (!page.mounted && roll < 7) return
+            const pick = queue.length ? Math.floor(next() * queue.length) : -1
+            switch (roll) {
+              case 0:
+                trail.push("request")
+                preview.request()
+                break
+              case 1:
+                trail.push("request(true)")
+                preview.request(true)
+                break
+              case 2:
+                trail.push("selectMic")
+                preview.selectMic(`m${step}`)
+                break
+              case 3:
+                trail.push("selectCam")
+                preview.selectCam(`c${step}`)
+                break
+              case 4:
+                trail.push("toggleCamera")
+                preview.toggleCamera()
+                break
+              case 5:
+                trail.push("releaseMic")
+                preview.releaseMic()
+                break
+              case 6:
+                trail.push("reclaimMic")
+                preview.reclaimMic()
+                break
+              case 7:
+              case 8:
+                if (pick >= 0) {
+                  trail.push(`grant#${pick}`)
+                  answer(queue.splice(pick, 1)[0])
+                }
+                break
+              case 9:
+                if (pick >= 0) {
+                  const name =
+                    next() < 0.5 ? "NotFoundError" : "NotAllowedError"
+                  trail.push(`${name}#${pick}`)
+                  queue.splice(pick, 1)[0].reject(domError(name))
+                }
+                break
+              default:
+                if (page.mounted) {
+                  trail.push("unmount")
+                  hook.unmount()
+                  page.mounted = false
+                }
+            }
+            await settle()
+          })
+          if (page.mounted) {
+            const shown = hook.result.current.stream?.getTracks() ?? []
+            const stray = tracks.filter(
+              (track) =>
+                track.readyState === "live" &&
+                !(shown as unknown[]).includes(track)
+            )
+            if (stray.length) {
+              failures.push(`seed ${seed} while mounted: ${trail.join(" > ")}`)
+              break
+            }
+          }
+        }
+        if (page.mounted) hook.unmount()
+        while (queue.length) {
+          answer(queue.shift()!)
+          await settle()
+        }
+        if (live(...tracks).length)
+          failures.push(`seed ${seed} after unmount: ${trail.join(" > ")}`)
+      }
+      expect(failures).toEqual([])
+    }
+  )
 })

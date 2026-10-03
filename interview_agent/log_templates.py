@@ -7,6 +7,7 @@ Never add candidate or generated content to this catalog.
 SAFE_LOG_TEMPLATES = frozenset(
     (
         "AUTH_MODE=local is for development only",
+        "Browser could not play the farewell",
         "Closing background task failed: %s",
         "Completion publication failed; persistent state remains available",
         "Could not persist evaluation failure",

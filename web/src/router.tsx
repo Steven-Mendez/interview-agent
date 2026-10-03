@@ -2,6 +2,7 @@ import { QueryClient } from "@tanstack/react-query"
 import { createRouter as createTanStackRouter } from "@tanstack/react-router"
 import { setupRouterSsrQueryIntegration } from "@tanstack/react-router-ssr-query"
 
+import { NotFound } from "@/components/not-found"
 import { RouteError, RoutePending } from "@/components/route-states"
 import { setUnauthorizedHandler } from "@/lib/api"
 import { safeRedirectPath } from "@/lib/auth"
@@ -21,6 +22,9 @@ export function getRouter() {
     defaultPreload: "intent",
     defaultPreloadStaleTime: 0,
     defaultErrorComponent: RouteError,
+    // Unknown paths have their own route ($.tsx); this covers a notFound()
+    // thrown by a page that has no not-found component of its own.
+    defaultNotFoundComponent: NotFound,
     defaultPendingComponent: RoutePending,
     defaultOnCatch: (error) => captureRouteError(error),
   })

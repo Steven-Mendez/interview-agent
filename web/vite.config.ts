@@ -38,6 +38,20 @@ const config = defineConfig({
     }),
     viteReact(),
   ],
+  build: {
+    rolldownOptions: {
+      output: {
+        codeSplitting: {
+          groups: [
+            // The LiveKit SDK (~450 kB) only loads on the interview page; on
+            // its own it stays cached in the browser across deploys that
+            // only change the app.
+            { name: "livekit", test: /node_modules[\\/]livekit-client[\\/]/ },
+          ],
+        },
+      },
+    },
+  },
   server: {
     proxy: {
       "/api": "http://localhost:8000",

@@ -6,3 +6,9 @@ allowBuilds:
   unrs-resolver: true
   msw: false
   core-js: false
+
+overrides:
+  # @neondatabase/auth pins zod 4.3.6 and imports its default export, which
+  # bundles all of zod (locales included) beside the app's own copy. One
+  # version for both: the auth chunk carries zod once.
+  "@neondatabase/auth>zod": 4.4.3

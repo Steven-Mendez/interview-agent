@@ -83,6 +83,7 @@ describe("initErrorReporting", () => {
     reporting.initErrorReporting()
     reporting.captureRouteError(new Error(CANARY))
     reporting.setErrorReportingUser("user-synthetic")
+    await vi.dynamicImportSettled()
 
     expect(mocks.init).not.toHaveBeenCalled()
     expect(mocks.captureException).not.toHaveBeenCalled()
@@ -95,8 +96,14 @@ describe("initErrorReporting", () => {
 
     reporting.initErrorReporting()
     reporting.initErrorReporting()
+    // Reported before the SDK has loaded: held until it has, after init.
+    reporting.setErrorReportingUser("user-synthetic")
+    await vi.waitFor(() => expect(mocks.setUser).toHaveBeenCalled())
 
     expect(mocks.init).toHaveBeenCalledTimes(1)
+    expect(mocks.init.mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.setUser.mock.invocationCallOrder[0]
+    )
     const options = mocks.init.mock.calls[0][0]
     expect(options.dataCollection).toMatchObject({
       userInfo: false,
@@ -108,8 +115,6 @@ describe("initErrorReporting", () => {
     expect(options.tracesSampleRate).toBeUndefined()
     expect(options.integrations).toBeUndefined()
     expect(options.beforeBreadcrumb({ message: CANARY })).toBeNull()
-
-    reporting.setErrorReportingUser("user-synthetic")
     expect(mocks.setUser).toHaveBeenCalledWith({ id: "user-synthetic" })
   })
 })

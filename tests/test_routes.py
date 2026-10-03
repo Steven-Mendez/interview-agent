@@ -2142,6 +2142,7 @@ async def test_detail_exposes_written_farewell_and_closing_bound_from_database_c
                     closing_deadline_at=now + timedelta(seconds=35),
                     closing_ack_deadline_at=now + timedelta(seconds=30),
                     farewell_status="pending",
+                    closing_audio_mime="audio/rtc",
                 ),
             ]
         )
@@ -2152,6 +2153,7 @@ async def test_detail_exposes_written_farewell_and_closing_bound_from_database_c
     assert body["closing_remaining_seconds"] is None
     body = (await client.get(f"/api/interviews/{closing}")).json()
     assert body["farewell_text"] is None
+    assert body["farewell_confirmation_source"] == "agent_playout"
     assert 35 < body["closing_remaining_seconds"] <= 40
 
 

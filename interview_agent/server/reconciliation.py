@@ -18,6 +18,7 @@ from interview_agent.interview.workers import (
     REPLACEMENT_SECONDS,
     last_activity,
 )
+from interview_agent.playback import confirmation_source
 
 logger = logging.getLogger(__name__)
 SWEEP_SECONDS = 5
@@ -124,13 +125,14 @@ async def reconcile_interview(session, conversation_id, settings):
     await session.commit()
     # Every close needs an outcome sample: worker-run closes emit theirs, and
     # server-reconciled ones complete the denominator for the failure rate.
+    dimensions = {"farewell_status": farewell, "source": "lifecycle_sweeper"}
+    if source := confirmation_source(conversation):
+        dimensions["confirmation_source"] = source
     for name, value in (
         ("reconciled", 1),
         ("playback_confirmed", int(farewell == "played")),
     ):
-        otel_metrics.record(
-            "closing", name, value, {"farewell_status": farewell, "source": "lifecycle_sweeper"}
-        )
+        otel_metrics.record("closing", name, value, dimensions)
     return "sealed_partial"
 
 

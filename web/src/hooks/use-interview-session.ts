@@ -122,28 +122,6 @@ export function useInterviewSession(interviewId: string): InterviewSession {
     React.useState(false)
   const farewellRef = React.useRef<FarewellPlayback | null>(null)
   const stopOnsetRef = React.useRef<(() => void) | null>(null)
-  // The farewell plays through this AudioContext, created and resumed inside
-  // the clicks that start and end the interview: Safari only lets a context
-  // make sound once a user gesture resumed it, and the clip arrives seconds
-  // after any click, too late for a media element's play() to count as one.
-  const farewellAudioRef = React.useRef<AudioContext | null>(null)
-  const unlockFarewellAudio = React.useCallback(() => {
-    let context = farewellAudioRef.current
-    if (!context || context.state === "closed") {
-      try {
-        context = new AudioContext()
-      } catch {
-        // No Web Audio: the farewell falls back to a media element.
-        return
-      }
-      farewellAudioRef.current = context
-    }
-    if (context.state !== "running") void context.resume().catch(() => {})
-  }, [])
-  const closeFarewellAudio = React.useCallback(() => {
-    void farewellAudioRef.current?.close().catch(() => {})
-    farewellAudioRef.current = null
-  }, [])
 
   // Refs for the transcription bookkeeping — mutated imperatively inside the
   // stream handlers.
@@ -355,7 +333,6 @@ export function useInterviewSession(interviewId: string): InterviewSession {
       // Start from a user action. Microphone acquisition also lets LiveKit
       // attempt audio playback; the UI offers recovery if it stays blocked.
       if (phaseRef.current !== "idle") return
-      unlockFarewellAudio()
 
       void (async () => {
         setPhase("connecting")
@@ -396,7 +373,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
             // must release the microphone, whatever a later version defaults
             // to.
             stopLocalTrackOnUnpublish: true,
-            // Interviewer audio and the farewell clip follow the same output.
+            // Questions and native farewell speech follow the same output.
             ...(options?.audioOutputDeviceId
               ? { audioOutput: { deviceId: options.audioOutputDeviceId } }
               : {}),
@@ -410,30 +387,20 @@ export function useInterviewSession(interviewId: string): InterviewSession {
             r,
             interviewId,
             {
-              onClosing: (text, closingId) => {
+              onClosing: () => {
                 if (disposedRef.current) return
                 phaseRef.current = "closing"
                 setPhase("closing")
-                if (text)
-                  setBubbleText(
-                    bubbleFor(`farewell-${closingId}`, "agent"),
-                    text
-                  )
               },
-              onCompleted: (status) => {
+              onCompleted: () => {
                 if (disposedRef.current) return
                 phaseRef.current = "ended"
                 setEndedAt(Date.now())
                 setPhase("ended")
-                for (const seg of segmentsRef.current.values()) {
-                  if (seg.segmentId.startsWith("farewell-"))
-                    finalizeBubble(seg, status !== "played")
-                }
                 // Sealed: release the microphone even if no worker remains to
                 // close the room (a server-reconciled end).
                 stopOnsetRef.current?.()
                 stopOnsetRef.current = null
-                closeFarewellAudio()
                 cancelTranscriptions()
                 if (roomRef.current) stopLocalTracks(roomRef.current)
                 void roomRef.current?.disconnect()
@@ -442,9 +409,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
               onError: setError,
               onRecoveryPending: () => setClosingRecoveryPending(true),
             },
-            token,
-            undefined,
-            () => farewellAudioRef.current
+            token
           )
           // Until start() hands the room to the UI, a disconnect is a start
           // failure and the catch below owns the phase — including the
@@ -574,21 +539,15 @@ export function useInterviewSession(interviewId: string): InterviewSession {
       interviewId,
       registerTranscriptionHandler,
       registerAgentStateHandler,
-      bubbleFor,
-      setBubbleText,
-      finalizeBubble,
       cancelTranscriptions,
-      unlockFarewellAudio,
-      closeFarewellAudio,
     ]
   )
 
   const requestEnd = React.useCallback(() => {
     const r = roomRef.current
     if (!r || phaseRef.current !== "live") return
-    // The confirm click: renews the farewell context's gesture if the
-    // browser suspended it during the interview.
-    unlockFarewellAudio()
+    // Preserve the click's audio gesture for the existing RTC renderer.
+    void r.startAudio().catch(() => {})
     const agent = [...r.remoteParticipants.values()].find(
       (participant) => participant.isAgent
     )
@@ -616,7 +575,7 @@ export function useInterviewSession(interviewId: string): InterviewSession {
         // closing. Keep the independent API supervision and its fixed deadline.
       }
     )
-  }, [unlockFarewellAudio])
+  }, [])
 
   const resumeFarewell = React.useCallback(() => {
     void farewellRef.current?.resume()
@@ -657,11 +616,10 @@ export function useInterviewSession(interviewId: string): InterviewSession {
       stopOnsetRef.current?.()
       cancelTranscriptions()
       farewellRef.current?.dispose()
-      closeFarewellAudio()
       if (roomRef.current) stopLocalTracks(roomRef.current)
       void roomRef.current?.disconnect()
     }
-  }, [cancelTranscriptions, closeFarewellAudio])
+  }, [cancelTranscriptions])
 
   return {
     phase,

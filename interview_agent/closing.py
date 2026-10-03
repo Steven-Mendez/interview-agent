@@ -1,35 +1,29 @@
-"""Exclusive, bounded closing with a finite clip acknowledged by the browser."""
+"""Exclusive, bounded closing through the agent's native speech pipeline."""
 
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import logging
 import time
 import uuid
-import wave
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import timedelta
 
 from sqlalchemy import func, literal, select
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.exc import SQLAlchemyError
 
 from interview_agent.interview import db
-from interview_agent.playback import PlaybackAck, acknowledge_playback, record_delivery
+from interview_agent.playback import NATIVE_AUDIO_MIME, confirmation_source, record_agent_playout
 from interview_agent.stt_drain import STTDrainReport
 
 logger = logging.getLogger(__name__)
 CONTROL_TOPIC = "interview.control"
-FAREWELL_TOPIC = "interview.farewell_audio"
+FAREWELL_READY_METHOD = "interview.farewell_ready"
 FINALIZATION_SECONDS = 5.0
 LEASE_RENEWAL_MARGIN_SECONDS = 5.0
-PLAYBACK_POLL_SECONDS = 0.25
 STT_DRAIN_SECONDS = 5.0
-FAREWELL_CHUNK_BYTES = 15_000
-FAREWELL_CHUNK_INTERVAL_SECONDS = 0.05
 FAREWELLS = {
     "es": (
         "Gracias por compartir tu experiencia. Hemos terminado la entrevista. "
@@ -40,26 +34,6 @@ FAREWELLS = {
         "I wish you every success. Goodbye."
     ),
 }
-
-
-async def synthesize_farewell(tts, language: str) -> bytes:
-    frames = []
-    async with tts.synthesize(FAREWELLS.get(language, FAREWELLS["en"])) as stream:
-        async for item in stream:
-            frames.append(item.frame)
-    if not frames:
-        raise ValueError("Farewell synthesis produced no audio")
-    first = frames[0]
-    output = io.BytesIO()
-    with wave.open(output, "wb") as wav:
-        wav.setnchannels(first.num_channels)
-        wav.setsampwidth(2)
-        wav.setframerate(first.sample_rate)
-        for frame in frames:
-            if frame.sample_rate != first.sample_rate or frame.num_channels != first.num_channels:
-                raise ValueError("Farewell audio format changed")
-            wav.writeframes(bytes(frame.data))
-    return output.getvalue()
 
 
 class ClosingCoordinator:
@@ -100,12 +74,13 @@ class ClosingCoordinator:
         self.stream_id = None
         self.attempt_id = None
         self.owns_closure = False
-        self.playback = asyncio.Event()
         self.playback_status = "pending"
-        self._delivery_ready = False
-        self._audio_task = None
+        self.confirmation_source = "agent_playout"
+        self._speech = None
+        self._stt_task = None
         self._finish_task = None
         self._abort = asyncio.Event()
+        self._audio_deadline = None
         self._pending: set[asyncio.Task] = set()
         self._finished = False
         self._recovered = False
@@ -136,14 +111,18 @@ class ClosingCoordinator:
             task.cancel()
             raise
 
-    def prewarm(self):
-        if self._audio_task is None:
-            self._audio_task = self._observe(
-                asyncio.create_task(
-                    synthesize_farewell(self.session.tts, self.language),
-                    name="prepare-farewell",
-                )
-            )
+    def is_farewell_item(self, item) -> bool:
+        return self._speech is not None and any(
+            message.id == item.id for message in self._speech.chat_items
+        )
+
+    async def wait_for_stt_drain(self):
+        """Keep the last candidate turn ahead of the native farewell in SQL."""
+        if self._stt_task is not None:
+            # The finish task records an unverifiable drain as partial.
+            # Its bounded failure must not discard the spoken SDK item.
+            with suppress(Exception):
+                await asyncio.shield(self._stt_task)
 
     async def publish(self, event, **fields):
         if self.speech_fence is not None:
@@ -152,7 +131,8 @@ class ClosingCoordinator:
             "event": event,
             "conversation_id": str(self.conversation_id),
             "closing_id": str(self.closing_id) if self.closing_id else None,
-            "stream_id": self.stream_id,
+            "transport": "rtc",
+            "confirmation_source": self.confirmation_source,
             "attempt_id": str(self.attempt_id) if self.attempt_id else None,
             **fields,
         }
@@ -162,30 +142,6 @@ class ClosingCoordinator:
             topic=CONTROL_TOPIC,
             destination_identities=["candidate"],
         )
-
-    async def acknowledge(self, caller, payload):
-        data = json.loads(payload)
-        if (
-            not isinstance(data, dict)
-            or caller != "candidate"
-            or not self.owns_closure
-            or self.closing_id is None
-            or self.stream_id is None
-            or data.get("closing_id") != str(self.closing_id)
-            or data.get("stream_id") != self.stream_id
-            or data.get("attempt_id") != str(self.attempt_id)
-        ):
-            raise ValueError("Playback acknowledgement does not match this closure attempt")
-        result, _first = await self._bounded(
-            acknowledge_playback(
-                self.sessionmaker, self.conversation_id, PlaybackAck.model_validate(data)
-            ),
-            FINALIZATION_SECONDS,
-        )
-        if result.get("accepted") and result.get("status") in ("played", "failed", "timeout"):
-            self.playback_status = result["status"]
-            self.playback.set()
-        return json.dumps(result)
 
     async def _claim(self, reason):
         async with self.sessionmaker() as session:
@@ -204,7 +160,7 @@ class ClosingCoordinator:
             if conv.closing_owner_id not in (None, self.owner_id):
                 if conv.closing_deadline_at is not None and conv.closing_deadline_at > now:
                     return "follow"
-                # A dead owner's clip must not be replayed by a replacement job.
+                # A dead owner's farewell must never be replayed by a replacement.
                 mode = "recover"
             else:
                 mode = "deliver"
@@ -239,6 +195,9 @@ class ClosingCoordinator:
             )
             conv.closing_stream_id = self.stream_id
             conv.closing_attempt_id = self.attempt_id
+            if mode != "recover":
+                conv.closing_audio_mime = NATIVE_AUDIO_MIME
+            self.confirmation_source = confirmation_source(conv) or "browser_playback"
             conv.status = "closing"
             conv.ended_reason = conv.ended_reason or reason
             if mode == "recover" and conv.farewell_status in ("played", "failed"):
@@ -262,109 +221,109 @@ class ClosingCoordinator:
         raise TimeoutError("Another owner has not finalized closure")
 
     async def _deliver(self, reason):
-        self.prewarm()
-        await self.publish(
-            "closing",
-            reason=reason,
-            text=FAREWELLS.get(self.language, FAREWELLS["en"]),
-            timeout_seconds=self.timeout_seconds,
-        )
+        self._require_audio_phase()
         self.session.input.set_audio_enabled(False)
+        if not self.session.output.audio_enabled or self.session.output.audio is None:
+            self.playback_status = "not_possible"
+            return
         current = self.session.current_speech
         if current is not None:
             # Ending during a long question must leave time for the farewell.
             # The public interrupt future also commits the interrupted item.
-            try:
-                await self._bounded(self.session.interrupt(force=True), 1)
-            except (TimeoutError, RuntimeError) as exc:
-                # The finite clip has a separate transport. The browser silences
-                # the interviewer's RTC track before playing it, so a stalled
-                # old playout callback must not suppress the farewell.
-                self.telemetry.emit(
-                    "closing",
-                    "speech_interrupt_errors",
-                    1,
-                    dimensions={"error_type": type(exc).__name__},
-                )
-        audio = await asyncio.shield(self._audio_task)
-        writer = await self.room.local_participant.stream_bytes(
-            "farewell.wav",
-            topic=FAREWELL_TOPIC,
-            mime_type="audio/wav",
-            stream_id=self.stream_id,
-            total_size=len(audio),
-            destination_identities=["candidate"],
-            attributes={
-                "closing_id": str(self.closing_id),
-                "conversation_id": str(self.conversation_id),
-                "attempt_id": str(self.attempt_id),
-            },
+            # Both speeches share the same output: a stalled interruption must
+            # not be followed by another speech or counted as success.
+            await self._bounded(self.session.interrupt(force=True), 1)
+        self._require_audio_phase()
+        await self.publish("closing", reason=reason, timeout_seconds=self.timeout_seconds)
+        # A readiness RPC gates old tabs that still mute the agent for WAV
+        # playback, and waits for blocked RTC audio without synthesizing twice.
+        ready = json.loads(
+            await self.room.local_participant.perform_rpc(
+                destination_identity="candidate",
+                method=FAREWELL_READY_METHOD,
+                payload=json.dumps(
+                    {
+                        "conversation_id": str(self.conversation_id),
+                        "closing_id": str(self.closing_id),
+                        "attempt_id": str(self.attempt_id),
+                        "timeout_seconds": self.timeout_seconds,
+                    }
+                ),
+                response_timeout=self.timeout_seconds,
+            )
+        )
+        self._require_audio_phase()
+        if not isinstance(ready, dict) or ready.get("ready") is not True:
+            self.playback_status = "not_possible"
+            return
+        if self.speech_fence is not None:
+            self.speech_fence()
+        self._speech = self.session.say(
+            FAREWELLS.get(self.language, FAREWELLS["en"]),
+            allow_interruptions=False,
+            add_to_chat_ctx=True,
         )
         try:
+            await self._speech.wait_for_playout()
+            if self._speech.exception() is not None or self._speech.interrupted:
+                raise RuntimeError("Native farewell speech did not finish successfully")
+            messages = [
+                item
+                for item in self._speech.chat_items
+                if getattr(item, "role", None) == "assistant"
+            ]
+            if len(messages) != 1 or messages[0].interrupted:
+                raise RuntimeError("Native farewell has no complete session item")
+            metrics = messages[0].metrics
+            duration = metrics.get("stopped_speaking_at", 0) - metrics.get("started_speaking_at", 0)
+            if not metrics.get("started_speaking_at") or duration <= 0:
+                raise RuntimeError("Native farewell has no audio playout evidence")
+            self._require_audio_phase()
             if self.speech_fence is not None:
                 self.speech_fence()
-            # A large FFI write queues every native chunk in one burst. Cloud
-            # delivery can then reach the footer with a missing 15 kB chunk.
-            # Pace finite writes (including the header-to-first-chunk gap),
-            # rather than treating local enqueue completion as network drain.
-            for offset in range(0, len(audio), FAREWELL_CHUNK_BYTES):
-                if len(audio) > FAREWELL_CHUNK_BYTES:
-                    await asyncio.sleep(FAREWELL_CHUNK_INTERVAL_SECONDS)
-                if self.speech_fence is not None:
-                    self.speech_fence()
-                await writer.write(audio[offset : offset + FAREWELL_CHUNK_BYTES])
-            # Commit full delivery before the footer. Keep this bounded commit
-            # alive if the audio budget expires just after the final byte.
-            persisted = self._observe(
-                asyncio.create_task(
-                    self._bounded(
-                        record_delivery(
-                            self.sessionmaker,
-                            self.conversation_id,
-                            self.owner_id,
-                            self.closing_id,
-                            self.stream_id,
-                            self.attempt_id,
-                            len(audio),
-                            "audio/wav",
-                        ),
-                        FINALIZATION_SECONDS,
-                    )
-                )
-            )
-            status = await asyncio.shield(persisted)
-            if status in ("played", "failed", "timeout"):
-                self.playback_status = status
-                self.playback.set()
-            self._delivery_ready = True
-            await writer.aclose()
-            await self.playback.wait()
+            # Success must survive a crash before the final seal: commit the
+            # SDK item first, identified by its source ID rather than its text.
+            await self.drain_transcript()
+            self._require_audio_phase()
+            if not await record_agent_playout(
+                self.sessionmaker,
+                self.conversation_id,
+                self.owner_id,
+                self.closing_id,
+                self.attempt_id,
+                duration,
+                source_id=messages[0].id,
+            ):
+                raise RuntimeError("Native farewell ownership or deadline changed")
+            self.playback_status = "played"
         finally:
-            # Cancellation of write/aclose must not introduce an unbounded await.
-            if not self._delivery_ready:
-                try:
-                    await self._bounded(writer.aclose(), min(0.25, self.timeout_seconds))
-                except (Exception, asyncio.CancelledError):
-                    logger.debug("Farewell writer cleanup did not finish")
+            if not self._speech.done():
+                self._speech.interrupt(force=True)
+
+    def _require_audio_phase(self):
+        # Cancellation-resistant SDK callbacks may return after closing has
+        # timed out. They must never start or confirm another native speech.
+        if (
+            self._audio_deadline is None
+            or time.monotonic() >= self._audio_deadline
+            or self._abort.is_set()
+        ):
+            raise TimeoutError("Native farewell audio phase is no longer active")
 
     async def _audio_phase(self, reason, say_goodbye):
         if not say_goodbye:
             self.playback_status = "not_possible"
             return
+        self._audio_deadline = time.monotonic() + self.timeout_seconds
         delivery = self._observe(asyncio.create_task(self._deliver(reason)))
         abort = asyncio.create_task(self._abort.wait())
-        playback = asyncio.create_task(self._watch_playback())
         try:
             done, _ = await asyncio.wait(
-                {delivery, abort, playback},
+                {delivery, abort},
                 timeout=self.timeout_seconds,
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if playback in done:
-                playback.result()
-                # Playback is authoritative even if an FFI footer callback stalls.
-                delivery.cancel()
-            elif abort in done:
+            if abort in done:
                 delivery.cancel()
                 self.playback_status = "not_possible"
             elif delivery in done:
@@ -372,35 +331,18 @@ class ClosingCoordinator:
             else:
                 delivery.cancel()
                 self.playback_status = "timeout"
+        except TimeoutError:
+            self.playback_status = "timeout"
         except Exception:
             self.playback_status = "failed"
             logger.exception("Farewell delivery failed")
         finally:
+            self._audio_deadline = None
+            if not delivery.done():
+                delivery.cancel()
+            if self._speech is not None and not self._speech.done():
+                self._speech.interrupt(force=True)
             abort.cancel()
-            playback.cancel()
-            self._delivery_ready = False
-
-    async def _watch_playback(self):
-        while not self.playback.is_set():
-            try:
-                async with asyncio.timeout(0.5), self.sessionmaker() as session:
-                    conv = await session.get(db.Conversation, self.conversation_id)
-                    if (
-                        conv is not None
-                        and conv.closing_id == self.closing_id
-                        and conv.closing_stream_id == self.stream_id
-                        and conv.closing_attempt_id == self.attempt_id
-                        and conv.farewell_status in ("played", "failed")
-                    ):
-                        self.playback_status = conv.farewell_status
-                        self.playback.set()
-                        return
-            except (TimeoutError, SQLAlchemyError):
-                # A transient DB outage must not erase a durable ACK. The
-                # containing audio phase and reconciliation remain bounded.
-                pass
-            with suppress(TimeoutError):
-                await asyncio.wait_for(self.playback.wait(), PLAYBACK_POLL_SECONDS)
 
     async def _finalize(self):
         async with self.sessionmaker() as session:
@@ -452,7 +394,9 @@ class ClosingCoordinator:
                 raise RuntimeError("Closure ownership changed while finalizing transcript")
             if conv.farewell_status in ("played", "failed", "timeout"):
                 self.playback_status = conv.farewell_status
-            if self.playback_status == "played":
+            if self.playback_status == "played" and conv.closing_audio_mime != NATIVE_AUDIO_MIME:
+                # Historical WAV recovery only. Native speech is persisted by
+                # conversation_item_added with its SDK identity, never twice.
                 await db.insert_message(
                     session,
                     self.conversation_id,
@@ -554,6 +498,7 @@ class ClosingCoordinator:
                         name="finish-stt-input",
                     )
                 )
+                self._stt_task = stt_task
             await self._audio_phase(reason, say_goodbye)
             if stt_task is not None:
                 try:
@@ -575,9 +520,17 @@ class ClosingCoordinator:
             "closing",
             "duration_seconds",
             time.monotonic() - start,
-            dimensions={"farewell_status": self.playback_status},
+            dimensions={
+                "farewell_status": self.playback_status,
+                "confirmation_source": self.confirmation_source,
+            },
         )
-        self.telemetry.emit("closing", "playback_confirmed", int(self.playback_status == "played"))
+        self.telemetry.emit(
+            "closing",
+            "playback_confirmed",
+            int(self.playback_status == "played"),
+            dimensions={"confirmation_source": self.confirmation_source},
+        )
         self._finished = True
         try:
             await self._bounded(
@@ -622,8 +575,8 @@ class ClosingCoordinator:
 
     async def aclose(self):
         self._abort.set()
-        if self._audio_task is not None and not self._audio_task.done():
-            self._audio_task.cancel()
+        if self._speech is not None and not self._speech.done():
+            self._speech.interrupt(force=True)
         if self._finish_task is not None and not self._finish_task.done():
             await self._bounded(
                 asyncio.shield(self._finish_task),

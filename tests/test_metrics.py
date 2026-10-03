@@ -73,6 +73,22 @@ async def test_missing_values_count_as_unknown_never_as_zero(recorded_metrics):
     assert (known.count, known.sum) == (1, 0.5)
 
 
+def test_farewell_metrics_preserve_the_evidence_policy_without_identity(recorded_metrics):
+    for source in ("agent_playout", "browser_playback"):
+        otel_metrics.record(
+            "closing",
+            "playback_confirmed",
+            1,
+            {"confirmation_source": source, "farewell_status": "played", **IDENTITY},
+        )
+    points = recorded_metrics("interview_agent.closing.playback_confirmed")
+    assert len(points) == 2
+    assert {tuple(sorted(dict(point.attributes).items())) for point in points} == {
+        (("confirmation_source", source), ("farewell_status", "played"))
+        for source in ("agent_playout", "browser_playback")
+    }
+
+
 async def test_samples_never_carry_the_current_span_as_an_exemplar(recorded_metrics):
     # The SDK default would attach the sampled span's trace and span IDs.
     with TracerProvider().get_tracer("test").start_as_current_span("voice turn"):

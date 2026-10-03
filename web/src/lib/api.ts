@@ -165,6 +165,8 @@ export interface Interview {
   max_minutes: number | null
   closing_id: string | null
   farewell_status: string | null
+  /** Native success is local agent playout, not a browser-ended ACK. */
+  farewell_confirmation_source?: "agent_playout" | "browser_playback" | null
   /** Localized written farewell when the audio was not (provably) heard. */
   farewell_text?: string | null
   /** Server-clock bound for a closing observed after a reload; else null. */
@@ -422,6 +424,7 @@ export interface ClosingState {
   status: InterviewStatus
   closing_id: string | null
   farewell_status: string | null
+  farewell_confirmation_source?: "agent_playout" | "browser_playback" | null
   transcript_sealed: boolean
   transcript_integrity: string | null
   remaining_seconds: number | null

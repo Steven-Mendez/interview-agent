@@ -24,6 +24,16 @@ const FAREWELL_NOTES: Partial<Record<string, string>> = {
   timeout: "Playback of the spoken farewell could not be confirmed in time.",
 }
 
+const AGENT_FAREWELL_NOTES: Partial<Record<string, string>> = {
+  played:
+    "The interviewer finished the farewell. This confirms agent playout, not complete playback in your browser.",
+  not_possible:
+    "The interviewer could not start the farewell through the connected audio session.",
+  failed: "The interviewer's farewell did not finish successfully.",
+  timeout:
+    "The interviewer's farewell did not finish within the closing time limit.",
+}
+
 /** Why the interview ended and, when the audio was not heard, the farewell
  *  in writing. Never claims a farewell was played. */
 export function InterviewEnding({ interview }: { interview: Interview }) {
@@ -31,7 +41,9 @@ export function InterviewEnding({ interview }: { interview: Interview }) {
     ? TECHNICAL_REASONS[interview.ended_reason]
     : undefined
   const farewellNote = interview.farewell_status
-    ? FAREWELL_NOTES[interview.farewell_status]
+    ? (interview.farewell_confirmation_source === "agent_playout"
+        ? AGENT_FAREWELL_NOTES
+        : FAREWELL_NOTES)[interview.farewell_status]
     : undefined
   if (!reason && !farewellNote) return null
   return (

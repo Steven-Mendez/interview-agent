@@ -33,6 +33,9 @@ const mocks = vi.hoisted(() => {
     // Every track createTracks handed out, published or not.
     created: MockTrack[] = []
     disconnected = false
+    state = "connected"
+    canPlaybackAudio = true
+    startAudio = vi.fn().mockResolvedValue(undefined)
     localParticipant = {
       // Enabling goes through createTracks and publishTrack, as the SDK's
       // does, so it shares their permission gate and closed-room publish.
@@ -68,6 +71,8 @@ const mocks = vi.hoisted(() => {
       }),
       performRpc: vi.fn().mockResolvedValue('{"accepted":true}'),
       getTrackPublications: () => this.publications,
+      registerRpcMethod: vi.fn(),
+      unregisterRpcMethod: vi.fn(),
     }
     connect = vi.fn(async () => {
       if (gates.connect) await gates.connect
@@ -89,8 +94,10 @@ const mocks = vi.hoisted(() => {
       this.listeners.set(event, [...(this.listeners.get(event) ?? []), handler])
       return this
     }
-    emit(event: string) {
-      this.listeners.get(event)?.forEach((handler) => handler())
+    emit(event: string, ...args: unknown[]) {
+      this.listeners
+        .get(event)
+        ?.forEach((handler) => Reflect.apply(handler, undefined, args))
     }
     receive(
       reader: ControlledReader,
@@ -914,101 +921,92 @@ describe("microphone release", () => {
   })
 })
 
-// Safari only lets an AudioContext make sound once a user gesture resumed
-// it, so the farewell's context must be created and resumed synchronously
-// inside the Join and End clicks; an await before it would lose the gesture.
-describe("farewell audio unlock", () => {
-  const contexts: AudioContextDouble[] = []
-  class AudioContextDouble {
-    state: AudioContextState = "suspended"
-    resume = vi.fn(() => {
-      this.state = "running"
-      return Promise.resolve()
+describe("native farewell audio", () => {
+  it("renders only the SDK farewell segment while closing, without a synthetic duplicate", async () => {
+    const { room, result, unmount } = await connected()
+    const payload = new TextEncoder().encode(
+      JSON.stringify({
+        event: "closing",
+        transport: "rtc",
+        conversation_id: "test",
+        closing_id: "closing",
+        attempt_id: "attempt",
+        text: "Native farewell",
+      })
+    )
+    await act(async () => {
+      room.emit(
+        RoomEvent.DataReceived,
+        payload,
+        { identity: "agent" },
+        undefined,
+        "interview.control"
+      )
+      room.emit(
+        RoomEvent.DataReceived,
+        payload,
+        { identity: "agent" },
+        undefined,
+        "interview.control"
+      )
+      await flush()
     })
-    close = vi.fn(() => {
-      this.state = "closed"
-      return Promise.resolve()
+    expect(result.current.phase).toBe("closing")
+    expect(result.current.messages).toEqual([])
+    const reader = new ControlledReader("native-farewell", true)
+    reader.push("Native farewell")
+    reader.push(null)
+    await act(async () => {
+      await room.receive(reader, "agent")
     })
-    constructor() {
-      contexts.push(this)
-    }
-  }
-
-  beforeEach(() => {
-    contexts.length = 0
-    vi.stubGlobal("AudioContext", AudioContextDouble)
+    expect(result.current.messages).toEqual([
+      {
+        segmentId: "native-farewell",
+        who: "agent",
+        text: "Native farewell",
+        interim: false,
+        incomplete: false,
+      },
+    ])
+    unmount()
   })
-  afterEach(() => {
+  it("does not create a second player or AudioContext for the farewell", async () => {
+    const create = vi.fn()
+    vi.stubGlobal("AudioContext", create)
+    const { unmount } = await connected()
+    expect(create).not.toHaveBeenCalled()
+    expect(mocks.rooms[0].registerByteStreamHandler).not.toHaveBeenCalled()
+    expect(
+      mocks.rooms[0].localParticipant.registerRpcMethod
+    ).toHaveBeenCalledWith("interview.farewell_ready", expect.any(Function))
+    unmount()
     vi.unstubAllGlobals()
   })
-
-  const farewellContext = () => {
-    const getter = mocks.farewells[0]?.[5] as () => AudioContext | null
-    return getter()
-  }
-
-  it("creates and resumes the context inside the Join click", async () => {
-    const hook = renderHook(() => useInterviewSession("test"))
-    await act(async () => {
-      hook.result.current.start()
-      // Before any await: still inside the click's user activation.
-      expect(contexts).toHaveLength(1)
-      expect(contexts[0].resume).toHaveBeenCalledOnce()
-      await flush()
-    })
-    expect(hook.result.current.phase).toBe("live")
-    // The playback plays through that same context.
-    expect(mocks.farewells).toHaveLength(1)
-    expect(farewellContext()).toBe(contexts[0])
-    hook.unmount()
-  })
-
-  it("resumes the same context again in the End click if it was suspended", async () => {
+  it("keeps the End click's gesture on the existing room audio", async () => {
     const { result, unmount } = await connected()
-    expect(contexts[0].state).toBe("running")
-    // The browser suspended it during the interview.
-    contexts[0].state = "suspended"
     act(() => {
       result.current.requestEnd()
-      expect(contexts[0].resume).toHaveBeenCalledTimes(2)
+      expect(mocks.rooms[0].startAudio).toHaveBeenCalledOnce()
     })
-    await act(async () => {
-      await flush()
-    })
-    expect(contexts).toHaveLength(1)
-    expect(farewellContext()).toBe(contexts[0])
+    await act(flush)
+    expect(
+      mocks.rooms[0].remoteParticipants.get("agent")?.setVolume
+    ).not.toHaveBeenCalled()
     unmount()
   })
-
-  it("leaves a running context alone in the End click", async () => {
+  it("releases the room only after saved transcript completion", async () => {
     const { result, unmount } = await connected()
     await act(async () => {
-      result.current.requestEnd()
+      result.current.syncClosingState("closing", "closing", "pending", false)
       await flush()
     })
-    expect(contexts).toHaveLength(1)
-    expect(contexts[0].resume).toHaveBeenCalledOnce()
-    unmount()
-  })
-
-  it("closes the context when the interview ends", async () => {
-    const { result, unmount } = await connected()
+    expect(mocks.rooms[0].disconnect).not.toHaveBeenCalled()
     await act(async () => {
-      result.current.syncClosingState("completed", null, "not_possible", true)
+      result.current.syncClosingState("completed", "closing", "played", true)
       await flush()
     })
     expect(result.current.phase).toBe("ended")
-    expect(contexts[0].close).toHaveBeenCalledOnce()
-    expect(farewellContext()).toBeNull()
+    expect(mocks.rooms[0].disconnect).toHaveBeenCalledOnce()
     unmount()
-    expect(contexts[0].close).toHaveBeenCalledOnce()
-  })
-
-  it("closes the context when the page goes away mid-interview", async () => {
-    const { unmount } = await connected()
-    expect(contexts[0].close).not.toHaveBeenCalled()
-    unmount()
-    expect(contexts[0].close).toHaveBeenCalledOnce()
-    expect(farewellContext()).toBeNull()
   })
 })

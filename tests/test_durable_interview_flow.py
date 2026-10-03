@@ -4,7 +4,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 from sqlalchemy import func, select
-from test_closing import ack, coordinator
+from test_closing import coordinator
 from test_dialogue import question, setup_graph
 from test_routes import _fake_evaluator
 
@@ -48,12 +48,12 @@ async def test_question_capture_correction_farewell_seal_and_recovered_evaluatio
     closing.drain_transcript = writer.drain
     closing.end_stt_input = AsyncMock(return_value=STTDrainReport(True, 1, 2, 0, 1, 1))
     finishing = asyncio.create_task(closing.finish("candidate_requested"))
-    await asyncio.wait_for(transport.sent.wait(), 1)
+    await asyncio.wait_for(transport.started.wait(), 1)
     async with postgres_sessionmaker() as session:
         assert (
             await session.get(db.Conversation, graph.conversation_id)
         ).transcript_sealed_at is None
-    await closing.acknowledge("candidate", ack(closing))
+    transport.release.set()
     assert await finishing == "played"
     monkeypatch.setattr(evaluations, "run_evaluator", _fake_evaluator)
     runner = evaluations.EvaluationRunner(postgres_sessionmaker)

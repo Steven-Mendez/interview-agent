@@ -51,6 +51,7 @@ DIMENSIONS = frozenset(
         "reasoning_effort",
         "price_version",
         "farewell_status",
+        "confirmation_source",
         "stt_model",
         "tts_model",
         "provider",

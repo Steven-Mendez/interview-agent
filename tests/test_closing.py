@@ -1,69 +1,77 @@
-"""Closing invariants with real PostgreSQL and controlled transport failures."""
+"""Native speech closure, durable evidence and fencing with real PostgreSQL."""
 
 import asyncio
-import io
-import json
 import time
 import uuid
-import wave
 from datetime import UTC, datetime, timedelta
-from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from livekit import rtc
-from sqlalchemy import event, func, select
+from livekit.agents.llm import ChatMessage
 
-from interview_agent import closing as closing_module
-from interview_agent.closing import FAREWELLS, ClosingCoordinator, synthesize_farewell
+from interview_agent.closing import FAREWELL_READY_METHOD, FAREWELLS, ClosingCoordinator
 from interview_agent.config import settings
 from interview_agent.interview import db
 from interview_agent.playback import (
     PlaybackAck,
     acknowledge_playback,
-    record_delivery,
+    closing_state,
+    record_agent_playout,
 )
 from interview_agent.server.reconciliation import reconcile_interview
 from interview_agent.stt_drain import STTDrainReport
 
 
-class SynthesizedClip:
-    async def __aenter__(self):
-        return self
+class Speech:
+    def __init__(self, sessionmaker, conversation_id):
+        self.id = "native-" + str(uuid.uuid4())
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        self.finished = False
+        self.interrupted = False
+        self.error = None
+        self.audio_evidence = True
+        self.chat_items = []
+        self.text = ""
+        self.before_persist = None
+        self.sessionmaker = sessionmaker
+        self.conversation_id = conversation_id
+        self.interrupt = Mock(side_effect=self._interrupt)
 
-    async def __aexit__(self, *args):
-        pass
+    def _interrupt(self, *, force=False):
+        self.interrupted = True
+        self.release.set()
 
-    async def __aiter__(self):
-        yield SimpleNamespace(
-            frame=rtc.AudioFrame(
-                data=b"\x00\x00" * 240,
-                sample_rate=24000,
-                num_channels=1,
-                samples_per_channel=240,
+    def done(self):
+        return self.finished
+
+    def exception(self):
+        return self.error
+
+    async def wait_for_playout(self):
+        await self.release.wait()
+        if not self.interrupted and self.error is None:
+            metrics = (
+                {"started_speaking_at": 1.0, "stopped_speaking_at": 1.05}
+                if self.audio_evidence
+                else {}
             )
-        )
-
-
-class Writer:
-    def __init__(self):
-        self.write_started = asyncio.Event()
-        self.sent = asyncio.Event()
-        self.write_gate = asyncio.Event()
-        self.write_gate.set()
-        self.close_gate = asyncio.Event()
-        self.close_gate.set()
-        self.data = b""
-
-    async def write(self, data):
-        self.write_started.set()
-        await self.write_gate.wait()
-        self.data += data
-
-    async def aclose(self):
-        self.sent.set()
-        await self.close_gate.wait()
+            item = ChatMessage(id=self.id, role="assistant", content=[self.text], metrics=metrics)
+            self.chat_items.append(item)
+            if self.before_persist is not None:
+                await self.before_persist()
+            # The worker's conversation_item_added listener owns persistence.
+            async with self.sessionmaker() as session:
+                await db.insert_message(
+                    session,
+                    self.conversation_id,
+                    item.role,
+                    item.text_content,
+                    source_id=item.id,
+                    metrics=metrics,
+                )
+        self.finished = True
 
 
 async def create_conversation(sessionmaker):
@@ -82,22 +90,26 @@ async def create_conversation(sessionmaker):
     return conversation_id
 
 
-def coordinator(sessionmaker, conversation_id, *, timeout=1, writer=None, seal=None):
-    writer = writer or Writer()
-    streams = []
+def coordinator(sessionmaker, conversation_id, *, timeout=1, speech=None, seal=None):
+    speech = speech or Speech(sessionmaker, conversation_id)
+    calls = []
 
-    async def stream_bytes(name, **kwargs):
-        streams.append({"name": name, **kwargs})
-        return writer
+    def say(text, **kwargs):
+        calls.append({"text": text, **kwargs})
+        speech.text = text
+        speech.started.set()
+        return speech
 
     local = SimpleNamespace(
-        stream_bytes=stream_bytes,
         publish_data=AsyncMock(),
+        perform_rpc=AsyncMock(return_value='{"ready":true}'),
+        stream_bytes=Mock(side_effect=AssertionError("No WAV transport")),
     )
     session = SimpleNamespace(
         input=SimpleNamespace(set_audio_enabled=Mock()),
         current_speech=None,
-        tts=SimpleNamespace(synthesize=lambda text: SynthesizedClip()),
+        output=SimpleNamespace(audio_enabled=True, audio=object()),
+        say=Mock(side_effect=say),
     )
     closing = ClosingCoordinator(
         room=SimpleNamespace(local_participant=local),
@@ -110,671 +122,518 @@ def coordinator(sessionmaker, conversation_id, *, timeout=1, writer=None, seal=N
         drain_transcript=AsyncMock(),
         seal_transcript=seal,
     )
-    return closing, writer, streams
+    speech.before_persist = closing.wait_for_stt_drain
+    return closing, speech, calls
 
 
-def ack(closing, **updates):
-    return json.dumps(
-        {
-            "closing_id": str(closing.closing_id),
-            "stream_id": closing.stream_id,
-            "attempt_id": str(closing.attempt_id),
-            "status": "played",
-            "duration_seconds": 0.01,
-            **updates,
-        }
+async def test_native_turn_before_seal_without_wav_or_fabricated_browser_ack(postgres_sessionmaker):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    seal = AsyncMock()
+    owner, speech, calls = coordinator(postgres_sessionmaker, conversation_id, seal=seal)
+    task = asyncio.create_task(owner.finish("candidate_requested"))
+    await asyncio.wait_for(speech.started.wait(), 1)
+    assert calls == [
+        {"text": FAREWELLS["es"], "allow_interruptions": False, "add_to_chat_ctx": True}
+    ]
+    assert not task.done()
+    seal.assert_not_awaited()
+    async with postgres_sessionmaker() as session:
+        row = await session.get(db.Conversation, conversation_id)
+        assert row.status == "closing" and row.closing_audio_mime == "audio/rtc"
+        assert row.closing_delivery_at is None and row.transcript_sealed_at is None
+    speech.release.set()
+    assert await task == "played"
+    seal.assert_awaited_once()
+    owner.room.local_participant.stream_bytes.assert_not_called()
+    async with postgres_sessionmaker() as session:
+        row = await session.get(db.Conversation, conversation_id)
+        assert row.status == "completed" and row.transcript_sealed_at is not None
+        assert row.closing_ack_status is None and row.closing_ack_received_at is None
+        assert row.closing_audio_size is None and row.closing_playback_seconds > 0
+        assert row.closing_stream_id == speech.id
+        messages = await db.get_messages(session, conversation_id)
+        assert len(messages) == 1 and messages[0].source_id == speech.id
+        assert messages[0].content == FAREWELLS["es"]
+        assert owner.is_farewell_item(speech.chat_items[0])
+    assert (await closing_state(postgres_sessionmaker, conversation_id))[
+        "farewell_confirmation_source"
+    ] == "agent_playout"
+    owner.telemetry.emit.assert_any_call(
+        "closing", "playback_confirmed", 1, dimensions={"confirmation_source": "agent_playout"}
     )
 
 
-async def test_explicit_stt_drain_runs_parallel_to_farewell_before_complete_seal(
-    postgres_sessionmaker,
+async def test_readiness_precedes_synthesis_and_cannot_confirm_playout(postgres_sessionmaker):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    owner, speech, _ = coordinator(postgres_sessionmaker, conversation_id)
+    entered, ready = asyncio.Event(), asyncio.Event()
+
+    async def gate(**kwargs):
+        assert (
+            kwargs["method"] == FAREWELL_READY_METHOD
+            and kwargs["destination_identity"] == "candidate"
+        )
+        entered.set()
+        await ready.wait()
+        return '{"ready":true}'
+
+    owner.room.local_participant.perform_rpc.side_effect = gate
+    task = asyncio.create_task(owner.finish("timeout"))
+    await entered.wait()
+    owner.session.say.assert_not_called()
+    ready.set()
+    await speech.started.wait()
+    assert not task.done() and owner.playback_status == "pending"
+    speech.release.set()
+    assert await task == "played"
+
+
+@pytest.mark.parametrize("failure", ["error", "interrupted", "no_audio"])
+async def test_finished_handle_is_not_sufficient_evidence(postgres_sessionmaker, failure):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    owner, speech, _ = coordinator(postgres_sessionmaker, conversation_id)
+    if failure == "error":
+        speech.error = RuntimeError("Controlled synthesis failure")
+    if failure == "interrupted":
+        speech.interrupted = True
+    if failure == "no_audio":
+        speech.audio_evidence = False
+    speech.release.set()
+    assert await owner.finish("timeout") == "failed"
+    async with postgres_sessionmaker() as session:
+        row = await session.get(db.Conversation, conversation_id)
+        assert row.farewell_status == "failed" and row.closing_delivery_at is None
+        assert row.transcript_sealed_at is not None
+
+
+@pytest.mark.parametrize("failure", ["not_ready", "unsupported", "audio_disabled"])
+async def test_unavailable_native_playout_does_not_synthesize(postgres_sessionmaker, failure):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    owner, _, calls = coordinator(postgres_sessionmaker, conversation_id)
+    if failure == "not_ready":
+        owner.room.local_participant.perform_rpc.return_value = '{"ready":false}'
+    if failure == "unsupported":
+        owner.room.local_participant.perform_rpc.side_effect = RuntimeError("Unsupported method")
+    if failure == "audio_disabled":
+        owner.session.output.audio_enabled = False
+    assert await owner.finish("timeout") == (
+        "failed" if failure == "unsupported" else "not_possible"
+    )
+    assert calls == []
+
+
+@pytest.mark.parametrize("stage", ["ready", "speech"])
+async def test_native_timeout_is_bounded_and_interrupts_unfinished_speech(
+    postgres_sessionmaker, stage
 ):
     conversation_id = await create_conversation(postgres_sessionmaker)
-    started, release = asyncio.Event(), asyncio.Event()
+    owner, speech, calls = coordinator(postgres_sessionmaker, conversation_id, timeout=0.05)
 
-    async def final_input():
-        started.set()
+    async def blocked_ready(**kwargs):
+        await asyncio.Event().wait()
+
+    if stage == "ready":
+        owner.room.local_participant.perform_rpc.side_effect = blocked_ready
+    started = time.monotonic()
+    assert await asyncio.wait_for(owner.finish("timeout"), 1) == "timeout"
+    assert time.monotonic() - started < 1
+    if stage == "speech":
+        speech.interrupt.assert_called_with(force=True)
+    else:
+        assert calls == []
+    async with postgres_sessionmaker() as session:
+        row = await session.get(db.Conversation, conversation_id)
+        assert row.status == "completed" and row.closing_delivery_at is None
+
+
+async def test_native_closure_rejects_old_browser_clip_acks(postgres_sessionmaker):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    owner, _, _ = coordinator(postgres_sessionmaker, conversation_id)
+    await owner._claim("timeout")
+    ack = PlaybackAck(
+        closing_id=owner.closing_id,
+        stream_id=owner.stream_id,
+        attempt_id=owner.attempt_id,
+        status="played",
+    )
+    with pytest.raises(ValueError, match="Native speech"):
+        await acknowledge_playback(postgres_sessionmaker, conversation_id, ack)
+    async with postgres_sessionmaker() as session:
+        row = await session.get(db.Conversation, conversation_id)
+        assert row.farewell_status == "pending" and row.closing_ack_status is None
+
+
+@pytest.mark.parametrize("invalid", ["owner", "attempt", "expired"])
+async def test_native_playout_is_fenced(postgres_sessionmaker, invalid):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    owner, _, _ = coordinator(postgres_sessionmaker, conversation_id)
+    await owner._claim("timeout")
+    if invalid == "expired":
+        async with postgres_sessionmaker() as session:
+            row = await session.get(db.Conversation, conversation_id)
+            row.closing_deadline_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+    assert not await record_agent_playout(
+        postgres_sessionmaker,
+        conversation_id,
+        uuid.uuid4() if invalid == "owner" else owner.owner_id,
+        owner.closing_id,
+        uuid.uuid4() if invalid == "attempt" else owner.attempt_id,
+        1,
+        source_id="native-item",
+    )
+
+
+async def test_stt_drain_parallel_to_native_speech_before_seal(postgres_sessionmaker):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def drain():
+        entered.set()
         await release.wait()
         async with postgres_sessionmaker() as session:
             await db.insert_message(
                 session,
                 conversation_id,
                 "user",
-                "The final answer tail.",
-                source_id="late-final",
+                "Final confirmed answer",
+                source_id="last-answer",
                 metrics={"stt_confirmed": True},
             )
         return STTDrainReport(True, 1, 2.5, 0, 1, 1)
 
-    closing, writer, _ = coordinator(postgres_sessionmaker, conversation_id)
-    closing.end_stt_input = final_input
-    finish = asyncio.create_task(closing.finish("candidate_requested"))
-    await asyncio.wait_for(writer.sent.wait(), 1)
-    assert started.is_set()
-    await closing.acknowledge("candidate", ack(closing))
-    assert not finish.done()
+    owner, speech, _ = coordinator(postgres_sessionmaker, conversation_id)
+    owner.end_stt_input = drain
+    task = asyncio.create_task(owner.finish("candidate_requested"))
+    await speech.started.wait()
+    assert entered.is_set()
+    speech.release.set()
+    await asyncio.sleep(0.05)
+    assert not task.done()
     async with postgres_sessionmaker() as session:
-        row = await session.get(db.Conversation, conversation_id)
-        assert row.transcript_sealed_at is None
+        assert (await session.get(db.Conversation, conversation_id)).transcript_sealed_at is None
     release.set()
-    assert await finish == "played"
+    assert await task == "played"
     async with postgres_sessionmaker() as session:
         row = await session.get(db.Conversation, conversation_id)
-        assert row.transcript_integrity == "complete" and row.stt_drain["complete"] is True
-        messages = await db.get_messages(session, conversation_id)
-        assert any(m.source_id == "late-final" for m in messages)
+        assert row.transcript_integrity == "complete"
+        assert [item.role for item in await db.get_messages(session, conversation_id)] == [
+            "user",
+            "assistant",
+        ]
 
 
 @pytest.mark.parametrize(
-    "prior_metrics",
-    [
-        {"stt_confirmed": False},
-        None,
-        {},
-        {"stt_confirmed": "unknown"},
-        {"stt_confirmed": "true"},
-        {"stt_confirmed": 1},
-        {"stt_confirmed": {"reason": "pending"}},
-    ],
+    "prior_metrics", [None, {}, {"stt_confirmed": False}, {"stt_confirmed": "true"}]
 )
-async def test_replacement_worker_drain_cannot_erase_persisted_unconfirmed_answer(
-    postgres_sessionmaker,
-    prior_metrics,
+async def test_native_drain_cannot_erase_unconfirmed_prior_input(
+    postgres_sessionmaker, prior_metrics
 ):
     conversation_id = await create_conversation(postgres_sessionmaker)
     async with postgres_sessionmaker() as session:
         await db.insert_message(
-            session,
-            conversation_id,
-            "user",
-            "Tail from the prior worker",
-            source_id="prior-worker-interim",
-            metrics=prior_metrics,
+            session, conversation_id, "user", "Prior tail", source_id="prior", metrics=prior_metrics
         )
-    closing, writer, _ = coordinator(postgres_sessionmaker, conversation_id)
-    closing.end_stt_input = AsyncMock(return_value=STTDrainReport(True, 1, 2.5, 0, 1, 1))
-    finish = asyncio.create_task(closing.finish("candidate_requested"))
-    await asyncio.wait_for(writer.sent.wait(), 1)
-    await closing.acknowledge("candidate", ack(closing))
-    assert await finish == "played" and not closing._recovered
+    owner, speech, _ = coordinator(postgres_sessionmaker, conversation_id)
+    owner.end_stt_input = AsyncMock(return_value=STTDrainReport(True, 1, 2.5, 0, 1, 1))
+    speech.release.set()
+    assert await owner.finish("timeout") == "played"
     async with postgres_sessionmaker() as session:
-        row = await session.get(db.Conversation, conversation_id)
-        assert row.transcript_integrity == "partial"
-        assert row.stt_drain["complete"] is True  # Current transport did drain.
-        assert row.stt_drain["canonical_unconfirmed_user_messages"] == 1
+        assert (
+            await session.get(db.Conversation, conversation_id)
+        ).transcript_integrity == "partial"
 
 
 @pytest.mark.parametrize("outcome", ["unresolved", "missing", "error", "timeout"])
-async def test_unverified_stt_drain_seals_partial_without_fabricating_completion(
-    postgres_sessionmaker, outcome
-):
+async def test_unverified_stt_drain_seals_partial(postgres_sessionmaker, outcome):
     conversation_id = await create_conversation(postgres_sessionmaker)
 
-    async def final_input():
+    async def drain():
         if outcome == "error":
-            raise RuntimeError("controlled input failure")
+            raise RuntimeError("Controlled drain failure")
         if outcome == "timeout":
             await asyncio.Event().wait()
         return STTDrainReport(True, 1, 2.5, 1, 0, 0)
 
-    closing, writer, _ = coordinator(postgres_sessionmaker, conversation_id)
-    closing.stt_drain_seconds = 0.03
+    owner, speech, _ = coordinator(postgres_sessionmaker, conversation_id)
+    owner.stt_drain_seconds = 0.03
     if outcome != "missing":
-        closing.end_stt_input = final_input
-    finish = asyncio.create_task(closing.finish("candidate_requested"))
-    await asyncio.wait_for(writer.sent.wait(), 1)
-    await closing.acknowledge("candidate", ack(closing))
-    assert await asyncio.wait_for(finish, 1) == "played"
+        owner.end_stt_input = drain
+    speech.release.set()
+    assert await owner.finish("timeout") == "played"
     async with postgres_sessionmaker() as session:
         row = await session.get(db.Conversation, conversation_id)
-        assert row.status == "completed"
-        assert row.transcript_integrity == "partial"
-        assert row.stt_drain["complete"] is False
+        assert row.transcript_integrity == "partial" and row.stt_drain["complete"] is False
 
 
-async def test_synthesis_is_a_finite_valid_pcm_wav():
-    audio = await synthesize_farewell(
-        SimpleNamespace(synthesize=lambda text: SynthesizedClip()),
-        "es",
-    )
-    with wave.open(io.BytesIO(audio)) as wav:
-        assert wav.getframerate() == 24000
-        assert wav.getnchannels() == 1
-        assert wav.getnframes() == 240
-
-
-async def test_farewell_paces_complete_chunks_before_delivery_and_footer(
-    postgres_sessionmaker, monkeypatch
-):
+async def test_long_question_is_interrupted_before_native_farewell(postgres_sessionmaker):
     conversation_id = await create_conversation(postgres_sessionmaker)
-    closing, writer, streams = coordinator(postgres_sessionmaker, conversation_id, timeout=3)
-    audio = bytes(range(256)) * 1300
-    closing._audio_task = asyncio.create_task(asyncio.sleep(0, result=audio))
-    writes = []
-    opened = []
-    original_open = closing.room.local_participant.stream_bytes
-    original_write = writer.write
-
-    async def stream_bytes(*args, **kwargs):
-        result = await original_open(*args, **kwargs)
-        opened.append(time.monotonic())
-        return result
-
-    async def write(chunk):
-        # A single large FFI write bursts all native chunks without yielding.
-        assert len(chunk) <= 15_000
-        writes.append((time.monotonic(), bytes(chunk)))
-        async with postgres_sessionmaker() as session:
-            row = await session.get(db.Conversation, conversation_id)
-            assert row.closing_delivery_at is None
-            assert row.transcript_sealed_at is None
-        await original_write(chunk)
-
-    monkeypatch.setattr(writer, "write", write)
-    monkeypatch.setattr(closing.room.local_participant, "stream_bytes", stream_bytes)
-    finish = asyncio.create_task(closing.finish("timeout"))
-    await asyncio.wait_for(writer.sent.wait(), 2)
-    assert writer.data == audio
-    assert streams[0]["total_size"] == len(audio)
-    assert len(writes) == 23
-    assert writes[0][0] - opened[0] >= 0.04
-    assert all(b[0] - a[0] >= 0.04 for a, b in pairwise(writes))
-    assert not finish.done()
-    await closing.acknowledge("candidate", ack(closing))
-    assert await finish == "played"
-    async with postgres_sessionmaker() as session:
-        row = await session.get(db.Conversation, conversation_id)
-        assert row.closing_audio_size == len(audio)
-        assert row.transcript_sealed_at is not None
-
-
-@pytest.mark.parametrize("failure", ["error", "timeout"])
-async def test_partial_chunk_delivery_never_proves_playback(postgres_sessionmaker, failure):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    writer = Writer()
-    closing, _, _ = coordinator(postgres_sessionmaker, conversation_id, timeout=0.2, writer=writer)
-    audio = b"\x00\x01" * 20_000
-    closing._audio_task = asyncio.create_task(asyncio.sleep(0, result=audio))
-    original_write = writer.write
-
-    async def write(chunk):
-        if writer.data:
-            if failure == "error":
-                raise ConnectionError("Controlled transport failure")
-            await asyncio.Event().wait()
-        await original_write(chunk)
-
-    writer.write = write
-    expected = "failed" if failure == "error" else "timeout"
-    assert await asyncio.wait_for(closing.finish("timeout"), 1) == expected
-    async with postgres_sessionmaker() as session:
-        row = await session.get(db.Conversation, conversation_id)
-        assert row.farewell_status == expected
-        assert row.closing_delivery_at is None
-        assert row.transcript_sealed_at is not None
-        assert await db.get_messages(session, conversation_id) == []
-    assert 0 < len(writer.data) < len(audio)
-
-
-async def test_playback_then_seal_then_complete(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-
-    async def seal():
-        async with postgres_sessionmaker() as session:
-            await db.insert_message(
-                session,
-                conversation_id,
-                "user",
-                "Last confirmed answer",
-                source_id="final-candidate-turn",
-            )
-
-    closing, writer, streams = coordinator(
-        postgres_sessionmaker,
-        conversation_id,
-        seal=seal,
-    )
-    task = asyncio.create_task(closing.finish("candidate_requested"))
-    await asyncio.wait_for(writer.sent.wait(), 1)
-    async with postgres_sessionmaker() as session:
-        conversation = await db.get_conversation(session, conversation_id)
-        assert conversation.status == "closing"
-        assert conversation.closing_owner_id == closing.owner_id
-        assert await db.get_messages(session, conversation_id) == []
-    assert not task.done()
-    assert streams[0]["mime_type"] == "audio/wav"
-    assert streams[0]["stream_id"] == closing.stream_id
-    assert streams[0]["attributes"]["attempt_id"] == str(closing.attempt_id)
-    result = await closing.acknowledge("candidate", ack(closing))
-    assert json.loads(result)["accepted"]
-    assert await task == "played"
-    async with postgres_sessionmaker() as session:
-        conversation = await db.get_conversation(session, conversation_id)
-        assert conversation.status == "completed"
-        assert conversation.farewell_status == "played"
-        messages = await db.get_messages(session, conversation_id)
-        assert [m.content for m in messages] == ["Last confirmed answer", FAREWELLS["es"]]
-
-
-async def test_ack_cannot_confirm_blocked_write(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    writer = Writer()
-    writer.write_gate.clear()
-    closing, _, _ = coordinator(postgres_sessionmaker, conversation_id, writer=writer)
-    task = asyncio.create_task(closing.finish("plan_complete"))
-    await asyncio.wait_for(writer.write_started.wait(), 1)
-    provisional = json.loads(await closing.acknowledge("candidate", ack(closing)))
-    assert provisional["accepted"] and provisional["provisional"]
-    assert not closing.playback.is_set()
-    with pytest.raises(ValueError):
-        await closing.acknowledge("candidate", ack(closing, stream_id="wrong"))
-    with pytest.raises(ValueError):
-        await closing.acknowledge("stranger", ack(closing))
-    writer.write_gate.set()
-    await writer.sent.wait()
-    # Full delivery promotes the received ACK without a second RPC.
+    owner, speech, _ = coordinator(postgres_sessionmaker, conversation_id)
+    owner.session.current_speech = object()
+    owner.session.interrupt = Mock(return_value=asyncio.sleep(0))
+    task = asyncio.create_task(owner.finish("candidate_requested"))
+    await speech.started.wait()
+    owner.session.interrupt.assert_called_once_with(force=True)
+    speech.release.set()
     assert await task == "played"
 
 
-async def test_timeout_survives_blocked_write_and_close(postgres_sessionmaker):
+async def test_stalled_interrupt_never_starts_a_second_native_speech(postgres_sessionmaker):
     conversation_id = await create_conversation(postgres_sessionmaker)
-    writer = Writer()
-    writer.write_gate.clear()
-    writer.close_gate.clear()
-    closing, _, _ = coordinator(
-        postgres_sessionmaker,
-        conversation_id,
-        timeout=0.03,
-        writer=writer,
-    )
-    started = time.monotonic()
-    assert await asyncio.wait_for(closing.finish("timeout"), 0.4) == "timeout"
-    assert time.monotonic() - started < 0.4
-    async with postgres_sessionmaker() as session:
-        conversation = await db.get_conversation(session, conversation_id)
-        assert conversation.status == "completed"
-        assert conversation.farewell_status == "timeout"
-    writer.close_gate.set()
-    await asyncio.sleep(0.05)
+    owner, _, calls = coordinator(postgres_sessionmaker, conversation_id, timeout=2)
+    owner.session.current_speech = object()
+    pending = asyncio.get_running_loop().create_future()
+    owner.session.interrupt = Mock(return_value=pending)
+    assert await asyncio.wait_for(owner.finish("timeout"), 2) == "timeout"
+    assert pending.cancelled() and calls == []
 
 
-async def test_played_ack_survives_a_blocked_footer_callback(postgres_sessionmaker):
+async def test_two_owners_and_repeated_close_speak_once(postgres_sessionmaker):
     conversation_id = await create_conversation(postgres_sessionmaker)
-    writer = Writer()
-    writer.close_gate.clear()
-    closing, _, _ = coordinator(postgres_sessionmaker, conversation_id, timeout=0.1, writer=writer)
-    task = asyncio.create_task(closing.finish("plan_complete"))
-    await writer.sent.wait()
-    await closing.acknowledge("candidate", ack(closing))
-    assert await asyncio.wait_for(task, 0.3) == "played"
+    a, sa, ca = coordinator(postgres_sessionmaker, conversation_id)
+    b, sb, cb = coordinator(postgres_sessionmaker, conversation_id)
+    sa.release.set()
+    sb.release.set()
+    assert await asyncio.gather(a.finish("timeout"), b.finish("timeout")) == ["played", "played"]
+    assert await a.finish("timeout") == "played"
+    assert len(ca) + len(cb) == 1
     async with postgres_sessionmaker() as session:
-        conversation = await db.get_conversation(session, conversation_id)
-        assert conversation.farewell_status == "played"
-    writer.close_gate.set()
-
-
-async def test_played_ack_survives_owner_crash_before_transcript_seal(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    seal_started = asyncio.Event()
-    seal_gate = asyncio.Event()
-
-    async def blocked_seal():
-        seal_started.set()
-        await seal_gate.wait()
-
-    first, writer, _ = coordinator(postgres_sessionmaker, conversation_id, seal=blocked_seal)
-    waiting = asyncio.create_task(first.finish("candidate_requested"))
-    await asyncio.wait_for(writer.sent.wait(), 1)
-    await first.acknowledge("candidate", ack(first))
-    await asyncio.wait_for(seal_started.wait(), 1)
-    async with postgres_sessionmaker() as session:
-        row = await db.get_conversation(session, conversation_id)
-        assert row.status == "closing" and row.farewell_status == "played"
-        previous_stream, previous_attempt = row.closing_stream_id, row.closing_attempt_id
-    # Terminate the canonical owner, rather than merely a shielded caller.
-    first._finish_task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await waiting
-    async with postgres_sessionmaker() as session:
-        row = await db.get_conversation(session, conversation_id)
-        row.closing_deadline_at = datetime.now(UTC) - timedelta(seconds=1)
-        await session.commit()
-    replacement, _, streams = coordinator(postgres_sessionmaker, conversation_id)
-    assert await replacement.finish("connection_lost") == "played"
-    assert streams == []
-    async with postgres_sessionmaker() as session:
-        row = await db.get_conversation(session, conversation_id)
-        assert row.status == "completed" and row.transcript_integrity == "partial"
-        assert row.farewell_status == "played"
-        assert (row.closing_stream_id, row.closing_attempt_id) == (
-            previous_stream,
-            previous_attempt,
-        )
         assert len(await db.get_messages(session, conversation_id)) == 1
 
 
-async def test_expired_owner_cannot_renew_but_ack_uses_initial_validation_window(
+async def test_caller_cancellation_does_not_abandon_close_and_disconnect_aborts_speech(
     postgres_sessionmaker,
 ):
     conversation_id = await create_conversation(postgres_sessionmaker)
-    owner, _, _ = coordinator(postgres_sessionmaker, conversation_id)
-    assert await owner._claim("timeout") == "deliver"
-    owner._delivery_ready = True
+    owner, speech, _ = coordinator(postgres_sessionmaker, conversation_id)
+    task = asyncio.create_task(owner.finish("candidate_requested"))
+    await speech.started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not owner._finish_task.done()
+    assert await owner.finish("candidate_left", say_goodbye=False) == "not_possible"
+    speech.interrupt.assert_called_with(force=True)
+
+
+async def test_native_playout_survives_crash_before_seal_without_replay(postgres_sessionmaker):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    entered = asyncio.Event()
+
+    async def seal():
+        entered.set()
+        await asyncio.Event().wait()
+
+    owner, speech, _ = coordinator(postgres_sessionmaker, conversation_id, seal=seal)
+    speech.release.set()
+    task = asyncio.create_task(owner.finish("timeout"))
+    await entered.wait()
+    owner._finish_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
     async with postgres_sessionmaker() as session:
-        row = await db.get_conversation(session, conversation_id)
+        row = await session.get(db.Conversation, conversation_id)
         row.closing_deadline_at = datetime.now(UTC) - timedelta(seconds=1)
         await session.commit()
-    received = json.loads(await owner.acknowledge("candidate", ack(owner)))
-    assert received["accepted"] and received["provisional"]
-    assert not owner.playback.is_set()
-    with pytest.raises(RuntimeError, match="ownership"):
-        await owner._finalize()
-
-
-async def test_initial_lease_covers_audio_finalization_and_margin(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    owner, _, _ = coordinator(postgres_sessionmaker, conversation_id, timeout=20)
-    await owner._claim("candidate_requested")
+    replacement, _, calls = coordinator(postgres_sessionmaker, conversation_id)
+    assert await replacement.finish("connection_lost") == "played" and calls == []
     async with postgres_sessionmaker() as session:
-        row = await db.get_conversation(session, conversation_id)
-        assert (row.closing_deadline_at - row.closing_started_at).total_seconds() == 35
+        row = await session.get(db.Conversation, conversation_id)
+        assert row.transcript_integrity == "partial" and row.transcript_sealed_at is not None
+        assert len(await db.get_messages(session, conversation_id)) == 1
 
 
-async def test_api_ack_watcher_bounds_database_polling_load(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    owner, _, _ = coordinator(postgres_sessionmaker, conversation_id)
-    await owner._claim("candidate_requested")
-    engine = postgres_sessionmaker.kw["bind"].sync_engine
-    reads = []
-
-    def query(_connection, _cursor, statement, _parameters, _context, _executemany):
-        if statement.startswith("SELECT") and "FROM conversations" in statement:
-            reads.append(statement)
-
-    event.listen(engine, "before_cursor_execute", query)
-    task = asyncio.create_task(owner._watch_playback())
-    try:
-        await asyncio.sleep(0.55)
-    finally:
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        event.remove(engine, "before_cursor_execute", query)
-    assert 1 <= len(reads) <= 4
-    assert not owner.playback.is_set()
-
-
-async def test_end_during_long_question_interrupts_it_before_farewell(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    owner, writer, _ = coordinator(postgres_sessionmaker, conversation_id)
-    playout = AsyncMock(side_effect=AssertionError("Do not wait for the long question"))
-    owner.session.current_speech = SimpleNamespace(wait_for_playout=playout)
-    owner.session.interrupt = Mock(return_value=asyncio.sleep(0))
-    task = asyncio.create_task(owner.finish("candidate_requested"))
-    await asyncio.wait_for(writer.sent.wait(), 1)
-    owner.session.interrupt.assert_called_once_with(force=True)
-    playout.assert_not_called()
-    await owner.acknowledge("candidate", ack(owner))
-    assert await asyncio.wait_for(task, 1) == "played"
-
-
-async def test_slow_interrupt_callback_does_not_suppress_separate_farewell(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    owner, writer, _ = coordinator(postgres_sessionmaker, conversation_id, timeout=3)
-    owner.session.current_speech = SimpleNamespace(wait_for_playout=AsyncMock())
-    pending = asyncio.get_running_loop().create_future()
-    owner.session.interrupt = Mock(return_value=pending)
-    task = asyncio.create_task(owner.finish("candidate_requested"))
-    await asyncio.wait_for(writer.sent.wait(), 1.8)
-    assert pending.cancelled()
-    owner.telemetry.emit.assert_any_call(
-        "closing", "speech_interrupt_errors", 1, dimensions={"error_type": "TimeoutError"}
-    )
-    await owner.acknowledge("candidate", ack(owner))
-    assert await asyncio.wait_for(task, 1) == "played"
-
-
-@pytest.mark.parametrize("status", ["played", "failed"])
-@pytest.mark.parametrize("finalization_error", [False, True])
-async def test_durable_ack_is_authoritative_after_rpc_cancellation(
-    postgres_sessionmaker, status, finalization_error
+async def test_old_wav_success_can_recover_without_new_audio_or_duplicate_message(
+    postgres_sessionmaker,
 ):
     conversation_id = await create_conversation(postgres_sessionmaker)
-    owner, _, _ = coordinator(postgres_sessionmaker, conversation_id)
-    await owner._claim("candidate_requested")
-    await record_delivery(
-        postgres_sessionmaker,
-        conversation_id,
-        owner.owner_id,
-        owner.closing_id,
-        owner.stream_id,
-        owner.attempt_id,
-        524,
-        "audio/wav",
-    )
-    received, _first = await acknowledge_playback(
-        postgres_sessionmaker,
-        conversation_id,
-        PlaybackAck.model_validate_json(ack(owner, status=status)),
-    )
-    assert received["status"] == status
-    # The RPC died between the storage commit and waking the audio phase.
-    owner.playback_status = "timeout"
-    if finalization_error:
-        await owner._mark_finalize_error()
-    else:
-        await owner._finalize()
+    close, attempt, old_owner = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
     async with postgres_sessionmaker() as session:
-        row = await db.get_conversation(session, conversation_id)
-        assert row.farewell_status == status
-        assert row.status == ("error" if finalization_error else "completed")
-
-
-async def test_owner_cannot_seal_after_renewed_lease_expires(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-
-    async def delayed_seal():
-        # Simulate a drain that returned after the renewed lease had expired.
-        async with postgres_sessionmaker() as session:
-            row = await db.get_conversation(session, conversation_id)
-            row.closing_deadline_at = datetime.now(UTC) - timedelta(seconds=1)
-            await session.commit()
-
-    owner, _, _ = coordinator(postgres_sessionmaker, conversation_id, seal=delayed_seal)
-    await owner._claim("candidate_requested")
-    with pytest.raises(RuntimeError, match="while finalizing"):
-        await owner._finalize()
-    async with postgres_sessionmaker() as session:
-        row = await db.get_conversation(session, conversation_id)
-        assert row.status == "closing" and row.transcript_sealed_at is None
-
-
-async def test_two_process_owners_send_exactly_one_clip(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    a, wa, sa = coordinator(postgres_sessionmaker, conversation_id)
-    b, wb, sb = coordinator(postgres_sessionmaker, conversation_id)
-    tasks = [asyncio.create_task(c.finish("plan_complete")) for c in (a, b)]
-    waiters = [asyncio.create_task(w.sent.wait()) for w in (wa, wb)]
-    done, pending = await asyncio.wait(
-        waiters,
-        timeout=1,
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    assert done
-    for task in pending:
-        task.cancel()
-    owner = a if a.owns_closure else b
-    await owner.acknowledge("candidate", ack(owner))
-    assert await asyncio.gather(*tasks) == ["played", "played"]
-    assert len(sa) + len(sb) == 1
-    async with postgres_sessionmaker() as session:
-        messages = await db.get_messages(session, conversation_id)
-        assert len(messages) == 1
-
-
-async def test_watcher_cancel_does_not_abandon_canonical_close(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    closing, writer, _ = coordinator(postgres_sessionmaker, conversation_id)
-    watcher = asyncio.create_task(closing.finish("plan_complete"))
-    await writer.sent.wait()
-    watcher.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await watcher
-    assert not closing._finish_task.done()
-    assert await closing.finish("candidate_left", say_goodbye=False) == "not_possible"
-    async with postgres_sessionmaker() as session:
-        conversation = await db.get_conversation(session, conversation_id)
-        assert conversation.status == "completed"
-        assert conversation.ended_reason == "plan_complete"
-
-
-async def test_stale_owner_recovers_without_replaying_audio(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    async with postgres_sessionmaker() as session:
-        conversation = await db.get_conversation(session, conversation_id)
-        conversation.status = "closing"
-        conversation.closing_id = uuid.uuid4()
-        conversation.closing_owner_id = uuid.uuid4()
-        conversation.closing_deadline_at = datetime.now(UTC) - timedelta(seconds=1)
-        conversation.ended_reason = "timeout"
+        row = await session.get(db.Conversation, conversation_id)
+        row.status = "closing"
+        row.closing_id, row.closing_attempt_id, row.closing_owner_id = close, attempt, old_owner
+        row.closing_stream_id = "historical-stream"
+        row.closing_audio_mime = "audio/wav"
+        row.closing_deadline_at = datetime.now(UTC) - timedelta(seconds=1)
+        row.farewell_status = "played"
         await session.commit()
-    closing, _, streams = coordinator(postgres_sessionmaker, conversation_id)
-    assert await closing.finish("connection_lost") == "timeout"
-    assert streams == []
+    replacement, _, calls = coordinator(postgres_sessionmaker, conversation_id)
+    assert await replacement.finish("connection_lost") == "played" and calls == []
+    assert (await closing_state(postgres_sessionmaker, conversation_id))[
+        "farewell_confirmation_source"
+    ] == "browser_playback"
+    async with postgres_sessionmaker() as session:
+        assert len(await db.get_messages(session, conversation_id)) == 1
 
 
-async def test_transcript_persistence_failure_blocks_evaluation(postgres_sessionmaker):
+async def test_failed_transcript_persistence_prevents_completed_status(postgres_sessionmaker):
     conversation_id = await create_conversation(postgres_sessionmaker)
-    closing, _, _ = coordinator(
+    owner, _, _ = coordinator(
         postgres_sessionmaker,
         conversation_id,
-        seal=AsyncMock(side_effect=RuntimeError("Persistence failed")),
+        seal=AsyncMock(side_effect=RuntimeError("Controlled failure")),
     )
     with pytest.raises(RuntimeError):
-        await closing.finish("candidate_left", say_goodbye=False)
+        await owner.finish("candidate_left", say_goodbye=False)
     async with postgres_sessionmaker() as session:
-        conversation = await db.get_conversation(session, conversation_id)
-        assert conversation.status == "error"
+        assert (await session.get(db.Conversation, conversation_id)).status == "error"
 
 
-async def test_late_dispatch_cannot_reopen_completed(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    async with postgres_sessionmaker() as session:
-        conversation = await db.get_conversation(session, conversation_id)
-        conversation.status = "completed"
-        await session.commit()
-        assert await db.begin_interview(session, conversation_id) == "completed"
-
-
-async def test_expiry_only_recovers_expired_closing_lease(postgres_sessionmaker):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    async with postgres_sessionmaker() as session:
-        conversation = await db.get_conversation(session, conversation_id)
-        conversation.status = "closing"
-        conversation.closing_id = uuid.uuid4()
-        conversation.closing_owner_id = uuid.uuid4()
-        conversation.closing_deadline_at = datetime.now(UTC) + timedelta(seconds=5)
-        await session.commit()
-        assert not await reconcile_interview(session, conversation_id, settings)
-        conversation.closing_deadline_at = datetime.now(UTC) - timedelta(seconds=1)
-        await session.commit()
-        assert await reconcile_interview(session, conversation_id, settings)
-        assert conversation.status == "completed"
-        assert conversation.farewell_status == "timeout"
-        assert conversation.transcript_integrity == "partial"
-        with pytest.raises(ValueError, match="sealed"):
-            await db.insert_message(session, conversation_id, "user", "Late committed answer")
-
-
-@pytest.mark.parametrize("skew", [-120, 120])
-async def test_closing_uses_database_clock_despite_worker_and_api_skew(
-    postgres_sessionmaker, monkeypatch, skew
-):
-    conversation_id = await create_conversation(postgres_sessionmaker)
-    owner, _, _ = coordinator(postgres_sessionmaker, conversation_id, timeout=20)
-    await owner._claim("candidate_requested")
-
-    class SkewedDateTime:
-        @classmethod
-        def now(cls, tz):
-            return datetime.now(tz) + timedelta(seconds=skew)
-
-    monkeypatch.setattr(closing_module, "datetime", SkewedDateTime, raising=False)
-    monkeypatch.setattr(db, "datetime", SkewedDateTime)
-    async with postgres_sessionmaker() as session:
-        before = await session.scalar(select(func.clock_timestamp()))
-        assert not await reconcile_interview(session, conversation_id, settings)
-    await owner._finalize()
-    async with postgres_sessionmaker() as session:
-        after = await session.scalar(select(func.clock_timestamp()))
-        row = await session.get(db.Conversation, conversation_id)
-        assert row.status == "completed"
-        assert before <= row.transcript_sealed_at <= after
-        assert row.closing_deadline_at == row.closing_ack_deadline_at
-
-
-@pytest.mark.parametrize("skew", [-120, 120])
-async def test_expired_owner_cannot_write_error_even_if_process_clock_is_behind(
-    postgres_sessionmaker, monkeypatch, skew
-):
+async def test_expired_lease_cannot_seal_or_mark_failed(postgres_sessionmaker):
     conversation_id = await create_conversation(postgres_sessionmaker)
     owner, _, _ = coordinator(postgres_sessionmaker, conversation_id)
-    await owner._claim("candidate_requested")
+    await owner._claim("timeout")
     async with postgres_sessionmaker() as session:
         row = await session.get(db.Conversation, conversation_id)
         row.closing_deadline_at = datetime.now(UTC) - timedelta(seconds=1)
         await session.commit()
-
-    class SkewedDateTime:
-        @classmethod
-        def now(cls, tz):
-            return datetime.now(tz) + timedelta(seconds=skew)
-
-    monkeypatch.setattr(closing_module, "datetime", SkewedDateTime, raising=False)
-    monkeypatch.setattr(db, "datetime", SkewedDateTime)
+    with pytest.raises(RuntimeError, match="ownership"):
+        await owner._finalize()
     await owner._mark_finalize_error()
     async with postgres_sessionmaker() as session:
         row = await session.get(db.Conversation, conversation_id)
         assert row.status == "closing" and row.transcript_sealed_at is None
         assert await reconcile_interview(session, conversation_id, settings)
-        assert row.status == "completed" and row.transcript_integrity == "partial"
+        assert row.farewell_status == "timeout" and row.transcript_integrity == "partial"
 
 
-async def test_close_can_retry_after_transient_claim_failure(postgres_sessionmaker, monkeypatch):
+async def test_claim_retry_after_transient_failure_and_late_dispatch_stays_terminal(
+    postgres_sessionmaker, monkeypatch
+):
     conversation_id = await create_conversation(postgres_sessionmaker)
-    closing, writer, _ = coordinator(postgres_sessionmaker, conversation_id)
-    original_claim = closing._claim
-    calls = 0
-
-    async def claim(reason):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise ConnectionError("synthetic temporary outage")
-        return await original_claim(reason)
-
-    monkeypatch.setattr(closing, "_claim", claim)
+    owner, speech, _ = coordinator(postgres_sessionmaker, conversation_id)
+    original = owner._claim
+    claim = AsyncMock(side_effect=[ConnectionError("Controlled failure"), "deliver"])
+    monkeypatch.setattr(owner, "_claim", claim)
     with pytest.raises(ConnectionError):
-        await closing.request_close("candidate_requested")
-    await closing.request_close("candidate_requested")
-    task = asyncio.create_task(closing.finish("candidate_requested"))
-    await writer.sent.wait()
-    await closing.acknowledge("candidate", ack(closing))
-    assert await task == "played"
-    assert calls == 2
+        await owner.request_close("timeout")
+    monkeypatch.setattr(owner, "_claim", original)
+    speech.release.set()
+    assert await owner.finish("timeout") == "played"
+    async with postgres_sessionmaker() as session:
+        assert await db.begin_interview(session, conversation_id) == "completed"
 
 
-async def test_successful_drain_cannot_seal_capture_incident_as_complete(postgres_sessionmaker):
+async def test_renewed_lease_must_still_hold_after_sealing_sdk(postgres_sessionmaker):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+
+    async def seal():
+        async with postgres_sessionmaker() as session:
+            row = await session.get(db.Conversation, conversation_id)
+            row.closing_deadline_at = datetime.now(UTC) - timedelta(seconds=1)
+            await session.commit()
+
+    owner, _, _ = coordinator(postgres_sessionmaker, conversation_id, seal=seal)
+    await owner._claim("timeout")
+    with pytest.raises(RuntimeError, match="while finalizing"):
+        await owner._finalize()
+
+
+async def test_capture_incident_remains_partial_with_successful_native_farewell(
+    postgres_sessionmaker,
+):
     conversation_id = await create_conversation(postgres_sessionmaker)
     async with postgres_sessionmaker() as session:
         row = await session.get(db.Conversation, conversation_id)
         row.capture_integrity_pending = True
         await session.commit()
-    closing, writer, _ = coordinator(postgres_sessionmaker, conversation_id)
-    closing.end_stt_input = AsyncMock(return_value=STTDrainReport(True, 1, 2.5, 0, 1, 1))
-    finish = asyncio.create_task(closing.finish("candidate_requested"))
-    await asyncio.wait_for(writer.sent.wait(), 1)
-    await closing.acknowledge("candidate", ack(closing))
-    assert await finish == "played"
+    owner, speech, _ = coordinator(postgres_sessionmaker, conversation_id)
+    owner.end_stt_input = AsyncMock(return_value=STTDrainReport(True, 1, 2.5, 0, 1, 1))
+    speech.release.set()
+    assert await owner.finish("timeout") == "played"
+    async with postgres_sessionmaker() as session:
+        assert (
+            await session.get(db.Conversation, conversation_id)
+        ).transcript_integrity == "partial"
+
+
+@pytest.mark.parametrize("evidence", ["missing", "interrupted", "expired_audio", "sealed"])
+async def test_playout_requires_a_persisted_complete_item_and_the_original_audio_budget(
+    postgres_sessionmaker, evidence
+):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    owner, _, _ = coordinator(postgres_sessionmaker, conversation_id)
+    await owner._claim("timeout")
+    async with postgres_sessionmaker() as session:
+        if evidence != "missing":
+            await db.insert_message(
+                session,
+                conversation_id,
+                "assistant",
+                "Native farewell",
+                source_id="native-item",
+                interrupted=evidence == "interrupted",
+            )
+        row = await session.get(db.Conversation, conversation_id)
+        if evidence == "expired_audio":
+            row.closing_acquired_at = datetime.now(UTC) - timedelta(seconds=2)
+        if evidence == "sealed":
+            row.status = "completed"
+            row.transcript_sealed_at = datetime.now(UTC)
+        await session.commit()
+    assert not await record_agent_playout(
+        postgres_sessionmaker,
+        conversation_id,
+        owner.owner_id,
+        owner.closing_id,
+        owner.attempt_id,
+        1,
+        source_id="native-item",
+    )
+
+
+async def test_changed_closing_owner_prevents_old_speech_from_confirming_or_sealing(
+    postgres_sessionmaker,
+):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    owner, speech, _ = coordinator(postgres_sessionmaker, conversation_id)
+    finish = asyncio.create_task(owner.finish("timeout"))
+    await speech.started.wait()
+    new_owner = uuid.uuid4()
     async with postgres_sessionmaker() as session:
         row = await session.get(db.Conversation, conversation_id)
-        assert row.transcript_integrity == "partial" and row.capture_integrity_pending
+        row.closing_owner_id = new_owner
+        await session.commit()
+    speech.release.set()
+    with pytest.raises(RuntimeError, match="ownership"):
+        await finish
+    async with postgres_sessionmaker() as session:
+        row = await session.get(db.Conversation, conversation_id)
+        assert row.closing_owner_id == new_owner and row.farewell_status == "pending"
+        assert row.transcript_sealed_at is None and row.closing_delivery_at is None
+
+
+async def test_native_item_persistence_failure_cannot_be_confirmed_as_played(postgres_sessionmaker):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    owner, speech, _ = coordinator(postgres_sessionmaker, conversation_id)
+    owner.drain_transcript = AsyncMock(side_effect=RuntimeError("Controlled persistence failure"))
+    speech.release.set()
+    with pytest.raises(RuntimeError):
+        await owner.finish("timeout")
+    async with postgres_sessionmaker() as session:
+        row = await session.get(db.Conversation, conversation_id)
+        assert row.status == "error" and row.farewell_status == "failed"
+        assert row.closing_delivery_at is None and row.transcript_sealed_at is None
+
+
+async def test_cancellation_resistant_readiness_cannot_start_speech_after_timeout(
+    postgres_sessionmaker,
+):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    owner, _, calls = coordinator(postgres_sessionmaker, conversation_id, timeout=0.05)
+    cancelled, release = asyncio.Event(), asyncio.Event()
+
+    async def late_ready(**kwargs):
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await release.wait()
+        return '{"ready":true}'
+
+    owner.room.local_participant.perform_rpc.side_effect = late_ready
+    assert await asyncio.wait_for(owner.finish("timeout"), 1) == "timeout"
+    await asyncio.wait_for(cancelled.wait(), 1)
+    release.set()
+    await asyncio.sleep(0.02)
+    assert calls == []

@@ -55,7 +55,12 @@ from interview_agent.observability import (
     content_hash,
     execution_config,
 )
-from interview_agent.playback import PlaybackAck, acknowledge_playback, closing_state
+from interview_agent.playback import (
+    PlaybackAck,
+    acknowledge_playback,
+    closing_state,
+    confirmation_source,
+)
 from interview_agent.prompts import DEFAULT_SENIORITY, fit_length, followup_budget, length_for
 from interview_agent.server import evaluations
 from interview_agent.server.account_metrics import publish_account_metrics
@@ -519,6 +524,7 @@ def _serialize(
         "followup_limit": conversation.followup_limit,
         "run_config": conversation.run_config,
         "farewell_status": conversation.farewell_status,
+        "farewell_confirmation_source": confirmation_source(conversation),
         # Written fallback for a farewell that was not (or not provably) heard.
         "farewell_text": FAREWELLS.get(_interview_language(conversation), FAREWELLS["en"])
         if conversation.farewell_status in ("failed", "timeout", "not_possible")

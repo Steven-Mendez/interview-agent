@@ -248,6 +248,36 @@ async def test_api_records_the_used_output_once_per_attempt_without_device_names
     assert dict(point.attributes) == {"audio_output": "selected", "farewell_status": "pending"}
 
 
+async def test_native_closing_api_exposes_policy_and_refuses_historical_clip_evidence(
+    postgres_sessionmaker, monkeypatch
+):
+    monkeypatch.setattr(settings, "livekit_api_key", "playback-test-key")
+    monkeypatch.setattr(settings, "livekit_api_secret", "playback-test-secret-at-least-32-bytes")
+    conversation_id, owner, ack = await attempt(postgres_sessionmaker)
+    async with postgres_sessionmaker() as session:
+        row = await session.get(db.Conversation, conversation_id)
+        row.closing_audio_mime = "audio/rtc"
+        await session.commit()
+    app = FastAPI()
+    app.state.sessionmaker = postgres_sessionmaker
+    app.include_router(router, prefix="/api")
+    headers = {"Authorization": f"Bearer {candidate_token(conversation_id)}"}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        path = f"/api/interviews/{conversation_id}/closing"
+        response = await client.post(
+            path + "/ack", headers=headers, json=ack.model_dump(mode="json")
+        )
+        assert response.status_code == 409
+        response = await client.get(path, headers=headers)
+        assert response.json()["farewell_confirmation_source"] == "agent_playout"
+        assert response.json()["farewell_status"] == "pending"
+    assert await deliver(postgres_sessionmaker, conversation_id, owner, ack) is None
+    async with postgres_sessionmaker() as session:
+        row = await session.get(db.Conversation, conversation_id)
+        assert row.closing_ack_status is None and row.closing_delivery_at is None
+        assert row.closing_audio_mime == "audio/rtc"
+
+
 async def test_a_failed_ack_records_why_once_as_a_category_without_its_message(
     postgres_sessionmaker, monkeypatch, recorded_metrics, caplog
 ):

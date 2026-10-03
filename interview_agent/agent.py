@@ -752,6 +752,8 @@ async def _run_interview_job(ctx, conversation_id, engine, sessionmaker, startup
         if not isinstance(item, ChatMessage):  # e.g. AgentHandoff items
             return
         text = item.text_content
+        if coordinator.is_farewell_item(item):
+            item.metrics["farewell_confirmation_source"] = "agent_playout"
         if item.role in ("user", "assistant") and text and text.strip():
             if item.role == "user" and isinstance(session.stt, DrainableInferenceSTT):
                 item.metrics.setdefault("stt_confirmed", False)
@@ -767,6 +769,9 @@ async def _run_interview_job(ctx, conversation_id, engine, sessionmaker, startup
 
     async def _persist(item: ChatMessage) -> None:
         metrics = dict(item.metrics)
+        if coordinator.is_farewell_item(item):
+            await coordinator.wait_for_stt_drain()
+            await capture_writer.drain()
         async with sessionmaker() as s:
             await db.insert_message(
                 s,
@@ -1047,6 +1052,11 @@ async def _run_interview_job(ctx, conversation_id, engine, sessionmaker, startup
 
     def _on_participant_disconnected(participant) -> None:
         nonlocal disconnect_task
+        if participant.identity == "candidate" and (closing or coordinator.owns_closure):
+            # Once closing has started, a known disconnect aborts the native
+            # turn instead of waiting for the interview reconnect grace.
+            _spawn(coordinator.finish("candidate_left", say_goodbye=False))
+            return
         if participant.identity == "candidate" and not closing:
             _spawn(worker.set_connected(False))
             if disconnect_task is not None:
@@ -1111,9 +1121,6 @@ async def _run_interview_job(ctx, conversation_id, engine, sessionmaker, startup
             await coordinator.request_close("candidate_requested")
             _spawn(finish("candidate_requested"))
             return json.dumps({"accepted": True})
-
-        if startup_status != "closing":
-            coordinator.prewarm()
 
     if startup_status == "closing":
         await finish(conversation.ended_reason or "connection_lost")

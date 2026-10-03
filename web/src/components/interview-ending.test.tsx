@@ -48,6 +48,19 @@ it("stays silent for a normal ending with a played farewell", () => {
   expect(view.container.textContent).toBe("")
 })
 
+it("distinguishes native agent playout from complete browser playback", () => {
+  render(
+    <InterviewEnding
+      interview={interview({ farewell_confirmation_source: "agent_playout" })}
+    />
+  )
+  expect(
+    screen.getByText(
+      /confirms agent playout, not complete playback in your browser/
+    )
+  ).toBeTruthy()
+})
+
 it("anchors reload supervision to the server bound without extending it", () => {
   vi.useFakeTimers()
   let monotonic = 1000

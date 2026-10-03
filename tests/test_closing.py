@@ -7,6 +7,7 @@ import time
 import uuid
 import wave
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -58,7 +59,7 @@ class Writer:
     async def write(self, data):
         self.write_started.set()
         await self.write_gate.wait()
-        self.data = data
+        self.data += data
 
     async def aclose(self):
         self.sent.set()
@@ -240,6 +241,79 @@ async def test_synthesis_is_a_finite_valid_pcm_wav():
         assert wav.getframerate() == 24000
         assert wav.getnchannels() == 1
         assert wav.getnframes() == 240
+
+
+async def test_farewell_paces_complete_chunks_before_delivery_and_footer(
+    postgres_sessionmaker, monkeypatch
+):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    closing, writer, streams = coordinator(postgres_sessionmaker, conversation_id, timeout=3)
+    audio = bytes(range(256)) * 1300
+    closing._audio_task = asyncio.create_task(asyncio.sleep(0, result=audio))
+    writes = []
+    opened = []
+    original_open = closing.room.local_participant.stream_bytes
+    original_write = writer.write
+
+    async def stream_bytes(*args, **kwargs):
+        result = await original_open(*args, **kwargs)
+        opened.append(time.monotonic())
+        return result
+
+    async def write(chunk):
+        # A single large FFI write bursts all native chunks without yielding.
+        assert len(chunk) <= 15_000
+        writes.append((time.monotonic(), bytes(chunk)))
+        async with postgres_sessionmaker() as session:
+            row = await session.get(db.Conversation, conversation_id)
+            assert row.closing_delivery_at is None
+            assert row.transcript_sealed_at is None
+        await original_write(chunk)
+
+    monkeypatch.setattr(writer, "write", write)
+    monkeypatch.setattr(closing.room.local_participant, "stream_bytes", stream_bytes)
+    finish = asyncio.create_task(closing.finish("timeout"))
+    await asyncio.wait_for(writer.sent.wait(), 2)
+    assert writer.data == audio
+    assert streams[0]["total_size"] == len(audio)
+    assert len(writes) == 23
+    assert writes[0][0] - opened[0] >= 0.04
+    assert all(b[0] - a[0] >= 0.04 for a, b in pairwise(writes))
+    assert not finish.done()
+    await closing.acknowledge("candidate", ack(closing))
+    assert await finish == "played"
+    async with postgres_sessionmaker() as session:
+        row = await session.get(db.Conversation, conversation_id)
+        assert row.closing_audio_size == len(audio)
+        assert row.transcript_sealed_at is not None
+
+
+@pytest.mark.parametrize("failure", ["error", "timeout"])
+async def test_partial_chunk_delivery_never_proves_playback(postgres_sessionmaker, failure):
+    conversation_id = await create_conversation(postgres_sessionmaker)
+    writer = Writer()
+    closing, _, _ = coordinator(postgres_sessionmaker, conversation_id, timeout=0.2, writer=writer)
+    audio = b"\x00\x01" * 20_000
+    closing._audio_task = asyncio.create_task(asyncio.sleep(0, result=audio))
+    original_write = writer.write
+
+    async def write(chunk):
+        if writer.data:
+            if failure == "error":
+                raise ConnectionError("Controlled transport failure")
+            await asyncio.Event().wait()
+        await original_write(chunk)
+
+    writer.write = write
+    expected = "failed" if failure == "error" else "timeout"
+    assert await asyncio.wait_for(closing.finish("timeout"), 1) == expected
+    async with postgres_sessionmaker() as session:
+        row = await session.get(db.Conversation, conversation_id)
+        assert row.farewell_status == expected
+        assert row.closing_delivery_at is None
+        assert row.transcript_sealed_at is not None
+        assert await db.get_messages(session, conversation_id) == []
+    assert 0 < len(writer.data) < len(audio)
 
 
 async def test_playback_then_seal_then_complete(postgres_sessionmaker):

@@ -28,6 +28,8 @@ FINALIZATION_SECONDS = 5.0
 LEASE_RENEWAL_MARGIN_SECONDS = 5.0
 PLAYBACK_POLL_SECONDS = 0.25
 STT_DRAIN_SECONDS = 5.0
+FAREWELL_CHUNK_BYTES = 15_000
+FAREWELL_CHUNK_INTERVAL_SECONDS = 0.05
 FAREWELLS = {
     "es": (
         "Gracias por compartir tu experiencia. Hemos terminado la entrevista. "
@@ -301,7 +303,16 @@ class ClosingCoordinator:
         try:
             if self.speech_fence is not None:
                 self.speech_fence()
-            await writer.write(audio)
+            # A large FFI write queues every native chunk in one burst. Cloud
+            # delivery can then reach the footer with a missing 15 kB chunk.
+            # Pace finite writes (including the header-to-first-chunk gap),
+            # rather than treating local enqueue completion as network drain.
+            for offset in range(0, len(audio), FAREWELL_CHUNK_BYTES):
+                if len(audio) > FAREWELL_CHUNK_BYTES:
+                    await asyncio.sleep(FAREWELL_CHUNK_INTERVAL_SECONDS)
+                if self.speech_fence is not None:
+                    self.speech_fence()
+                await writer.write(audio[offset : offset + FAREWELL_CHUNK_BYTES])
             # Commit full delivery before the footer. Keep this bounded commit
             # alive if the audio budget expires just after the final byte.
             persisted = self._observe(

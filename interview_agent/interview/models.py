@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class Seniority(StrEnum):
@@ -35,6 +35,88 @@ class InterviewLength(StrEnum):
     DEEP = "deep"
 
 
+class InterviewType(StrEnum):
+    TECHNICAL = "technical"
+    BEHAVIORAL = "behavioral"
+    MIXED = "mixed"
+
+
+class InterviewObjective(StrEnum):
+    SIMULATION = "simulation"
+    PRACTICE = "practice"
+
+
+class InterviewPreferences(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    interview_type: InterviewType = InterviewType.TECHNICAL
+    objective: InterviewObjective = InterviewObjective.SIMULATION
+    practice_focus: str = Field(default="", max_length=1000)
+
+    @field_validator("practice_focus")
+    @classmethod
+    def strip_focus(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def focus_requires_practice(self) -> InterviewPreferences:
+        if self.practice_focus and self.objective != InterviewObjective.PRACTICE:
+            raise ValueError("A practice focus requires the practice objective")
+        return self
+
+
+class InterviewBudget(BaseModel):
+    max_minutes: int = Field(ge=1, le=25)
+    question_limit: int = Field(ge=1, le=12)
+    followup_limit: int = Field(ge=0, le=2)
+
+
+class RoleRequirement(BaseModel):
+    id: str = Field(min_length=1)
+    competency: str = Field(min_length=1)
+    kind: str = Field(pattern="^(technical|behavioral)$")
+    job_quote: str = Field(min_length=1, description="Verbatim supporting job-offer excerpt.")
+    relevance: str = Field(
+        min_length=1, description="How the quoted duty requires this competency."
+    )
+    expected_evidence: str = Field(
+        min_length=1,
+        description="Minimum observable passing evidence; accept equivalent valid approaches.",
+    )
+    essential: bool
+
+
+class RoleRubric(BaseModel):
+    seniority: Seniority
+    seniority_evidence: str
+    requirements: list[RoleRequirement] = Field(min_length=1, max_length=12)
+
+
+class PlannedTopic(BaseModel):
+    requirement_id: str
+    title: str
+    description: str = Field(
+        description="Neutral scenario and question goal, without the solution."
+    )
+    resume_quotes: list[str] = Field(
+        description="Verbatim CV references, or [] for a hypothetical."
+    )
+
+
+class OmittedRequirement(BaseModel):
+    requirement_id: str
+    reason: str = Field(pattern="^(time_budget|outside_focus|interview_type)$")
+    explanation: str = Field(min_length=1)
+
+
+class PersonalizedPlan(BaseModel):
+    persona: str
+    summary: str
+    focus_areas: list[str]
+    topics: list[PlannedTopic] = Field(min_length=1, max_length=12)
+    omitted_requirements: list[OmittedRequirement]
+
+
 class MilestoneSpec(BaseModel):
     """One interview milestone the interviewer must cover."""
 
@@ -53,6 +135,8 @@ class MilestoneSpec(BaseModel):
     competency: str = Field(
         default="", description="Competency assessed, independent of topic count."
     )
+    requirement_id: str | None = None
+    resume_quotes: list[str] = Field(default_factory=list)
 
 
 class InterviewPlan(BaseModel):
@@ -84,7 +168,7 @@ class InterviewPlan(BaseModel):
         default=None,
         description=(
             "Only when you classified the seniority: the concrete phrase from "
-            "the job offer (or resume) that justifies it."
+            "the job offer that justifies it."
         ),
     )
     # Hard ceiling only: the exact range is imposed per interview_length by the
@@ -95,6 +179,10 @@ class InterviewPlan(BaseModel):
         # 12 = the typed primary-question ceiling; length profiles stay lower.
         max_length=12,
     )
+    requirements: list[RoleRequirement] = Field(default_factory=list)
+    omitted_requirements: list[OmittedRequirement] = Field(default_factory=list)
+    preferences: InterviewPreferences = Field(default_factory=InterviewPreferences)
+    budget: InterviewBudget | None = None
 
 
 class Assessment(StrEnum):
@@ -133,6 +221,35 @@ class FeedbackFinding(BaseModel):
     evidence: list[EvidenceRef]
 
 
+class AnswerRevision(BaseModel):
+    milestone_id: str
+    question_id: str = Field(description="ID of the question immediately before this answer.")
+    question: str = Field(default="", description="Original question, filled from the transcript.")
+    original: EvidenceRef
+    suggested_answer: str = Field(
+        min_length=1,
+        max_length=1800,
+        description="A concise answer the candidate could practise, grounded in known facts.",
+    )
+    explanation: str = Field(
+        min_length=1,
+        description="The specific change and why it addresses the criterion's actual gap.",
+    )
+    basis: str = Field(
+        pattern="^(clarification|knowledge_example)$",
+        description=(
+            "clarification reorganizes facts already supplied by the candidate; "
+            "knowledge_example teaches a missing or incorrect technical concept."
+        ),
+    )
+    missing_details: list[str] = Field(
+        description=(
+            "Concrete facts the candidate must supply or verify before using this answer. "
+            "Never fabricate achievements, numbers, experience or outcomes. Empty if none."
+        ),
+    )
+
+
 class EvaluationResult(BaseModel):
     """Evaluator output: the hiring decision over the interview transcript."""
 
@@ -168,17 +285,20 @@ class EvaluationResult(BaseModel):
     evaluation_status: str = Field(default="complete", pattern="^(complete|partial|insufficient)$")
     criteria: list[CriterionEvaluation] = Field(default_factory=list)
     findings: list[FeedbackFinding] = Field(default_factory=list)
+    answer_revisions: list[AnswerRevision] = Field(default_factory=list)
+    assessment_scope: str = Field(default="interview", pattern="^(interview|practice|limited)$")
+    uncovered_requirements: list[str] = Field(default_factory=list)
     coverage: float = Field(
         default=0.0, ge=0, le=1, description="Fraction of criteria observed, not ability."
     )
 
     @model_validator(mode="after")
     def _no_verdict_without_complete_assessment(self) -> EvaluationResult:
-        if self.evaluation_status != "complete" and (
+        if (self.evaluation_status != "complete" or self.assessment_scope != "interview") and (
             self.score is not None or self.hired is not None
         ):
             raise ValueError(
-                "Partial or insufficient evidence cannot produce an overall score/verdict"
+                "Partial, insufficient or scoped practice cannot produce an overall score/verdict"
             )
         return self
 

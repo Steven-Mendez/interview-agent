@@ -8,9 +8,11 @@ Un simulador de entrevistas de trabajo por voz con IA. Sube tu currículum (PDF)
 
 Tres agentes, un solo flujo:
 
-1. **Planner** — lee el currículum y la oferta, y diseña la entrevista (persona del entrevistador, hitos a cubrir) en el idioma que configuraste.
+1. **Planner** — extrae una rúbrica de la oferta y el nivel; después personaliza los ejemplos con el CV sin cambiar esos criterios. Cada tema cita su requisito y los requisitos omitidos quedan registrados.
 2. **Interviewer** — un agente de voz en tiempo real que conduce la entrevista en el navegador sobre LiveKit, va marcando los hitos y usa el currículum completo y la oferta en su contexto para fundamentar las preguntas.
-3. **Evaluator** — tras el cierre y un sello inmutable del transcript, evalúa cada criterio con evidencia del candidato. Las entrevistas parciales o insuficientes no reciben puntuación ni veredicto global. Las solicitudes recuperables conservan sus intentos y resultados anteriores.
+3. **Evaluator** — tras el cierre y un sello inmutable del transcript, evalúa cada criterio con evidencia del candidato. Las entrevistas parciales o insuficientes, la práctica focalizada y las sesiones que omiten requisitos esenciales no reciben puntuación ni veredicto global. Las solicitudes recuperables conservan sus intentos y resultados anteriores.
+
+Puedes elegir preguntas técnicas, conductuales o mixtas, y simulación o práctica focalizada. La oferta fija los criterios, el CV aporta ejemplos y las respuestas guían el orden y las repreguntas. Las sesiones cortas permiten una repregunta por tema, sujeta al límite del nivel. Planificación, ejecución y pruebas por texto comparten los mismos límites.
 
 ## Stack
 
@@ -20,6 +22,9 @@ Tres agentes, un solo flujo:
 - **PostgreSQL** — conversaciones, hitos, transcripts, evaluaciones
 - **FastAPI** — el API, bajo `/api` (también sirve el frontend compilado)
 - **TanStack Start + shadcn/ui** — frontend React en `web/`, compilado como SPA
+
+Los tres roles LLM usan por defecto `gpt-6.1-sol`: razonamiento `low` para el
+entrevistador y `high` para planificación y evaluación.
 
 ## Requisitos
 
@@ -97,6 +102,81 @@ Quién es admin lo decide solo `ADMIN_USER_IDS`: una lista separada por comas de
 Los tests solo necesitan Docker en marcha: `uv run pytest` levanta un Postgres 16 desechable para la sesión y lo elimina al terminar (sin `.env` ni base de datos levantada). Para usar una base existente, define `TEST_DATABASE_URL` con una cuyo nombre termine en `_test` (CI lo hace con su contenedor de servicio).
 
 > **Nota sobre el idioma y la voz:** el idioma de la entrevista, el nombre del agente y su voz se configuran en la pantalla Settings de la app (no en el `.env`). El reconocimiento y la síntesis de voz quedan fijados al idioma configurado; el catálogo de voces vive en `interview_agent/voices.py`.
+
+## Probar la entrevista por texto
+
+La consola usa el planificador, la invocación estructurada del entrevistador,
+sus prompts, límites y validaciones, y el evaluador de la app. Solo necesita
+`OPENAI_API_KEY` en `.env`; las llamadas a los modelos son reales y consumen tokens.
+`--from-interview` también necesita `DATABASE_URL` para leer una configuración guardada.
+
+```bash
+# Casos sintéticos: respuestas correctas y breves, vagas, incorrectas y «no sé».
+# Añade controles de entrevista parcial y sin respuestas.
+uv run python scripts/interview_text.py --suite
+
+# Conversar desde la terminal, con un plan generado desde tu CV y la oferta.
+# Los archivos deben contener texto; el CV puede estar en Markdown.
+uv run python scripts/interview_console.py --resume cv.md --job-offer oferta.txt
+
+# Probar enseguida con un CV y una oferta sintéticos (tú escribes las respuestas).
+uv run python scripts/interview_console.py --demo --length short
+
+# Reutilizar el plan, idioma, personalidad, preferencias, límites y modelos de la web.
+# UUID: el identificador de la entrevista en su URL. Inicia una sesión local nueva.
+uv run python scripts/interview_console.py --from-interview UUID
+
+# Elegir el alcance como en el frontend.
+uv run python scripts/interview_console.py --resume cv.md --job-offer oferta.txt \
+  --seniority auto --language es --length short --questions 3 --followups 1 \
+  --interview-type technical --objective practice --practice-focus "Depuración"
+
+# Reevaluar exactamente la misma transcripción al cambiar el feedback.
+uv run python scripts/interview_text.py --replay logs/text-interview/vague.json \
+  --output logs/text-interview/after
+
+# Retomar una comparación: reutiliza transcripciones y conserva resultados terminados.
+uv run python scripts/interview_text.py --suite \
+  --reuse-transcripts logs/text-interview/before \
+  --output logs/text-interview/after --continue-run
+```
+
+Escribe una respuesta por línea y pulsa Enter. `/end`, Ctrl+D o Ctrl+C terminan
+la entrevista y generan feedback con lo observado. Una línea vacía vuelve a pedir
+respuesta. El tiempo de escritura cuenta dentro del límite de la entrevista.
+Por defecto: nivel automático desde la oferta, duración `standard`, idioma `es`,
+entrevista técnica y simulación. También admite `--agent-name`, `--persona` y
+`--custom-instructions`. La variante `interview_text.py --interactive` sigue disponible.
+
+Cada sesión interactiva crea una carpeta única en `logs/text-interview/`
+(o bajo `--output`), con `setup.json`, `interactive.json` e `interactive.md`.
+El feedback aparece también en la terminal. El modo `--from-interview` lee PostgreSQL
+en una transacción de solo lectura y conserva el plan original; no vuelve a planificar.
+Si se interrumpe la evaluación, puedes repetirla sobre las respuestas guardadas:
+`uv run python scripts/interview_text.py --replay RUTA/interactive.json --output RUTA`.
+
+Cada caso guarda preguntas, respuestas, decisiones, reparaciones, criterios,
+consumo y evaluación en JSON, y un reporte legible con comparaciones `diff` en
+Markdown, bajo `logs/text-interview/`. Se guardan avances de la conversación y
+la entrada del evaluador para conservar evidencia si falla una llamada. Una
+suite incompleta o un control fallido devuelve código 1. La suite fija los
+criterios para comparar resultados; el modo interactivo usa el planner real.
+También comprueba que los errores conceptuales reciban una repregunta antes de
+cambiar de tema y que sus correcciones se identifiquen como conocimientos que
+practicar. Las transcripciones reutilizadas conservan las preguntas originales;
+ejecuta una suite nueva para verificar cambios en el prompt del entrevistador.
+Las trazas de estas pruebas se desactivan; los reportes locales pueden contener
+el texto que proporcionaste. Estas pruebas verifican razonamiento y feedback;
+no acreditan el funcionamiento del micrófono, la latencia de voz ni una mejora
+estadística de calidad.
+
+El feedback nuevo muestra «lo que dijiste → una alternativa para practicar»
+para criterios con una carencia demostrada. Incluye la pregunta original, el
+motivo del cambio y los detalles personales que necesitas completar. Distingue
+aclarar tu explicación de aprender un concepto técnico. No pide corregir
+respuestas que ya cumplen el criterio ni trata temas no evaluados como fallos.
+Las evaluaciones anteriores siguen disponibles; **Request new assessment**
+genera el formato nuevo sin reemplazar su historia.
 
 ## Despliegue
 

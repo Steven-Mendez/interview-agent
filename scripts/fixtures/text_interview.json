@@ -1,0 +1,46 @@
+{
+  "resume": "# Alex Rivera\nDesarrollador backend junior. Python, FastAPI y PostgreSQL. En una API de pedidos corregí un error 500 cuando no se encontraba un pedido: añadí una comprobación y devolví 404. Escribí tests para pedidos existentes e inexistentes. Sé usar EXPLAIN e índices para investigar consultas lentas. No he medido impacto en producción ni liderado equipos.",
+  "job_offer": "Backend junior. Python, FastAPI y PostgreSQL. Buscamos diagnosticar una consulta lenta usando EXPLAIN e índices, explicar un bug concreto con su causa y solución, y escribir pruebas para el caso normal y un caso límite. No se requiere experiencia en arquitectura distribuida ni métricas de producción.",
+  "language": "es",
+  "seniority": "junior",
+  "plan": {
+    "persona": "Emma, entrevistadora técnica clara y cercana",
+    "summary": "Entrevista junior de backend centrada en SQL, depuración y pruebas.",
+    "focus_areas": ["SQL", "Depuración", "Pruebas"]
+  },
+  "milestones": [
+    {"id": "sql", "title": "Consulta lenta", "description": "La consulta filtra pedidos por user_id y tarda demasiado. Pregunta cómo diagnosticarla.", "expected_evidence": "Identifica un índice en user_id y usa EXPLAIN para comprobar el plan.", "essential": true, "competency": "SQL"},
+    {"id": "debug", "title": "Depuración de una API", "description": "Pide un bug concreto, su causa y cómo lo corrigió.", "expected_evidence": "Explica un bug concreto, su causa y la solución aplicada.", "essential": true, "competency": "Depuración"},
+    {"id": "test", "title": "Pruebas de regresión", "description": "Pregunta cómo probaría la corrección de un endpoint que devuelve 404 cuando no encuentra un pedido.", "expected_evidence": "Propone un test del caso normal y otro del pedido inexistente con su resultado esperado.", "essential": true, "competency": "Pruebas"}
+  ],
+  "scenarios": {
+    "concise_correct": {
+      "description": "Respuestas breves que cumplen el criterio: no deben convertirse en debilidades.",
+      "answers": {
+        "sql": "Comprobaría si user_id tiene un índice y usaría EXPLAIN para ver si la consulta lo utiliza.",
+        "debug": "Un endpoint daba 500 al buscar un pedido inexistente: asumía que siempre había una fila. Añadí una comprobación y devolví 404.",
+        "test": "Probaría un pedido existente esperando 200 y sus datos, y uno inexistente esperando 404."
+      }
+    },
+    "vague": {
+      "description": "Respuestas vagas: el entrevistador debe sondear y el feedback debe mostrar una alternativa concreta sin inventar logros.",
+      "answers": {
+        "sql": "Miraría la base de datos e intentaría optimizarla.",
+        "debug": "Había un error y cambié el código hasta que funcionó.",
+        "test": "Haría unas pruebas para ver que funciona."
+      }
+    },
+    "incorrect": {
+      "description": "Errores conceptuales: distinguir corrección técnica de reformulación y proponer un ejercicio.",
+      "answers": {
+        "sql": "EXPLAIN crea automáticamente los índices que necesita la consulta.",
+        "debug": "Para evitar errores 500 devolvería siempre 200, aunque no exista el pedido. Eso resuelve el error.",
+        "test": "Probaría solo que el servidor arranca. Si arranca, todos los endpoints ya funcionan."
+      }
+    },
+    "unknown": {
+      "description": "No sabe: una respuesta ejemplo debe explicar conocimiento que necesita aprender sin fingir experiencia.",
+      "answers": {"sql": "No sé cómo hacerlo.", "debug": "No recuerdo un bug concreto que pueda explicar.", "test": "No sé qué pruebas escribir."}
+    }
+  }
+}

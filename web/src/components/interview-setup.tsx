@@ -14,6 +14,7 @@ import {
 
 import {
   ApiError,
+  DEFAULT_PREFERENCES,
   LANGUAGE_LABELS,
   LENGTH_LABELS,
   LENGTH_TOPICS,
@@ -40,6 +41,7 @@ import { useResumePreview } from "@/hooks/use-resume-preview"
 import { log } from "@/lib/log"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { InterviewPreferenceFields } from "@/components/interview-preferences"
 import {
   Field,
   FieldDescription,
@@ -93,11 +95,16 @@ const uploadSchema = z.object({
     .refine((text) => !!text.trim(), "Paste the job offer.")
     .max(20000, "The offer must be 20,000 characters or fewer."),
   // Depth axis. "auto" lets the planner classify the role once from the offer
-  // and the resume — without it the model infers the level from how advanced
+  // — without it the model infers the level from how advanced
   // the tech stack sounds, and grills a junior like a senior.
   seniority: z.enum(["auto", "trainee", "junior", "mid", "senior", "lead"]),
   // Volume axis, independent of the level: how much ground to cover.
   interview_length: z.enum(["short", "standard", "deep"]),
+  preferences: z.object({
+    interview_type: z.enum(["technical", "behavioral", "mixed"]),
+    objective: z.enum(["simulation", "practice"]),
+    practice_focus: z.string().max(1000),
+  }),
   // Who conducts it. Pre-filled from the global Settings screen; changing it
   // here applies to THIS interview only. Blank is allowed here because the
   // server falls back to the saved value for each of these — see
@@ -168,6 +175,7 @@ const STEPS = [
     fields: [
       "seniority",
       "interview_length",
+      "preferences",
       "question_limit",
       "followup_limit",
       "max_minutes",
@@ -434,6 +442,7 @@ export function UploadPage() {
       job_offer: "",
       seniority: "auto",
       interview_length: "standard",
+      preferences: DEFAULT_PREFERENCES,
       agent_name: "",
       language: "",
       voice: "",
@@ -455,6 +464,7 @@ export function UploadPage() {
       formData.append("job_offer", value.job_offer)
       formData.append("seniority", value.seniority)
       formData.append("interview_length", value.interview_length)
+      formData.append("preferences", JSON.stringify(value.preferences))
       formData.append(
         "resume_review",
         JSON.stringify({
@@ -874,6 +884,15 @@ export function UploadPage() {
                         )}
                       />
                     </div>
+                    <form.Field name="preferences">
+                      {(field) => (
+                        <InterviewPreferenceFields
+                          value={field.state.value}
+                          onChange={field.handleChange}
+                          disabled={mutation.isPending}
+                        />
+                      )}
+                    </form.Field>
                     <div className="grid items-start gap-4 @md/main:grid-cols-3">
                       {BUDGET_FIELDS.map(({ name, label, min, max }) => (
                         <form.Field

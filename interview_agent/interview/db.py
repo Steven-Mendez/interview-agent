@@ -79,6 +79,7 @@ class Conversation(Base):
     # planner) and free-form requests (practice topics, question limits...).
     persona: Mapped[str | None] = mapped_column(Text)
     custom_instructions: Mapped[str | None] = mapped_column(Text)
+    interview_preferences: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     # Planner output minus milestones: persona, language, summary, focus_areas.
     plan: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     # The two calibration axes, resolved ONCE at creation and never re-inferred
@@ -200,6 +201,7 @@ class Milestone(Base):
     close_reason: Mapped[str | None] = mapped_column(Text)
     essential: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true")
     competency: Mapped[str | None] = mapped_column(Text)
+    planning_context: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     primary_questions: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     followups: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     clarifications: Mapped[int] = mapped_column(Integer, default=0, server_default="0")

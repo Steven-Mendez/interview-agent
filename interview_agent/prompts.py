@@ -180,7 +180,7 @@ LENGTH_PROFILE: dict[InterviewLength, dict[str, int]] = {
         "min_milestones": 3,
         "max_milestones": 4,
         "minutes": 8,
-        "followups": 0,
+        "followups": 1,
     },
     InterviewLength.STANDARD: {
         "min_milestones": 4,

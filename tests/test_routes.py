@@ -14,6 +14,7 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from unittest.mock import AsyncMock
 
 import jwt
 import pytest
@@ -145,6 +146,70 @@ async def client_and_sessionmaker(monkeypatch, integration_database_url, acting_
 
 async def _fake_planner(settings, resume_markdown, job_offer, **kwargs) -> InterviewPlan:
     return _plan()
+
+
+async def test_grounded_plan_preferences_and_repeat_keep_the_role_bar(
+    client_and_sessionmaker, monkeypatch
+):
+    from test_planner import OFFER, install, personalized, rubric
+
+    from interview_agent.interview import planner
+
+    client, sessionmaker = client_and_sessionmaker
+    model = install(
+        monkeypatch,
+        rubric(),
+        personalized(quote="Python dev."),
+        personalized(quote="Python dev.", behavioral=True),
+    )
+    monkeypatch.setattr(routes, "run_planner", planner.run_planner)
+    response = await client.post("/api/interviews", **_upload(OFFER, interview_length="short"))
+    assert response.status_code == 200, response.text
+    first = response.json()
+    assert first["followup_limit"] == 1
+    assert first["plan"]["budget"] == {"max_minutes": 8, "question_limit": 2, "followup_limit": 1}
+    assert first["milestones"][0]["planning_context"]["resume_quotes"] == ["Python dev."]
+    preferences = {
+        "interview_type": "behavioral",
+        "objective": "practice",
+        "practice_focus": "Asking for help",
+    }
+    response = await client.post(
+        f"/api/interviews/{first['id']}/repeat", json={"preferences": preferences}
+    )
+    assert response.status_code == 200, response.text
+    repeated = response.json()
+    assert repeated["preferences"] == preferences
+    assert repeated["plan"]["requirements"] == first["plan"]["requirements"]
+    assert repeated["milestones"][0]["planning_context"]["requirement_id"] == "explain"
+    assert len(model.calls) == 3  # Only personalization is repeated.
+    async with sessionmaker() as session:
+        saved = await db.get_conversation(session, uuid.UUID(repeated["id"]))
+        assert saved.interview_preferences == preferences
+
+    # An explicit auto request reclassifies rather than reusing the pinned rubric.
+    model = install(monkeypatch, rubric(), personalized(quote="Python dev.", behavioral=True))
+    response = await client.post(
+        f"/api/interviews/{repeated['id']}/repeat", json={"seniority": "auto"}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["preferences"] == preferences
+    assert len(model.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "preferences",
+    ['{"interview_type":"unknown"}', '{"objective":"unknown"}', "null", '{"surprise":true}'],
+)
+async def test_invalid_preferences_do_not_start_planning(
+    client_and_sessionmaker, monkeypatch, preferences
+):
+    client, _ = client_and_sessionmaker
+    mocked = AsyncMock()
+    monkeypatch.setattr(routes, "run_planner", mocked)
+    response = await client.post("/api/interviews", **_upload(preferences=preferences))
+    assert response.status_code == 400
+    mocked.assert_not_awaited()
 
 
 async def _fake_evaluator(settings, **kwargs) -> EvaluationResult:
@@ -1586,6 +1651,7 @@ async def test_history_row_carries_the_score(client_and_sessionmaker, monkeypatc
         "hired": True,
         "score": 82,
         "evaluation_status": "complete",
+        "assessment_scope": "interview",
     }
     assert row["milestones_completed"] == 1
 

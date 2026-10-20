@@ -97,7 +97,7 @@ async def test_effective_manifest_distinguishes_defaults_process_snapshot_and_pr
     )
     encoded = json.dumps(manifest)
     assert "CANARY_" not in encoded
-    assert manifest["loaded_defaults"]["interviewer_model"] == "gpt-6-astra"
+    assert manifest["loaded_defaults"]["interviewer_model"] == "gpt-6.1-sol"
     assert manifest["process_settings"]["interviewer_model"] == "gpt-6-astra"
     assert manifest["effective_settings"]["interviewer_model"] == "gpt-6.1-sol"
     assert manifest["process_settings"]["stt_model"] == "assemblyai/universal-3-6-pro"

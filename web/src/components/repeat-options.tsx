@@ -18,7 +18,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { LENGTH_LABELS } from "@/lib/api"
+import { DEFAULT_PREFERENCES, LENGTH_LABELS } from "@/lib/api"
+import { InterviewPreferenceFields } from "@/components/interview-preferences"
 import type { Interview, InterviewLength, RepeatRequest } from "@/lib/api"
 
 /** Same body the backend contract defines: a changed duration recalculates
@@ -54,6 +55,8 @@ export function RepeatOptions({
   )
   const [questions, setQuestions] = React.useState("")
   const [followups, setFollowups] = React.useState("")
+  const originalPreferences = interview.preferences ?? DEFAULT_PREFERENCES
+  const [preferences, setPreferences] = React.useState(originalPreferences)
   const invalid =
     (questions.trim() !== "" &&
       !(
@@ -72,8 +75,14 @@ export function RepeatOptions({
       className="flex flex-col gap-5 text-left"
       onSubmit={(event) => {
         event.preventDefault()
-        if (!invalid)
-          onRepeat(repeatBody(interview, length, questions, followups))
+        if (!invalid) {
+          const body = repeatBody(interview, length, questions, followups)
+          if (
+            JSON.stringify(preferences) !== JSON.stringify(originalPreferences)
+          )
+            body.preferences = preferences
+          onRepeat(body)
+        }
       }}
     >
       <Field>
@@ -96,6 +105,11 @@ export function RepeatOptions({
           </SelectContent>
         </Select>
       </Field>
+      <InterviewPreferenceFields
+        value={preferences}
+        onChange={setPreferences}
+        disabled={pending}
+      />
       <div className="grid gap-4 sm:grid-cols-2">
         <Field>
           <FieldLabel htmlFor="repeat-questions">

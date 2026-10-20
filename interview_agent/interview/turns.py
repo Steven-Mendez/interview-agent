@@ -13,15 +13,14 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from interview_agent.interview import db
+from interview_agent.interview.decision import DECISION_SECONDS, MAX_INVOCATIONS
 
-DECISION_SECONDS = 15
 QUEUE_SECONDS = 30
 WAITER_SECONDS = 3
 # How long a confirmed capture may wait for its own claim. Capture precedes
 # the chat message that claims it, so a later turn briefly yields to it; a
 # voice reply cancelled before claiming never arrives, and must not block.
 CLAIM_GRACE_SECONDS = 5
-MAX_INVOCATIONS = 2
 CLEANUP_SECONDS = 1
 logger = logging.getLogger(__name__)
 

@@ -43,8 +43,14 @@ from interview_agent.closing import FAREWELLS
 from interview_agent.config import settings
 from interview_agent.interview import db
 from interview_agent.interview import resume as resume_ingestion
+from interview_agent.interview.budgets import resolve_budget
 from interview_agent.interview.context import validate_source_documents
-from interview_agent.interview.models import InterviewLength, Seniority
+from interview_agent.interview.models import (
+    InterviewLength,
+    InterviewPreferences,
+    RoleRubric,
+    Seniority,
+)
 from interview_agent.interview.planner import run_planner
 from interview_agent.interview.seals import result_invalid, seal_invalid
 from interview_agent.interview.workers import reconnect_deadline
@@ -61,7 +67,7 @@ from interview_agent.playback import (
     closing_state,
     confirmation_source,
 )
-from interview_agent.prompts import DEFAULT_SENIORITY, fit_length, followup_budget, length_for
+from interview_agent.prompts import DEFAULT_SENIORITY
 from interview_agent.server import evaluations
 from interview_agent.server.account_metrics import publish_account_metrics
 from interview_agent.server.auth import (
@@ -515,6 +521,8 @@ def _serialize(
         # Root of the re-run chain, NULL on a first attempt.
         "repeat_of_id": (str(conversation.repeat_of_id) if conversation.repeat_of_id else None),
         "plan": conversation.plan,
+        "preferences": conversation.interview_preferences
+        or InterviewPreferences().model_dump(mode="json"),
         "seniority": conversation.seniority,
         "seniority_source": conversation.seniority_source,
         "seniority_evidence": conversation.seniority_evidence,
@@ -558,6 +566,7 @@ def _serialize(
                 "close_reason": m.close_reason,
                 "essential": m.essential,
                 "competency": m.competency,
+                "planning_context": m.planning_context,
                 "primary_questions": m.primary_questions,
                 "followups": m.followups,
                 "clarifications": m.clarifications,
@@ -656,6 +665,7 @@ def _serialize_summary(
                 "hired": evaluation.hired,
                 "score": evaluation.score,
                 "evaluation_status": (evaluation.result or {}).get("evaluation_status"),
+                "assessment_scope": (evaluation.result or {}).get("assessment_scope", "interview"),
                 **(
                     {"hired": None, "score": None, "evaluation_status": "partial"}
                     if conversation.capture_integrity_pending or evaluation_invalid
@@ -750,7 +760,7 @@ async def create_interview(
     resume: UploadFile,
     job_offer: str = Form(),
     # Depth axis. "auto" (the default) means the planner classifies the role
-    # ONCE from the offer and the resume; anything else pins it outright.
+    # ONCE from the offer; anything else pins it outright.
     seniority: str = Form("auto"),
     # Volume axis, independent of the level: milestone count and minutes.
     interview_length: str = Form("standard"),
@@ -764,10 +774,19 @@ async def create_interview(
     # than silently falling back to fresh extraction. The hash binds the edit
     # to the selected PDF, including when preview requests finish out of order.
     resume_review: str | None = Form(None),
+    preferences: str | None = Form(None),
 ):
     requested_seniority = _parse_seniority(seniority)
     length = _parse_length(interview_length)
     interviewer_overrides = _parse_interviewer(interviewer)
+    try:
+        parsed_preferences = (
+            InterviewPreferences.model_validate_json(preferences)
+            if preferences is not None
+            else InterviewPreferences()
+        )
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid interview preferences") from None
     if not job_offer.strip():
         raise HTTPException(status_code=400, detail="job_offer must not be empty")
     _validate_sources("", job_offer)
@@ -799,6 +818,7 @@ async def create_interview(
         requested_seniority=requested_seniority,
         length=length,
         interviewer_overrides=interviewer_overrides,
+        preferences=parsed_preferences,
         resume_provenance={
             "kind": "reviewed_pdf_text" if resume_review is not None else "extracted_pdf_text",
             "pdf_sha256": pdf_hash,
@@ -821,6 +841,8 @@ async def _plan_and_persist(
     pinned_evidence: str | None = None,
     interviewer_overrides: dict[str, Any] | None = None,
     resume_provenance: dict[str, Any] | None = None,
+    preferences: InterviewPreferences | None = None,
+    rubric: RoleRubric | None = None,
 ) -> dict[str, Any]:
     """Run the planner and store the resume and planned interview in Postgres.
 
@@ -846,14 +868,14 @@ async def _plan_and_persist(
     # a "deep" request under a 15-minute cap is planned for 15 minutes
     # instead of being cut off mid-plan (`interview_length` stays "deep").
     overrides = interviewer_overrides or {}
-    max_minutes = min(
-        overrides.get("max_minutes") or length_for(length)["minutes"],
-        settings.interview_max_minutes,
+    preferences = preferences or InterviewPreferences()
+    budget = resolve_budget(
+        length,
+        requested_seniority,
+        server_max_minutes=settings.interview_max_minutes,
+        **{key: overrides.get(key) for key in ("max_minutes", "question_limit", "followup_limit")},
     )
-    question_limit = (
-        overrides.get("question_limit")
-        or length_for(fit_length(length, max_minutes))["max_milestones"]
-    )
+    max_minutes, question_limit = budget.max_minutes, budget.question_limit
     async with _sessionmaker(request)() as session:
         # Snapshot the interviewer NOW: this interview keeps this
         # persona/language/voice even if the settings change later.
@@ -888,6 +910,7 @@ async def _plan_and_persist(
                 repeat_of_id=repeat_of_id,
                 persona=interviewer["persona"],
                 custom_instructions=interviewer["custom_instructions"],
+                interview_preferences=preferences.model_dump(mode="json"),
                 agent_settings=agent_settings,
                 # Provisional: when the planner classifies, the detected value
                 # overwrites this a few lines below.
@@ -930,6 +953,9 @@ async def _plan_and_persist(
                 usage_callback=planner_usage,
                 question_limit=question_limit,
                 telemetry_callback=observer,
+                followup_limit=budget.followup_limit,
+                preferences=preferences,
+                rubric=rubric,
                 langsmith_extra={"metadata": telemetry.trace_metadata()},
             )
             if requested_seniority is None and (
@@ -981,16 +1007,22 @@ async def _plan_and_persist(
             conversation.seniority = plan.detected_seniority.value
             conversation.seniority_source = "detected"
             conversation.seniority_evidence = plan.seniority_evidence
-        budget = followup_budget(conversation.seniority, fit_length(length, max_minutes))
-        conversation.followup_limit = min(
-            overrides.get("followup_limit")
-            if overrides.get("followup_limit") is not None
-            else budget,
-            budget,
+        effective_budget = resolve_budget(
+            length,
+            conversation.seniority,
+            server_max_minutes=settings.interview_max_minutes,
+            max_minutes=max_minutes,
+            question_limit=min(question_limit, len(plan.milestones)),
+            followup_limit=budget.followup_limit,
         )
+        conversation.followup_limit = effective_budget.followup_limit
         # One primary question per milestone: the effective limit is what the
         # plan can actually ask. Requested values stay visible beside it.
         conversation.question_limit = min(question_limit, len(plan.milestones))
+        conversation.plan = {
+            **conversation.plan,
+            "budget": effective_budget.model_dump(mode="json"),
+        }
         conversation.run_config = {
             **run_config,
             "seniority": conversation.seniority,
@@ -1013,6 +1045,10 @@ async def _plan_and_persist(
                     expected_evidence=spec.expected_evidence,
                     essential=spec.essential,
                     competency=spec.competency,
+                    planning_context={
+                        "requirement_id": spec.requirement_id,
+                        "resume_quotes": spec.resume_quotes,
+                    },
                 )
             )
         await session.commit()
@@ -1533,6 +1569,7 @@ class RepeatRequest(BudgetOverrides):
 
     seniority: str | None = None
     interview_length: str | None = None
+    preferences: InterviewPreferences | None = None
 
 
 @router.post("/interviews/{interview_id}/repeat")
@@ -1594,6 +1631,17 @@ async def repeat_interview(
             if override is not None or inherited is not None:
                 interviewer_overrides[field] = override if override is not None else inherited
         resume_provenance = (source.run_config or {}).get("resume_input")
+        preferences = body.preferences or InterviewPreferences.model_validate(
+            source.interview_preferences or (source.plan or {}).get("preferences", {})
+        )
+        # A new level or explicit auto classification needs a fresh role rubric.
+        rubric = None
+        if requested_seniority == source.seniority and (source.plan or {}).get("requirements"):
+            rubric = RoleRubric(
+                seniority=source.seniority,
+                seniority_evidence=source.seniority_evidence or "",
+                requirements=source.plan["requirements"],
+            )
 
     logger.info(
         "repeating interview",
@@ -1612,6 +1660,8 @@ async def repeat_interview(
         pinned_evidence=pinned_evidence,
         interviewer_overrides=interviewer_overrides,
         resume_provenance=resume_provenance,
+        preferences=preferences,
+        rubric=rubric,
     )
 
 

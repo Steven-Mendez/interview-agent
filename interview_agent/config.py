@@ -71,10 +71,10 @@ class Settings(BaseSettings):
 
     # LLM (OpenAI via LangGraph)
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
-    # The interviewer's model decides every voice turn: quality first, with its
-    # audible latency measured. Planner and evaluator have their own below.
+    # Use Sol across production roles; the realtime interviewer uses low effort.
+    # Planner and evaluator keep their own reasoning budgets below.
     interviewer_model: str = Field(
-        default="gpt-6-astra",
+        default="gpt-6.1-sol",
         alias="INTERVIEWER_MODEL",
         description="Decision model for the realtime voice loop.",
     )
@@ -84,10 +84,10 @@ class Settings(BaseSettings):
     interviewer_temperature: float = Field(default=0.7, alias="INTERVIEWER_TEMPERATURE")
 
     # Interview planner/evaluator: run once per interview with no latency
-    # pressure, so quality-first models with high reasoning effort.
-    planner_model: str = Field(default="gpt-6-astra", alias="PLANNER_MODEL")
+    # pressure, so use Sol with high reasoning effort.
+    planner_model: str = Field(default="gpt-6.1-sol", alias="PLANNER_MODEL")
     planner_reasoning_effort: str = Field(default="high", alias="PLANNER_REASONING_EFFORT")
-    evaluator_model: str = Field(default="gpt-6-astra", alias="EVALUATOR_MODEL")
+    evaluator_model: str = Field(default="gpt-6.1-sol", alias="EVALUATOR_MODEL")
     evaluator_reasoning_effort: str = Field(default="high", alias="EVALUATOR_REASONING_EFFORT")
 
     # Postgres (from docker-compose.yml).

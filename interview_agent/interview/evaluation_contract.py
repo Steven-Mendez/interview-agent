@@ -8,6 +8,7 @@ from interview_agent.interview.models import (
     EvaluationResult,
     Seniority,
 )
+from interview_agent.interview.planning_contract import evaluation_scope
 
 # Highest score of each rubric band (90-100, 70-89, 40-69, 0-39).
 BAND_TOPS = frozenset({100, 89, 69, 39})
@@ -61,7 +62,16 @@ def validate_evaluation(
     milestones: list[dict],
     records: list[dict],
     transcript_complete: bool = True,
+    require_answer_revisions: bool = False,
+    plan: dict | None = None,
 ) -> EvaluationResult:
+    scope, uncovered = evaluation_scope(plan)
+    if result.assessment_scope != scope or result.uncovered_requirements != uncovered:
+        raise ValueError("Assessment scope and uncovered requirements must match the saved plan")
+    if scope != "interview" and (result.score is not None or result.hired is not None):
+        raise ValueError(
+            "Focused practice or limited role coverage cannot produce a hiring verdict"
+        )
     if result.seniority_evaluated != seniority:
         raise ValueError("Evaluation seniority differs from the pinned role level")
     expected = {str(m["id"]): m for m in milestones}
@@ -78,18 +88,22 @@ def validate_evaluation(
     essential_observed = all(
         criteria[k].assessment != Assessment.NOT_ASSESSABLE
         for k, m in expected.items()
-        if m.get("essential", True)
+        if scope == "practice" or m.get("essential", True)
     )
     status = (
         "insufficient"
         if not observed
         else "complete"
-        if essential_observed and transcript_complete
+        if essential_observed and transcript_complete and scope != "limited"
         else "partial"
     )
     if result.evaluation_status != status:
         raise ValueError(f"Evidence coverage requires evaluation_status={status}")
-    if status == "complete" and (result.score is None or result.hired is None):
+    if (
+        status == "complete"
+        and scope == "interview"
+        and (result.score is None or result.hired is None)
+    ):
         raise ValueError("A complete evaluation requires score and verdict")
     if result.hired is True and (result.score is None or result.score < 70):
         raise ValueError("A positive hiring simulation requires a score of at least 70")
@@ -126,12 +140,48 @@ def validate_evaluation(
     for kind, texts in (("strength", result.strengths), ("weakness", result.weaknesses)):
         if set(texts) != {f.text for f in result.findings if f.kind == kind}:
             raise ValueError("Strengths and weaknesses must match evidence-backed findings")
+    revised = set()
+    seen = set()
+    for revision in result.answer_revisions:
+        criterion = criteria.get(revision.milestone_id)
+        if criterion is None or criterion.assessment not in (Assessment.PARTIAL, Assessment.BELOW):
+            raise ValueError("Answer revisions require a criterion with a demonstrated gap")
+        verify_evidence([revision.original], records)
+        if not any(
+            ref.message_id == revision.original.message_id
+            and ref.message_version == revision.original.message_version
+            for ref in criterion.evidence
+        ):
+            raise ValueError("The revised answer must be evidence for its linked criterion")
+        index = next(i for i, m in enumerate(records) if m["id"] == revision.original.message_id)
+        question = next((m for m in reversed(records[:index]) if m["role"] == "assistant"), None)
+        if question is None or question["id"] != revision.question_id:
+            raise ValueError("An answer revision must reference the question before its answer")
+        revision.question = question["content"]
+        if not revision.suggested_answer.strip() or not revision.explanation.strip():
+            raise ValueError("An answer revision requires an alternative and an explanation")
+        if revision.suggested_answer.strip() == revision.original.quote.strip():
+            raise ValueError("An answer revision must make an actual change")
+        key = (
+            revision.milestone_id,
+            revision.original.message_id,
+            revision.original.message_version,
+        )
+        if key in seen:
+            raise ValueError("Do not repeat an answer revision for the same criterion and answer")
+        seen.add(key)
+        revised.add(revision.milestone_id)
+    if require_answer_revisions and any(
+        c.assessment in (Assessment.PARTIAL, Assessment.BELOW) and c.milestone_id not in revised
+        for c in result.criteria
+    ):
+        raise ValueError("Every demonstrated gap needs a concrete answer revision")
     # Coverage is arithmetic, not an LLM estimate of ability or confidence.
     return result.model_copy(update={"coverage": observed / len(expected) if expected else 0.0})
 
 
 def insufficient_evaluation(
-    seniority: Seniority, milestones: list[dict], language: str
+    seniority: Seniority, milestones: list[dict], language: str, plan: dict | None = None
 ) -> EvaluationResult:
     reason = (
         "No hay respuestas evaluables del candidato."
@@ -146,6 +196,8 @@ def insufficient_evaluation(
         rationale=reason,
         seniority_evaluated=seniority,
         evaluation_status="insufficient",
+        assessment_scope=evaluation_scope(plan)[0],
+        uncovered_requirements=evaluation_scope(plan)[1],
         criteria=[
             CriterionEvaluation(
                 milestone_id=str(m["id"]),

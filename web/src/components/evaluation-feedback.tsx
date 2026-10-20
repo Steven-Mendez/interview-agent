@@ -2,6 +2,7 @@ import { ChevronDownIcon, LightbulbIcon } from "lucide-react"
 
 import type {
   Assessment,
+  AnswerRevision,
   CriterionEvaluation,
   Evaluation,
   Milestone,
@@ -96,11 +97,15 @@ export function EvaluationOutcome({
   captureIntegrityPending?: boolean
 }) {
   const complete =
+    (!evaluation.assessment_scope ||
+      evaluation.assessment_scope === "interview") &&
     !captureIntegrityPending &&
     evaluation.evaluation_status === "complete" &&
     evaluation.score !== null &&
     evaluation.hired !== null
   const insufficient = evaluation.evaluation_status === "insufficient"
+  const practice = evaluation.assessment_scope === "practice"
+  const limited = evaluation.assessment_scope === "limited"
   return (
     <section
       aria-label="Overall result"
@@ -110,7 +115,13 @@ export function EvaluationOutcome({
         <ScoreRing score={evaluation.score!} hired={evaluation.hired!} />
       ) : (
         <Badge variant="secondary" className="h-8 self-start px-3 text-sm">
-          {insufficient ? "Insufficient evidence" : "Partial assessment"}
+          {practice
+            ? "Practice feedback"
+            : insufficient
+              ? "Insufficient evidence"
+              : limited
+                ? "Limited role coverage"
+                : "Partial assessment"}
         </Badge>
       )}
       <div className="flex flex-1 flex-col gap-2">
@@ -134,9 +145,13 @@ export function EvaluationOutcome({
           <p className="text-sm leading-relaxed">
             {insufficient
               ? "There is not enough candidate evidence to assess this interview."
-              : transcriptPartial
-                ? "Feedback covers the saved answers. Transcript completeness could not be confirmed."
-                : "Feedback covers the answers observed. The available evidence does not support a complete assessment."}{" "}
+              : practice
+                ? "Feedback covers the selected skills for focused practice."
+                : limited
+                  ? "Some essential role requirements were outside this session."
+                  : transcriptPartial
+                    ? "Feedback covers the saved answers. Transcript completeness could not be confirmed."
+                    : "Feedback covers the answers observed. The available evidence does not support a complete assessment."}{" "}
             No overall score or hiring verdict is available.
           </p>
         )}
@@ -144,10 +159,21 @@ export function EvaluationOutcome({
           <MascotAvatar size={18} tone="plain" />
           Evaluated by Interviewer Agent · as {level} · {duration}
         </p>
+        {!!evaluation.uncovered_requirements?.length && (
+          <div className="text-sm text-muted-foreground">
+            <p>Essential role requirements outside this session:</p>
+            <ul className="list-disc pl-5">
+              {evaluation.uncovered_requirements.map((item, i) => (
+                <li key={i}>{item}</li>
+              ))}
+            </ul>
+            <p>Missing coverage is not a demonstrated weakness.</p>
+          </div>
+        )}
         {evaluation.coverage !== undefined && (
           <p className="text-xs text-muted-foreground">
-            Criteria observed: {Math.round(evaluation.coverage * 100)}%.
-            Coverage measures what was assessed, not ability.
+            Selected criteria observed: {Math.round(evaluation.coverage * 100)}
+            %. Coverage measures what was assessed, not ability.
           </p>
         )}
         {captureIntegrityPending && (
@@ -199,6 +225,99 @@ function CriterionBody({ criterion }: { criterion: CriterionEvaluation }) {
         </div>
       )}
     </div>
+  )
+}
+
+function AnswerComparison({ revision }: { revision: AnswerRevision }) {
+  return (
+    <article className="overflow-hidden rounded-xl border bg-card">
+      <div className="flex flex-col gap-2 px-4 py-4">
+        {revision.question && (
+          <p className="text-sm leading-relaxed font-medium">
+            {revision.question}
+          </p>
+        )}
+        <p className="text-xs text-muted-foreground">
+          {revision.basis === "knowledge_example"
+            ? "Concept to learn and practise"
+            : "Make your explanation clearer"}
+          {" · "}Candidate answer #{revision.original.message_id}
+          {revision.original.message_version != null &&
+            ` · version ${revision.original.message_version}`}
+        </p>
+      </div>
+      <div className="border-y" aria-label="Answer comparison">
+        <div className="flex gap-3 bg-destructive/8 px-4 py-3">
+          <span aria-hidden className="font-mono text-destructive">
+            −
+          </span>
+          <div className="min-w-0">
+            <p className="mb-1 text-xs font-medium text-destructive">
+              You said
+            </p>
+            <p className="text-sm leading-relaxed whitespace-pre-wrap">
+              {revision.original.quote}
+            </p>
+          </div>
+        </div>
+        <div className="flex gap-3 bg-success/8 px-4 py-3">
+          <span aria-hidden className="font-mono text-success">
+            +
+          </span>
+          <div className="min-w-0">
+            <p className="mb-1 text-xs font-medium text-success">
+              {revision.basis === "knowledge_example"
+                ? "After practising, you could explain"
+                : "You could say"}
+            </p>
+            <p className="text-sm leading-relaxed whitespace-pre-wrap">
+              {revision.suggested_answer}
+            </p>
+          </div>
+        </div>
+      </div>
+      <div className="flex flex-col gap-3 px-4 py-4 text-sm">
+        <div>
+          <p className="mb-1 font-medium">Why this helps</p>
+          <p className="leading-relaxed whitespace-pre-wrap">
+            {revision.explanation}
+          </p>
+        </div>
+        {revision.missing_details.length > 0 && (
+          <div className="rounded-lg bg-muted p-3">
+            <p className="mb-2 font-medium">Add your real details</p>
+            <ul className="list-disc space-y-1 pl-4">
+              {revision.missing_details.map((detail, index) => (
+                <li key={index}>{detail}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+      </div>
+    </article>
+  )
+}
+
+export function AnswerComparisons({ evaluation }: { evaluation: Evaluation }) {
+  const revisions = evaluation.answer_revisions ?? []
+  if (!revisions.length) return null
+  return (
+    <section aria-label="Improve your answers" className="flex flex-col gap-4">
+      <div className="flex flex-col gap-1.5">
+        <h2 className="text-title">Improve your answers</h2>
+        <p className="max-w-3xl text-sm leading-relaxed text-muted-foreground">
+          Compare your words with an example to practise. Keep the parts that
+          are true for you and fill in any missing details with your own
+          experience.
+        </p>
+      </div>
+      {revisions.map((revision) => (
+        <AnswerComparison
+          key={`${revision.milestone_id}-${revision.original.message_id}`}
+          revision={revision}
+        />
+      ))}
+    </section>
   )
 }
 

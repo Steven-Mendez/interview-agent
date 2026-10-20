@@ -95,6 +95,7 @@ def execution_config(settings: Settings, *, language: str, voice: dict, **budget
             "llm.py",
             "interview/models.py",
             "interview/dialogue.py",
+            "interview/decision.py",
             "interview/evaluation_contract.py",
             "closing.py",
         )

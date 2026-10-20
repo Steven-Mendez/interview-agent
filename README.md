@@ -8,9 +8,11 @@ An AI voice job-interview simulator. Upload your resume (PDF) and paste a job of
 
 Three agents, one flow:
 
-1. **Planner** — reads the resume and the job offer, designs the interview (interviewer persona, milestones to cover) in the language you configured.
+1. **Planner** — extracts a rubric from the job offer and role level, then personalizes examples from the resume without changing the passing criteria. Each topic links to a requirement; omitted requirements remain explicit.
 2. **Interviewer** — a real-time voice agent that runs the interview in the browser over LiveKit, checks off milestones as it goes, and uses the full resume and job offer in its context to ground its questions.
-3. **Evaluator** — after closure and an immutable transcript seal, it assesses each criterion with evidence from the candidate. Partial or insufficient interviews have no global score or verdict. Recoverable requests preserve their attempts and previous results.
+3. **Evaluator** — after closure and an immutable transcript seal, it assesses each criterion with evidence from the candidate. Partial or insufficient interviews, focused practice, and sessions that omit essential role requirements have no global score or verdict. Recoverable requests preserve their attempts and previous results.
+
+Choose technical, behavioral or mixed questions, and interview simulation or focused practice. The job sets the bar, the resume supplies examples, and answers guide topic order and follow-ups. Short sessions allow one follow-up per topic, subject to the role-level cap. Planning, execution and the text harness share the same effective limits.
 
 ## Tech stack
 
@@ -20,6 +22,9 @@ Three agents, one flow:
 - **PostgreSQL** — conversations, milestones, transcripts, evaluations
 - **FastAPI** — the API, under `/api` (also serves the built frontend)
 - **TanStack Start + shadcn/ui** — React frontend in `web/`, built as a SPA
+
+All three LLM roles default to `gpt-6.1-sol`: low reasoning effort for the
+interviewer and high for planning and evaluation.
 
 ## Requirements
 
@@ -97,6 +102,75 @@ Who is an admin is decided by `ADMIN_USER_IDS` alone: a comma-separated list of 
 Tests need only Docker running: `uv run pytest` starts a throwaway Postgres 16 container for the session and removes it afterwards (no `.env`, no running database). To use an existing database instead, set `TEST_DATABASE_URL` to one whose name ends in `_test` (CI does this with its service container).
 
 > **Note on language and voice:** the interview language, the agent's name and its voice are set in the in-app Settings screen (not in `.env`). Speech recognition and synthesis are pinned to the configured language; the voice catalog lives in `interview_agent/voices.py`.
+
+## Test interviews through text
+
+The console uses the app's planner, structured interviewer invocation, prompts,
+budgets, validation and evaluator. It needs only `OPENAI_API_KEY` in `.env`;
+the configured models make real, paid API calls. `--from-interview` also needs
+`DATABASE_URL` to read a saved setup.
+
+```bash
+# Fixed synthetic cases: concise correct, vague, incorrect, unknown; coverage controls.
+uv run python scripts/interview_text.py --suite
+
+# Interactive terminal interview, using the real planner and text/Markdown documents.
+uv run python scripts/interview_console.py --resume cv.md --job-offer role.txt
+
+# Start immediately with a synthetic CV/offer; type your own answers.
+uv run python scripts/interview_console.py --demo --length short
+
+# Reuse a web interview's plan, preferences, budgets, models and interviewer settings.
+# UUID is the interview identifier in its URL. Starts a fresh local session.
+uv run python scripts/interview_console.py --from-interview UUID
+
+# Choose the scope as in the frontend.
+uv run python scripts/interview_console.py --resume cv.md --job-offer role.txt \
+  --seniority auto --language en --length short --questions 3 --followups 1 \
+  --interview-type technical --objective practice --practice-focus "Debugging"
+
+# Compare feedback on exactly the same saved answers.
+uv run python scripts/interview_text.py --replay logs/text-interview/vague.json \
+  --output logs/text-interview/after
+
+# Continue remaining cases without rerunning completed reports.
+uv run python scripts/interview_text.py --suite \
+  --reuse-transcripts logs/text-interview/before \
+  --output logs/text-interview/after --continue-run
+```
+
+Type one answer per line and press Enter. `/end`, Ctrl+D or Ctrl+C end the
+interview and evaluate the evidence collected. Empty lines ask again. Typing time
+counts toward the interview deadline. Defaults: automatic seniority from the job
+offer, `standard` length, `es` language, technical simulation. `--agent-name`,
+`--persona` and `--custom-instructions` are also supported.
+`interview_text.py --interactive` remains available.
+
+Each interactive session creates a unique directory under `logs/text-interview/`
+(or `--output`) with `setup.json`, `interactive.json` and `interactive.md`.
+Feedback is also printed to the terminal. `--from-interview` reads PostgreSQL
+in a read-only transaction and reuses the original plan without replanning.
+If evaluation is interrupted, retry it against the saved answers:
+`uv run python scripts/interview_text.py --replay PATH/interactive.json --output PATH`.
+
+JSON reports include decisions, transcript, validation repairs, evaluation and
+token usage. Markdown reports show original/suggested answers as diffs. Outputs
+and checkpoints live in `logs/text-interview/`; incomplete runs or failed checks
+exit with status 1. The suite pins its criteria, while interactive mode generates
+a real plan. Test tracing is disabled; local reports contain the supplied text.
+The suite also checks that technical misconceptions receive a follow-up before
+moving on and that conceptual corrections are labeled as knowledge to practise.
+Reused transcripts retain the original interviewer behavior; run a fresh suite
+to verify changes to the interviewer prompt.
+This checks reasoning and feedback, not microphone behavior, voice latency or a
+statistically measured improvement in interview quality.
+
+New assessments show the original question and answer, a concrete alternative
+to practise, why it helps and any personal details still needed. Technical
+examples are identified as knowledge to learn; missing personal facts use
+placeholders. Answers that already meet their criterion need no rewrite, and
+unasked topics are not failures. Older assessments remain readable; **Request
+new assessment** creates the new format while preserving the earlier history.
 
 ## Deploy
 

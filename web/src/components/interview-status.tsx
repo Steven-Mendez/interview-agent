@@ -84,13 +84,21 @@ export function EvaluationSummary({
   className?: string
 }) {
   if (!evaluation) return null
-  const hasVerdict = evaluation.score != null && evaluation.hired !== null
+  const hasVerdict =
+    (!evaluation.assessment_scope ||
+      evaluation.assessment_scope === "interview") &&
+    evaluation.score != null &&
+    evaluation.hired !== null
   if (!hasVerdict) {
     return (
       <span className={cn("text-xs text-muted-foreground", className)}>
-        {evaluation.evaluation_status === "insufficient"
-          ? "Insufficient evidence"
-          : "Partial assessment"}
+        {evaluation.assessment_scope === "practice"
+          ? "Practice feedback"
+          : evaluation.assessment_scope === "limited"
+            ? "Limited role coverage"
+            : evaluation.evaluation_status === "insufficient"
+              ? "Insufficient evidence"
+              : "Partial assessment"}
       </span>
     )
   }

@@ -2,9 +2,44 @@
 import { cleanup, render, screen } from "@testing-library/react"
 import { afterEach, expect, it } from "vitest"
 import type { Evaluation } from "@/lib/api"
-import { CriterionFeedback, EvaluationOutcome } from "./evaluation-feedback"
+import {
+  AnswerComparisons,
+  CriterionFeedback,
+  EvaluationOutcome,
+} from "./evaluation-feedback"
 
 afterEach(cleanup)
+
+it.each(["practice", "limited"] as const)(
+  "shows %s scope without implying rejection",
+  (scope) => {
+    render(
+      <EvaluationOutcome
+        evaluation={{
+          ...evaluation,
+          assessment_scope: scope,
+          evaluation_status: scope === "practice" ? "complete" : "partial",
+          coverage: 1,
+          uncovered_requirements: ["Accessibility"],
+        }}
+        level="Junior"
+        duration="Up to 8 min"
+      />
+    )
+    expect(
+      screen.getByText(
+        scope === "practice" ? "Practice feedback" : "Limited role coverage"
+      )
+    ).toBeTruthy()
+    expect(screen.getByText("Accessibility")).toBeTruthy()
+    expect(
+      screen.getByText(/Missing coverage is not a demonstrated weakness/)
+    ).toBeTruthy()
+    expect(screen.queryByText("Not hired")).toBeNull()
+    expect(screen.queryByText("Hired")).toBeNull()
+    expect(screen.queryByText("Partial assessment")).toBeNull()
+  }
+)
 
 const evaluation: Evaluation = {
   score: null,
@@ -30,7 +65,7 @@ it("shows useful partial feedback without inventing a verdict or zero score", ()
   expect(screen.getByText("Partial assessment")).toBeTruthy()
   expect(screen.queryByText("Not hired")).toBeNull()
   expect(screen.queryByText("/100")).toBeNull()
-  expect(screen.getByText(/Criteria observed: 50%/)).toBeTruthy()
+  expect(screen.getByText(/Selected criteria observed: 50%/)).toBeTruthy()
 })
 
 it("explains insufficient evidence and shows candidate quotes with actionable practice", () => {
@@ -121,4 +156,79 @@ it("explains the points a complete score is missing", () => {
     />
   )
   expect(screen.getByText(/Why not higher: The Docker answer/)).toBeTruthy()
+})
+
+it("shows a grounded before/after comparison and the real details still needed", () => {
+  render(
+    <AnswerComparisons
+      evaluation={{
+        ...evaluation,
+        answer_revisions: [
+          {
+            milestone_id: "debug",
+            question_id: "41",
+            question: "What bug did you fix?",
+            original: {
+              message_id: "42",
+              message_version: 1,
+              quote: "I changed the code.",
+            },
+            suggested_answer:
+              "I fixed [your actual bug] by [the change you made].",
+            explanation:
+              "Specify the cause and the fix instead of only the activity.",
+            basis: "clarification",
+            missing_details: ["Identify the actual bug and your change."],
+          },
+        ],
+      }}
+    />
+  )
+  expect(
+    screen.getByRole("region", { name: "Improve your answers" })
+  ).toBeTruthy()
+  expect(screen.getByText("What bug did you fix?")).toBeTruthy()
+  expect(screen.getByText("You said")).toBeTruthy()
+  expect(screen.getByText("You could say")).toBeTruthy()
+  expect(screen.getByText("I changed the code.")).toBeTruthy()
+  expect(screen.getByText(/I fixed \[your actual bug\]/)).toBeTruthy()
+  expect(
+    screen.getByText("Identify the actual bug and your change.")
+  ).toBeTruthy()
+  expect(screen.getByText(/Candidate answer #42 · version 1/)).toBeTruthy()
+})
+
+it("labels missing knowledge as something to learn before using the example", () => {
+  render(
+    <AnswerComparisons
+      evaluation={{
+        ...evaluation,
+        answer_revisions: [
+          {
+            milestone_id: "sql",
+            question_id: "1",
+            question: "How does EXPLAIN help?",
+            original: { message_id: "2", quote: "EXPLAIN creates indexes." },
+            suggested_answer:
+              "EXPLAIN shows the execution plan; it does not create indexes.",
+            explanation: "Learn to read a plan before applying this approach.",
+            basis: "knowledge_example",
+            missing_details: [],
+          },
+        ],
+      }}
+    />
+  )
+  expect(screen.getByText(/Concept to learn and practise/)).toBeTruthy()
+  expect(screen.getByText("After practising, you could explain")).toBeTruthy()
+  expect(screen.queryByText("Add your real details")).toBeNull()
+})
+
+it("does not invent corrections for old evaluations or sufficient answers", () => {
+  const { rerender } = render(<AnswerComparisons evaluation={evaluation} />)
+  expect(screen.queryByRole("region")).toBeNull()
+  rerender(
+    <AnswerComparisons evaluation={{ ...evaluation, answer_revisions: [] }} />
+  )
+  expect(screen.queryByRole("region")).toBeNull()
 })

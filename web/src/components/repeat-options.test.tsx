@@ -6,6 +6,31 @@ import { RepeatOptions, repeatBody } from "./repeat-options"
 
 afterEach(cleanup)
 
+it("inherits practice preferences and sends an edited focus", () => {
+  const onRepeat = vi.fn()
+  const preferences = {
+    interview_type: "behavioral",
+    objective: "practice",
+    practice_focus: "Communication",
+  } as const
+  render(
+    <RepeatOptions
+      interview={{ interview_length: "short", preferences } as Interview}
+      pending={false}
+      onRepeat={onRepeat}
+    />
+  )
+  const focus = screen.getByLabelText("Practice focus (optional)")
+  expect(focus).toHaveProperty("value", "Communication")
+  fireEvent.change(focus, { target: { value: "Asking for help" } })
+  fireEvent.click(
+    screen.getByRole("button", { name: "Repeat with these settings" })
+  )
+  expect(onRepeat).toHaveBeenCalledWith({
+    preferences: { ...preferences, practice_focus: "Asking for help" },
+  })
+})
+
 it("sends only explicit changes so unchanged settings are inherited", () => {
   const source = { interview_length: "standard" } as const
   expect(repeatBody(source, "standard", "", "")).toEqual({})

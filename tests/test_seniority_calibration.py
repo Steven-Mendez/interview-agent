@@ -85,8 +85,10 @@ def test_followup_budget_takes_the_stricter_axis():
     # conversation into a senior one.
     assert followup_budget(Seniority.JUNIOR, InterviewLength.DEEP) == 1
     assert followup_budget(Seniority.TRAINEE, InterviewLength.DEEP) == 0
-    # A short senior screen stays short.
-    assert followup_budget(Seniority.SENIOR, InterviewLength.SHORT) == 0
+    # Short screens allow one probe, still bounded by seniority.
+    assert followup_budget(Seniority.SENIOR, InterviewLength.SHORT) == 1
+    assert followup_budget(Seniority.JUNIOR, InterviewLength.SHORT) == 1
+    assert followup_budget(Seniority.TRAINEE, InterviewLength.SHORT) == 0
     assert followup_budget(Seniority.SENIOR, InterviewLength.DEEP) == 2
 
 

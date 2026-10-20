@@ -6,7 +6,11 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Disclosure } from "@/components/ui/disclosure"
 import { Spinner } from "@/components/ui/spinner"
-import { CriterionFeedback, EvaluationOutcome } from "./evaluation-feedback"
+import {
+  AnswerComparisons,
+  CriterionFeedback,
+  EvaluationOutcome,
+} from "./evaluation-feedback"
 
 type History = Awaited<ReturnType<typeof getEvaluationHistory>>
 type Attempt = History["attempts"][number]
@@ -146,6 +150,7 @@ function HistoricalAttempt({
           />
           <p className="whitespace-pre-wrap">{result.rationale}</p>
           <CriterionFeedback evaluation={result} milestones={milestones} />
+          <AnswerComparisons evaluation={result} />
           <FeedbackList title="Strengths" items={result.strengths} />
           <FeedbackList title="Areas to practise" items={result.weaknesses} />
           <FeedbackList

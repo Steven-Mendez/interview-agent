@@ -210,6 +210,8 @@ class EvaluationRunner:
                     "essential": m.essential,
                     "lifecycle": m.lifecycle,
                     "close_reason": m.close_reason,
+                    "competency": m.competency,
+                    "planning_context": m.planning_context,
                 }
                 for m in milestones
             ]
@@ -293,6 +295,7 @@ class EvaluationRunner:
                 milestones=criteria,
                 records=records,
                 transcript_complete=transcript_complete,
+                plan=plan,
             )
             values = {
                 "hired": result.hired,

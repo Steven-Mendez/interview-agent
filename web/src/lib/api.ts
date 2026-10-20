@@ -36,6 +36,17 @@ export type InterviewStatus =
 export type Seniority = "trainee" | "junior" | "mid" | "senior" | "lead"
 /** Volume axis: milestone count and minutes. Independent of the level. */
 export type InterviewLength = "short" | "standard" | "deep"
+export interface InterviewPreferences {
+  interview_type: "technical" | "behavioral" | "mixed"
+  objective: "simulation" | "practice"
+  practice_focus: string
+}
+export const DEFAULT_PREFERENCES: InterviewPreferences = {
+  interview_type: "technical",
+  objective: "simulation",
+  practice_focus: "",
+}
+export type AssessmentScope = "interview" | "practice" | "limited"
 /** How the pinned level was arrived at. */
 export type SenioritySource = "explicit" | "detected" | "fallback"
 
@@ -89,6 +100,10 @@ export interface Milestone {
   primary_questions?: number
   followups?: number
   clarifications?: number
+  planning_context?: {
+    requirement_id: string | null
+    resume_quotes: string[]
+  } | null
 }
 
 export type Assessment =
@@ -107,6 +122,17 @@ export interface CriterionEvaluation {
   practice: string
 }
 
+export interface AnswerRevision {
+  milestone_id: string
+  question_id: string
+  question: string
+  original: EvidenceRef
+  suggested_answer: string
+  explanation: string
+  basis: "clarification" | "knowledge_example"
+  missing_details: string[]
+}
+
 export interface Evaluation {
   hired: boolean | null
   score: number | null
@@ -122,8 +148,11 @@ export interface Evaluation {
   ended_by: string
   /** Complete, partial or insufficient evidence for a verdict. */
   evaluation_status: EvaluationStatus
+  assessment_scope?: AssessmentScope
+  uncovered_requirements?: string[]
   coverage?: number
   criteria?: CriterionEvaluation[]
+  answer_revisions?: AnswerRevision[]
   findings?: {
     kind: "strength" | "weakness"
     text: string
@@ -157,6 +186,7 @@ export interface Interview {
   /** Root of the re-run chain; null on a first attempt. */
   repeat_of_id: string | null
   plan: Record<string, unknown> | null
+  preferences?: InterviewPreferences
   seniority: Seniority
   seniority_source: SenioritySource
   /** Why the planner classified it this way; null when the user picked it. */
@@ -216,6 +246,7 @@ export interface InterviewSummary {
     hired: boolean | null
     score: number | null
     evaluation_status?: EvaluationStatus
+    assessment_scope?: AssessmentScope
   } | null
 }
 
@@ -252,6 +283,7 @@ export interface TranscriptResponse {
 /** Level and length inherit. Limits inherit for the same length, or are
  *  recalculated for a changed profile before applying explicit overrides. */
 export interface RepeatRequest {
+  preferences?: InterviewPreferences
   seniority?: string
   interview_length?: string
   question_limit?: number

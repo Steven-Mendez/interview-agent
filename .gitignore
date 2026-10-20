@@ -48,6 +48,7 @@ Thumbs.db
 
 # Logs
 *.log
+logs/text-interview/
 
 # Audio / voice agent artifacts
 *.wav

@@ -105,6 +105,8 @@ async def test_v2_upgrade_preserves_legacy_data_and_blocks_destructive_downgrade
                 row = await db.get_conversation(session, conversation_id)
                 assert row.evaluation.score == 82 and row.evaluation.hired is True
                 assert row.run_config is None and row.evaluation.result is None
+                assert row.interview_preferences is None
+                assert row.milestones[0].planning_context is None
                 assert row.stt_drain is None
                 assert row.state_revision == 0
                 assert row.worker_epoch == 0 and row.worker_owner_id is None
@@ -235,8 +237,45 @@ async def test_v2_upgrade_preserves_legacy_data_and_blocks_destructive_downgrade
         await assert_manifest_schema(engine, alembic)
         await assert_profiles_schema(engine, alembic)
         await assert_accounts_schema(engine, alembic)
+        await assert_planning_schema(engine, alembic)
     finally:
         await engine.dispose()
+
+
+async def assert_planning_schema(engine, alembic):
+    code, output = await alembic("upgrade", "head")
+    assert code == 0, output
+    conversation_id = uuid.uuid4()
+    async with engine.begin() as connection:
+        # Account-deletion migration checks may have removed the earlier topics.
+        await connection.execute(
+            text(
+                "INSERT INTO conversations (id,status,job_offer,resume_markdown) "
+                "VALUES (:id,'planned','Synthetic role','Synthetic CV')"
+            ),
+            {"id": conversation_id},
+        )
+        await connection.execute(
+            text(
+                "INSERT INTO milestones (id,conversation_id,position,title,description,completed) "
+                "VALUES (:id,:conversation,0,'SQL','Describe an index',false)"
+            ),
+            {"id": uuid.uuid4(), "conversation": conversation_id},
+        )
+        await connection.execute(text("UPDATE conversations SET interview_preferences='{}'::jsonb"))
+    code, output = await alembic("downgrade", "9c3d5e7f1a20")
+    assert code != 0 and "destroy interview preferences" in output
+    async with engine.begin() as connection:
+        await connection.execute(text("UPDATE conversations SET interview_preferences=NULL"))
+        await connection.execute(text("UPDATE milestones SET planning_context='{}'::jsonb"))
+    code, output = await alembic("downgrade", "9c3d5e7f1a20")
+    assert code != 0 and "planning provenance" in output
+    async with engine.begin() as connection:
+        await connection.execute(text("UPDATE milestones SET planning_context=NULL"))
+    code, output = await alembic("downgrade", "9c3d5e7f1a20")
+    assert code == 0, output
+    code, output = await alembic("upgrade", "head")
+    assert code == 0, output
 
 
 async def assert_capture_schema(engine, alembic, conversation_id, milestone_id, execution_id):

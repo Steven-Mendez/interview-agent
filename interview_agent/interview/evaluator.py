@@ -21,6 +21,7 @@ from interview_agent.interview.evaluation_contract import (
     validate_evaluation,
 )
 from interview_agent.interview.models import EvaluationResult, Seniority
+from interview_agent.interview.planning_contract import evaluation_scope
 from interview_agent.llm import build_chat_model, close_chat_model
 from interview_agent.observability import traced_inputs
 from interview_agent.prompts import build_evaluator_prompt
@@ -53,7 +54,7 @@ async def run_evaluator(
         {**m, "id": str(m.get("id", f"milestone-{i + 1}"))} for i, m in enumerate(milestones)
     ]
     if not any(m["role"] == "user" and m["content"].strip() for m in records):
-        return insufficient_evaluation(level, milestones, language)
+        return insufficient_evaluation(level, milestones, language, plan)
     model = build_chat_model(
         settings,
         model=settings.evaluator_model,
@@ -115,7 +116,55 @@ async def run_evaluator(
     metrics, trade-offs or depth unless the supplied criterion explicitly needs
     them at the pinned level. This evidence contract overrides conflicting older
     scoring instructions. Lifecycle closure and interviewer notes give no credit.
+
+    ## Show the candidate how to answer better
+    For EVERY criterion assessed partial or below, include at least one answer_revisions
+    item. Select an exact candidate quote (a bounded excerpt is allowed), its supplied
+    message_id and message_version, and the question_id of the assistant question
+    immediately before that candidate answer. The original answer must also be cited
+    in that criterion's evidence. Give a concise, speakable suggested_answer and a
+    specific explanation of what changed and why it satisfies the actual junior/mid/etc.
+    criterion. Keep it at the pinned level; do not write an ideal senior answer.
+    Use basis=clarification to reorganize or make explicit facts already supplied
+    in the transcript or resume. A resume claim is context for coaching, never proof
+    of interview performance. Preserve the candidate's actual ownership and uncertainty.
+    Never invent work experience, tools used, metrics, achievements, responsibilities,
+    outcomes, or personal anecdotes. If a personal example is incomplete, use clearly
+    marked [placeholders] and list the concrete facts to supply in missing_details.
+    Use basis=knowledge_example for a conceptual correction or a missing technical
+    concept: explain an approach with conditional language ('I would ...'), never claim
+    the candidate has already done it. Explain that it needs understanding and practice,
+    rather than just polished wording. If they said 'I don't know', preserve honesty;
+    do not rewrite it as a claim of experience. Generic technical examples can teach
+    knowledge; personal facts must be sourced or explicit placeholders.
+    Choose the basis from the gap being corrected, not from where an example
+    comes from. Correcting a false technical claim ALWAYS needs knowledge_example,
+    even when the resume supplies a related project. Explain the misconception
+    and the correct reasoning explicitly; do not disguise a conceptual correction
+    as clarification by replacing the answer with a better resume claim. When
+    the question requests past experience, keep a technical example hypothetical
+    and identify any real incident details still needed. The candidate's explicit
+    account of ownership or uncertainty takes precedence over a broader resume claim.
+    Do NOT rewrite criteria assessed meets, exceeds or not_assessable. A short correct
+    answer needs no correction; unasked questions are not failures. Preserve what
+    the candidate got right. All coaching text, including placeholders, must use
+    the authoritative interview language. Revisions are hypothetical practice,
+    not new evidence; they MUST NOT change the evaluation of the original answers.
     """
+        scope, uncovered = evaluation_scope(plan)
+        system += f"""\nAUTHORITATIVE assessment_scope: {scope}.
+Copy uncovered_requirements exactly: {json.dumps(uncovered, ensure_ascii=False)}.
+These are essential role requirements omitted from the plan, not candidate weaknesses.
+If scope is practice: evaluate the selected skills, keep score and hired null even
+when evaluation_status is complete. Do not draw an overall hiring conclusion.
+Practice is complete only if every selected skill has evidence; otherwise partial
+(or insufficient if none was observed), even for skills nonessential to the job.
+If scope is limited: use partial (or insufficient if nothing was observed), with
+score and hired null. Completing selected topics does not establish role coverage.
+Only scope=interview with complete evidence permits an overall score/verdict.
+Accept alternative valid solutions satisfying the criterion's outcomes, not only
+the implementation suggested by a CV or example question.
+"""
         if not transcript_complete:
             system += (
                 "\nThe transcript's final turn integrity is unverified. "
@@ -137,6 +186,8 @@ async def run_evaluator(
                     milestones=milestones,
                     records=records,
                     transcript_complete=transcript_complete,
+                    require_answer_revisions=True,
+                    plan=plan,
                 )
             except ValueError as exc:
                 if attempt:

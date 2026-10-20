@@ -15,6 +15,7 @@ import {
 import { MascotHead } from "@/components/mascot"
 import { AssessmentRequest } from "@/components/assessment-request"
 import {
+  AnswerComparisons,
   CriterionFeedback,
   EvaluationOutcome,
 } from "@/components/evaluation-feedback"
@@ -288,6 +289,8 @@ function EvaluatedOverview({
           interview.evaluation_invalidated
         }
       />
+
+      <AnswerComparisons evaluation={ev} />
 
       <div className="grid gap-8 @3xl/main:grid-cols-2">
         <FeedbackList

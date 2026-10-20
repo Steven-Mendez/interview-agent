@@ -46,11 +46,7 @@ function mount() {
   })
   render(
     <QueryClientProvider client={client}>
-      <EvaluationHistory
-        interviewId="interview"
-        milestones={[]}
-        duration="Up to 8 min"
-      />
+      <EvaluationHistory interviewId="interview" milestones={[]} />
     </QueryClientProvider>
   )
   const details = screen.getByText("Evaluation history")

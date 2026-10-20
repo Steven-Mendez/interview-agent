@@ -6,7 +6,12 @@ import { afterEach, expect, it, vi } from "vitest"
 import type * as Router from "@tanstack/react-router"
 import type * as Auth from "@/lib/auth"
 import type * as Api from "@/lib/api"
-import { getInterview, getEvaluationHistory, getSealHistory } from "@/lib/api"
+import {
+  getInterview,
+  getEvaluationHistory,
+  getSealHistory,
+  getTranscript,
+} from "@/lib/api"
 import type { Interview } from "@/lib/api"
 import { interviewQueryOptions } from "@/lib/queries"
 import { Route } from "@/routes/interviews.$interviewId"
@@ -37,6 +42,7 @@ vi.mock("@/lib/api", async (original) => ({
   getInterview: vi.fn(),
   getEvaluationHistory: vi.fn(),
   getSealHistory: vi.fn(),
+  getTranscript: vi.fn(),
   getMe: vi.fn(() =>
     Promise.resolve({
       id: "user",
@@ -133,7 +139,11 @@ it.each(["evaluating", "evaluation_failed"] as const)(
     expect(screen.getByRole("status").textContent).toContain(
       "earlier saved assessment"
     )
-    expect(screen.getByText("Evaluation history")).toBeTruthy()
+    fireEvent.click(screen.getByRole("button", { name: "More actions" }))
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Evaluation details" })
+    )
+    expect(await screen.findByText("Evaluation history")).toBeTruthy()
     client.clear()
   }
 )
@@ -172,12 +182,19 @@ it("offers saved versions and failed-attempt history even if no assessment ever 
     status: "evaluation_failed",
     evaluation: null,
   })
+  fireEvent.click(screen.getByRole("button", { name: "More actions" }))
+  fireEvent.click(
+    await screen.findByRole("menuitem", { name: "Evaluation details" })
+  )
   const details = (await screen.findByText("Evaluation history"))
     .parentElement as HTMLDetailsElement
   details.open = true
   fireEvent(details, new Event("toggle"))
   await screen.findByText("This attempt could not produce a valid assessment.")
   expect(screen.queryByText("private failure details")).toBeNull()
-  expect(screen.getByText("Review saved answers")).toBeTruthy()
+  fireEvent.click(screen.getByRole("button", { name: "Close" }))
+  vi.mocked(getTranscript).mockResolvedValue({ messages: [] })
+  fireEvent.click(screen.getByRole("tab", { name: "Transcript" }))
+  expect(await screen.findByText("Review saved answers")).toBeTruthy()
   client.clear()
 })

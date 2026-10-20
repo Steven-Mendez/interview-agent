@@ -123,7 +123,9 @@ export function TranscriptView({
                     {m.content}
                   </p>
                   <div className="flex flex-wrap gap-x-3 text-xs text-muted-foreground empty:hidden">
-                    {m.version != null && <span>Version {m.version}</span>}
+                    {m.version != null && m.version > 1 && (
+                      <span>Version {m.version}</span>
+                    )}
                     {isUser &&
                       m.metrics &&
                       m.metrics.stt_confirmed !== true && (

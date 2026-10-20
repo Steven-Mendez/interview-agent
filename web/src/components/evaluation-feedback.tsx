@@ -7,7 +7,6 @@ import type {
   Evaluation,
   Milestone,
 } from "@/lib/api"
-import { MascotAvatar } from "@/components/mascot"
 import { Badge } from "@/components/ui/badge"
 import { TopicMarker, topicLabel } from "@/components/interview-progress"
 import { cn } from "@/lib/utils"
@@ -85,14 +84,10 @@ function ScoreRing({ score, hired }: { score: number; hired: boolean }) {
 
 export function EvaluationOutcome({
   evaluation,
-  level,
-  duration,
   transcriptPartial = false,
   captureIntegrityPending = false,
 }: {
   evaluation: Evaluation
-  level: string
-  duration: string
   transcriptPartial?: boolean
   captureIntegrityPending?: boolean
 }) {
@@ -135,11 +130,6 @@ export function EvaluationOutcome({
                 Interview simulation
               </span>
             </p>
-            {evaluation.score_gap && (
-              <p className="text-sm leading-relaxed">
-                Why not higher: {evaluation.score_gap}
-              </p>
-            )}
           </>
         ) : (
           <p className="text-sm leading-relaxed">
@@ -155,9 +145,8 @@ export function EvaluationOutcome({
             No overall score or hiring verdict is available.
           </p>
         )}
-        <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          <MascotAvatar size={18} tone="plain" />
-          Evaluated by Interviewer Agent · as {level} · {duration}
+        <p className="text-sm leading-relaxed whitespace-pre-wrap">
+          {evaluation.rationale}
         </p>
         {!!evaluation.uncovered_requirements?.length && (
           <div className="text-sm text-muted-foreground">
@@ -170,7 +159,7 @@ export function EvaluationOutcome({
             <p>Missing coverage is not a demonstrated weakness.</p>
           </div>
         )}
-        {evaluation.coverage !== undefined && (
+        {evaluation.coverage !== undefined && evaluation.coverage < 1 && (
           <p className="text-xs text-muted-foreground">
             Selected criteria observed: {Math.round(evaluation.coverage * 100)}
             %. Coverage measures what was assessed, not ability.
@@ -180,7 +169,7 @@ export function EvaluationOutcome({
           <p role="alert" className="text-sm text-destructive">
             This result cannot show an overall score because its saved answers
             have pending review or a confirmed omission. Review the saved
-            answers to see the recording history.
+            answers in the Transcript tab to see the recording history.
           </p>
         )}
         {transcriptPartial && (
@@ -206,10 +195,6 @@ function CriterionBody({ criterion }: { criterion: CriterionEvaluation }) {
           className="border-l-[3px] border-primary/60 pl-3 text-sm"
         >
           <p className="whitespace-pre-wrap">“{ref.quote}”</p>
-          <footer className="mt-1 text-xs text-muted-foreground">
-            Candidate answer #{ref.message_id}
-            {ref.message_version != null && ` · version ${ref.message_version}`}
-          </footer>
         </blockquote>
       ))}
       {criterion.practice && (
@@ -237,14 +222,6 @@ function AnswerComparison({ revision }: { revision: AnswerRevision }) {
             {revision.question}
           </p>
         )}
-        <p className="text-xs text-muted-foreground">
-          {revision.basis === "knowledge_example"
-            ? "Concept to learn and practise"
-            : "Make your explanation clearer"}
-          {" · "}Candidate answer #{revision.original.message_id}
-          {revision.original.message_version != null &&
-            ` · version ${revision.original.message_version}`}
-        </p>
       </div>
       <div className="border-y" aria-label="Answer comparison">
         <div className="flex gap-3 bg-destructive/8 px-4 py-3">
@@ -276,24 +253,30 @@ function AnswerComparison({ revision }: { revision: AnswerRevision }) {
           </div>
         </div>
       </div>
-      <div className="flex flex-col gap-3 px-4 py-4 text-sm">
-        <div>
-          <p className="mb-1 font-medium">Why this helps</p>
+      <details className="group/explanation px-4 py-3 text-sm">
+        <summary className="flex cursor-pointer list-none items-center justify-between gap-2 font-medium [&::-webkit-details-marker]:hidden">
+          Why this helps
+          <ChevronDownIcon
+            aria-hidden
+            className="size-4 shrink-0 text-muted-foreground transition-transform group-open/explanation:rotate-180"
+          />
+        </summary>
+        <div className="flex flex-col gap-3 pt-3">
           <p className="leading-relaxed whitespace-pre-wrap">
             {revision.explanation}
           </p>
+          {revision.missing_details.length > 0 && (
+            <div className="rounded-lg bg-muted p-3">
+              <p className="mb-2 font-medium">Add your real details</p>
+              <ul className="list-disc space-y-1 pl-4">
+                {revision.missing_details.map((detail, index) => (
+                  <li key={index}>{detail}</li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
-        {revision.missing_details.length > 0 && (
-          <div className="rounded-lg bg-muted p-3">
-            <p className="mb-2 font-medium">Add your real details</p>
-            <ul className="list-disc space-y-1 pl-4">
-              {revision.missing_details.map((detail, index) => (
-                <li key={index}>{detail}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </div>
+      </details>
     </article>
   )
 }
@@ -303,20 +286,15 @@ export function AnswerComparisons({ evaluation }: { evaluation: Evaluation }) {
   if (!revisions.length) return null
   return (
     <section aria-label="Improve your answers" className="flex flex-col gap-4">
-      <div className="flex flex-col gap-1.5">
-        <h2 className="text-title">Improve your answers</h2>
-        <p className="max-w-3xl text-sm leading-relaxed text-muted-foreground">
-          Compare your words with an example to practise. Keep the parts that
-          are true for you and fill in any missing details with your own
-          experience.
-        </p>
+      <h2 className="text-title">Improve your answers</h2>
+      <div className="grid items-start gap-4 @4xl/main:grid-cols-2">
+        {revisions.map((revision) => (
+          <AnswerComparison
+            key={`${revision.milestone_id}-${revision.original.message_id}`}
+            revision={revision}
+          />
+        ))}
       </div>
-      {revisions.map((revision) => (
-        <AnswerComparison
-          key={`${revision.milestone_id}-${revision.original.message_id}`}
-          revision={revision}
-        />
-      ))}
     </section>
   )
 }
@@ -375,7 +353,7 @@ export function CriterionFeedback({
         {rows.map(({ key, milestone, index, criterion }) => {
           const heading = (
             <>
-              {milestone ? (
+              {milestone && !criterion ? (
                 <TopicMarker milestone={milestone} index={index} />
               ) : (
                 <span className="flex size-6 shrink-0 items-center justify-center rounded-full border text-xs text-muted-foreground tabular-nums">
@@ -386,7 +364,7 @@ export function CriterionFeedback({
                 <span className="text-sm font-medium">
                   {milestone?.title ?? "Criterion"}
                 </span>
-                {milestone && (
+                {milestone && !criterion && (
                   <span className="text-xs text-muted-foreground">
                     {topicLabel(milestone)}
                     {milestone.competency && ` · ${milestone.competency}`}
@@ -394,7 +372,10 @@ export function CriterionFeedback({
                 )}
               </span>
               {criterion && (
-                <Badge variant={ASSESSMENT_TONES[criterion.assessment]}>
+                <Badge
+                  variant={ASSESSMENT_TONES[criterion.assessment]}
+                  className="h-auto min-h-6 max-w-32 shrink-0 py-0.5 text-center whitespace-normal sm:max-w-none"
+                >
                   {ASSESSMENT_LABELS[criterion.assessment]}
                 </Badge>
               )}

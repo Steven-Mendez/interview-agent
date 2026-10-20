@@ -7,12 +7,12 @@ import {
   ClockIcon,
   EllipsisVerticalIcon,
   GaugeIcon,
+  HistoryIcon,
   RotateCcwIcon,
   SlidersHorizontalIcon,
   XCircleIcon,
 } from "lucide-react"
 
-import { MascotHead } from "@/components/mascot"
 import { AssessmentRequest } from "@/components/assessment-request"
 import {
   AnswerComparisons,
@@ -21,14 +21,19 @@ import {
 } from "@/components/evaluation-feedback"
 import { EvaluationHistory } from "@/components/evaluation-history"
 import { InterviewEnding } from "@/components/interview-ending"
-import { isSettled } from "@/components/interview-progress"
-import { InterviewStatusChip } from "@/components/interview-status"
 import { RepeatOptionsDialog } from "@/components/repeat-options"
 import { TranscriptView } from "@/components/results/transcript-view"
 import { TranscriptReview } from "@/components/transcript-review"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogTitle,
+  DialogFooter,
+} from "@/components/ui/dialog"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -75,6 +80,7 @@ export function ResultsPage({
   // An exhausted guest cannot repeat: the reason shows instead of a 429.
   const quotaBlocked = quotaBlock(me.data)
   const [repeatOpen, setRepeatOpen] = React.useState(false)
+  const [detailsOpen, setDetailsOpen] = React.useState(false)
   const agentName = interview.interviewer?.agent_name || "Interviewer"
   const milestones = interview.milestones
   const duration = durationLabel(
@@ -97,14 +103,8 @@ export function ResultsPage({
 
         <header className="flex flex-col gap-4 @3xl/main:flex-row @3xl/main:items-start @3xl/main:justify-between">
           <div className="flex min-w-0 flex-col gap-3">
-            <p className="text-overline text-muted-foreground uppercase">
-              Interview results
-            </p>
             <h1 className="text-headline line-clamp-2">{interview.title}</h1>
             <ul className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-muted-foreground">
-              <li>
-                <InterviewStatusChip row={interview} />
-              </li>
               <li className="flex items-center gap-1.5">
                 <CalendarIcon aria-hidden className="size-4" />
                 <time dateTime={interview.created_at}>
@@ -119,12 +119,6 @@ export function ResultsPage({
                 <ClockIcon aria-hidden className="size-4" />
                 {duration}
               </li>
-              {interview.interviewer?.agent_name && (
-                <li className="flex items-center gap-1.5">
-                  <MascotHead className="size-4" />
-                  {interview.interviewer.agent_name}
-                </li>
-              )}
               {interview.repeat_of_id && (
                 <li>
                   <Badge variant="outline">
@@ -175,6 +169,10 @@ export function ResultsPage({
                   <SlidersHorizontalIcon />
                   Repeat with changes…
                 </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setDetailsOpen(true)}>
+                  <HistoryIcon />
+                  Evaluation details
+                </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
@@ -196,25 +194,14 @@ export function ResultsPage({
         <Tabs defaultValue="overview">
           <TabsList>
             <TabsTrigger value="overview">Overview</TabsTrigger>
-            <TabsTrigger value="topics">
-              Topics
-              {milestones.length > 0 && (
-                <span className="text-xs text-muted-foreground tabular-nums">
-                  {milestones.filter(isSettled).length}/{milestones.length}
-                </span>
-              )}
-            </TabsTrigger>
+            <TabsTrigger value="topics">Topics</TabsTrigger>
             <TabsTrigger value="transcript">Transcript</TabsTrigger>
           </TabsList>
           <TabsContent value="overview" className="pt-2">
             {interview.evaluation ? (
-              <EvaluatedOverview interview={interview} duration={duration} />
+              <EvaluatedOverview interview={interview} />
             ) : (
-              <PendingOverview
-                interview={interview}
-                endedAt={endedAt}
-                duration={duration}
-              />
+              <PendingOverview interview={interview} endedAt={endedAt} />
             )}
           </TabsContent>
           <TabsContent value="topics" className="pt-2">
@@ -224,30 +211,65 @@ export function ResultsPage({
                 This interview has no planned topics.
               </p>
             ) : (
-              <div className="flex flex-col gap-3">
-                <p className="text-sm text-muted-foreground">
-                  {interview.evaluation?.criteria?.length
-                    ? "Open a topic to see the evidence quoted from your answers and what to practise next."
-                    : "How far each planned topic got."}
-                </p>
-                <CriterionFeedback
-                  evaluation={interview.evaluation}
-                  milestones={milestones}
-                  allTopics
-                  title={null}
-                />
-              </div>
+              <CriterionFeedback
+                evaluation={interview.evaluation}
+                milestones={milestones}
+                allTopics
+                title={null}
+              />
             )}
           </TabsContent>
           <TabsContent value="transcript" className="pt-2">
-            <PageContainer variant="reading" className="mx-0">
+            <PageContainer
+              variant="reading"
+              className="mx-0 flex flex-col gap-6"
+            >
+              {(interview.capture_integrity_pending ||
+                interview.evaluation_invalidated) && (
+                <TranscriptReview interviewId={interview.id} />
+              )}
               <TranscriptView
                 interviewId={interview.id}
                 agentName={agentName}
               />
+              {!interview.capture_integrity_pending &&
+                !interview.evaluation_invalidated && (
+                  <TranscriptReview interviewId={interview.id} />
+                )}
             </PageContainer>
           </TabsContent>
         </Tabs>
+
+        <Dialog open={detailsOpen} onOpenChange={setDetailsOpen}>
+          <DialogContent className="[--dialog-width:48rem]">
+            <DialogTitle>Evaluation details</DialogTitle>
+            {interview.evaluation?.score_gap && (
+              <Section title="About the score">
+                <p className="text-sm leading-relaxed whitespace-pre-wrap">
+                  {interview.evaluation.score_gap}
+                </p>
+              </Section>
+            )}
+            <FeedbackList
+              title="Not counted against you at this level"
+              items={interview.evaluation?.calibration_notes ?? []}
+              icon={GaugeIcon}
+              iconClassName="text-muted-foreground"
+            />
+            {interview.evaluation && (
+              <AssessmentRequest interview={interview} />
+            )}
+            <EvaluationHistory
+              interviewId={interview.id}
+              milestones={milestones}
+            />
+            <DialogFooter>
+              <DialogClose render={<Button variant="quiet" />}>
+                Close
+              </DialogClose>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
         <RepeatOptionsDialog
           open={repeatOpen}
@@ -261,16 +283,9 @@ export function ResultsPage({
   )
 }
 
-function EvaluatedOverview({
-  interview,
-  duration,
-}: {
-  interview: Interview
-  duration: string
-}) {
+function EvaluatedOverview({ interview }: { interview: Interview }) {
   const ev = interview.evaluation!
-  // The earlier-assessment notice belongs at the top; the plain "request a
-  // new assessment" action is a record-keeping task and sits with the rest.
+  // Keep recovery visible when a replacement assessment needs attention.
   const assessmentOnTop =
     interview.evaluation_is_previous ||
     interview.status === "evaluating" ||
@@ -281,8 +296,6 @@ function EvaluatedOverview({
       <InterviewEnding interview={interview} />
       <EvaluationOutcome
         evaluation={ev}
-        level={SENIORITY_LABELS[interview.seniority]}
-        duration={duration}
         transcriptPartial={interview.transcript_integrity === "partial"}
         captureIntegrityPending={
           interview.capture_integrity_pending ||
@@ -292,46 +305,23 @@ function EvaluatedOverview({
 
       <AnswerComparisons evaluation={ev} />
 
-      <div className="grid gap-(--page-gap) @3xl/main:grid-cols-2">
-        <FeedbackList
-          title="Strengths"
-          items={ev.strengths}
-          icon={CheckCircle2Icon}
-          iconClassName="text-success"
-          empty="No strengths noted."
-        />
-        <FeedbackList
-          title="Areas of concern"
-          items={ev.weaknesses}
-          icon={XCircleIcon}
-          iconClassName="text-destructive"
-          empty="No weaknesses noted."
-        />
-      </div>
-
-      <Section title="Evaluator rationale">
-        <p className="max-w-3xl text-sm leading-relaxed whitespace-pre-wrap">
-          {ev.rationale}
-        </p>
-      </Section>
-
-      {/* What the evaluator deliberately did NOT hold against the candidate
-          because it sits above the role's level. Empty is the normal case —
-          a non-empty list is the audit trail proving the calibration filter
-          actually fired. */}
-      {ev.calibration_notes.length > 0 && (
-        <FeedbackList
-          title="Not counted against you at this level"
-          items={ev.calibration_notes}
-          icon={GaugeIcon}
-          iconClassName="text-muted-foreground"
-          empty=""
-        />
+      {/* Older assessments have no topic evidence or answer comparisons. */}
+      {!ev.criteria?.length && !ev.answer_revisions?.length && (
+        <div className="grid gap-(--page-gap) @3xl/main:grid-cols-2">
+          <FeedbackList
+            title="Strengths"
+            items={ev.strengths}
+            icon={CheckCircle2Icon}
+            iconClassName="text-success"
+          />
+          <FeedbackList
+            title="Areas of concern"
+            items={ev.weaknesses}
+            icon={XCircleIcon}
+            iconClassName="text-destructive"
+          />
+        </div>
       )}
-
-      <Records interview={interview} duration={duration}>
-        {!assessmentOnTop && <AssessmentRequest interview={interview} />}
-      </Records>
     </div>
   )
 }
@@ -339,11 +329,9 @@ function EvaluatedOverview({
 function PendingOverview({
   interview,
   endedAt,
-  duration,
 }: {
   interview: Interview
   endedAt: number | null
-  duration: string
 }) {
   const { showRetry, action, problem, retry } = useEvaluationWait(
     interview,
@@ -392,37 +380,7 @@ function PendingOverview({
         )}
       </section>
       <InterviewEnding interview={interview} />
-      <Records interview={interview} duration={duration} />
     </div>
-  )
-}
-
-/** Assessment history, saved-answer review and external traces: the
- *  record-keeping side of a result, folded away. */
-function Records({
-  interview,
-  duration,
-  children,
-}: {
-  interview: Interview
-  duration: string
-  children?: React.ReactNode
-}) {
-  return (
-    <Section
-      title="Records"
-      description="Earlier assessments and saved answer versions."
-    >
-      <div className="flex flex-col gap-3">
-        {children}
-        <EvaluationHistory
-          interviewId={interview.id}
-          milestones={interview.milestones}
-          duration={duration}
-        />
-        <TranscriptReview interviewId={interview.id} />
-      </div>
-    </Section>
   )
 }
 
@@ -431,43 +389,29 @@ function FeedbackList({
   items,
   icon: Icon,
   iconClassName,
-  empty,
 }: {
   title: string
   items: string[]
   icon: React.ComponentType<{ className?: string }>
   iconClassName?: string
-  empty: string
 }) {
+  if (!items.length) return null
   return (
-    <Section
-      title={
-        <span className="flex items-center gap-2">
-          {title}
-          <span className="text-sm font-normal text-muted-foreground tabular-nums">
-            {items.length}
-          </span>
-        </span>
-      }
-    >
-      {items.length === 0 ? (
-        <p className="text-sm text-muted-foreground">{empty}</p>
-      ) : (
-        <ul className="flex flex-col gap-3">
-          {items.map((item, i) => (
-            <li
-              key={i}
-              className="flex items-start gap-3 text-sm leading-relaxed"
-            >
-              <Icon
-                aria-hidden
-                className={cn("mt-0.5 size-[18px] shrink-0", iconClassName)}
-              />
-              <span>{item}</span>
-            </li>
-          ))}
-        </ul>
-      )}
+    <Section title={title}>
+      <ul className="flex flex-col gap-3">
+        {items.map((item, i) => (
+          <li
+            key={i}
+            className="flex items-start gap-3 text-sm leading-relaxed"
+          >
+            <Icon
+              aria-hidden
+              className={cn("mt-0.5 size-[18px] shrink-0", iconClassName)}
+            />
+            <span>{item}</span>
+          </li>
+        ))}
+      </ul>
     </Section>
   )
 }

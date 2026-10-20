@@ -22,8 +22,6 @@ it.each(["practice", "limited"] as const)(
           coverage: 1,
           uncovered_requirements: ["Accessibility"],
         }}
-        level="Junior"
-        duration="Up to 8 min"
       />
     )
     expect(
@@ -55,13 +53,7 @@ const evaluation: Evaluation = {
 }
 
 it("shows useful partial feedback without inventing a verdict or zero score", () => {
-  render(
-    <EvaluationOutcome
-      evaluation={evaluation}
-      level="Junior"
-      duration="Up to 8 min"
-    />
-  )
+  render(<EvaluationOutcome evaluation={evaluation} />)
   expect(screen.getByText("Partial assessment")).toBeTruthy()
   expect(screen.queryByText("Not hired")).toBeNull()
   expect(screen.queryByText("/100")).toBeNull()
@@ -86,17 +78,12 @@ it("explains insufficient evidence and shows candidate quotes with actionable pr
   }
   render(
     <>
-      <EvaluationOutcome
-        evaluation={ev}
-        level="Junior"
-        duration="Up to 8 min"
-      />
+      <EvaluationOutcome evaluation={ev} />
       <CriterionFeedback evaluation={ev} milestones={[]} />
     </>
   )
   expect(screen.getByText("Insufficient evidence")).toBeTruthy()
   expect(screen.getByText(/I do not know how the index works/)).toBeTruthy()
-  expect(screen.getByText("Candidate answer #42")).toBeTruthy()
   expect(screen.getByText(/Create an index and compare/)).toBeTruthy()
 })
 
@@ -109,8 +96,6 @@ it("hides a formerly complete global result while capture integrity needs review
         score: 82,
         hired: true,
       }}
-      level="Junior"
-      duration="Up to 8 min"
       captureIntegrityPending
     />
   )
@@ -141,7 +126,7 @@ it("labels a criterion answered above its bar", () => {
   expect(screen.getByText("Exceeds the criterion")).toBeTruthy()
 })
 
-it("explains the points a complete score is missing", () => {
+it("summarizes a complete result once without repeating scoring details", () => {
   render(
     <EvaluationOutcome
       evaluation={{
@@ -149,13 +134,15 @@ it("explains the points a complete score is missing", () => {
         evaluation_status: "complete",
         score: 98,
         hired: true,
+        coverage: 1,
+        rationale: "The answers meet the role's criteria.",
         score_gap: "The Docker answer stopped at a standard healthcheck.",
       }}
-      level="Junior"
-      duration="Up to 15 min"
     />
   )
-  expect(screen.getByText(/Why not higher: The Docker answer/)).toBeTruthy()
+  expect(screen.getByText("The answers meet the role's criteria.")).toBeTruthy()
+  expect(screen.queryByText(/The Docker answer/)).toBeNull()
+  expect(screen.queryByText(/Selected criteria observed/)).toBeNull()
 })
 
 it("shows a grounded before/after comparison and the real details still needed", () => {
@@ -195,7 +182,6 @@ it("shows a grounded before/after comparison and the real details still needed",
   expect(
     screen.getByText("Identify the actual bug and your change.")
   ).toBeTruthy()
-  expect(screen.getByText(/Candidate answer #42 · version 1/)).toBeTruthy()
 })
 
 it("labels missing knowledge as something to learn before using the example", () => {
@@ -219,7 +205,6 @@ it("labels missing knowledge as something to learn before using the example", ()
       }}
     />
   )
-  expect(screen.getByText(/Concept to learn and practise/)).toBeTruthy()
   expect(screen.getByText("After practising, you could explain")).toBeTruthy()
   expect(screen.queryByText("Add your real details")).toBeNull()
 })

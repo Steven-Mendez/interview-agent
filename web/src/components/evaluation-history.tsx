@@ -28,11 +28,9 @@ const STATUS_LABELS: Record<string, string> = {
 export function EvaluationHistory({
   interviewId,
   milestones,
-  duration,
 }: {
   interviewId: string
   milestones: Milestone[]
-  duration: string
 }) {
   const [open, setOpen] = useState(false)
   const query = useQuery({
@@ -106,7 +104,6 @@ export function EvaluationHistory({
                 key={attempt.id}
                 attempt={attempt}
                 milestones={milestones}
-                duration={duration}
               />
             ))}
         </div>
@@ -124,11 +121,9 @@ export function EvaluationHistory({
 function HistoricalAttempt({
   attempt,
   milestones,
-  duration,
 }: {
   attempt: Attempt
   milestones: Milestone[]
-  duration: string
 }) {
   const result = attempt.result
   return (
@@ -144,11 +139,11 @@ function HistoricalAttempt({
         <div className="mt-4 flex flex-col gap-4">
           <EvaluationOutcome
             evaluation={result}
-            level={result.seniority_evaluated || "Saved level"}
-            duration={duration}
             captureIntegrityPending={attempt.invalidated}
           />
-          <p className="whitespace-pre-wrap">{result.rationale}</p>
+          {result.score_gap && (
+            <p className="whitespace-pre-wrap">{result.score_gap}</p>
+          )}
           <CriterionFeedback evaluation={result} milestones={milestones} />
           <AnswerComparisons evaluation={result} />
           <FeedbackList title="Strengths" items={result.strengths} />

@@ -105,6 +105,11 @@
 }
 
 :root {
+  /* Let shorter windows spend their height on content, while tall screens
+     retain breathing room. Controls and text keep their accessible sizes. */
+  --page-space: clamp(1rem, 2dvh, 2rem);
+  --page-gap: clamp(1rem, 2dvh, 1.5rem);
+
   /* Surfaces */
   --background: #f8f9fa;
   --foreground: #1f1f1f;

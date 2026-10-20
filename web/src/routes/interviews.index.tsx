@@ -194,7 +194,7 @@ function HistoryPage() {
 
   return (
     <PageShell>
-      <PageContainer variant="wide" className="flex flex-col gap-6">
+      <PageContainer variant="wide" className="flex flex-col gap-(--page-gap)">
         <PageHeader
           title="History"
           description="Your interviews and their results."

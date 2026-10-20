@@ -5,7 +5,7 @@ import { cn } from "@/lib/utils"
 const pageContainerVariants = {
   narrow: "max-w-xl",
   reading: "max-w-3xl",
-  wide: "max-w-6xl",
+  wide: "max-w-none",
 } as const
 
 /** Horizontal measure for page content. */
@@ -30,7 +30,7 @@ function PageContainer({
   )
 }
 
-/** The scrolling content area of a management page. */
+/** Content uses the available viewport and grows naturally when necessary. */
 function PageShell({
   center = false,
   className,
@@ -45,7 +45,7 @@ function PageShell({
       data-slot="page-shell"
       data-center={center}
       className={cn(
-        "flex flex-1 flex-col gap-6 px-4 py-6 @lg/main:px-8 @lg/main:py-8",
+        "flex min-w-0 flex-1 flex-col gap-(--page-gap) px-4 py-(--page-space) @lg/main:px-6 @5xl/main:px-8",
         center && "items-center justify-center",
         className
       )}

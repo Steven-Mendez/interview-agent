@@ -233,7 +233,7 @@ const OPTION_LABELS: Record<string, string> = Object.fromEntries(
   [...SENIORITY_OPTIONS, ...LENGTH_OPTIONS].map((o) => [o.value, o.label])
 )
 
-/** Where the wizard is: a vertical list of steps on wide screens, a compact
+/** Where the wizard is: a horizontal list of steps on wide screens, a compact
  *  "Step n of m" with a bar on narrow ones. */
 function Stepper({
   current,
@@ -246,7 +246,7 @@ function Stepper({
 }) {
   return (
     <>
-      <div className="flex flex-col gap-2 @3xl/main:hidden">
+      <div className="flex flex-col gap-2 @2xl/main:hidden">
         <span className="text-xs text-muted-foreground">
           Step {current + 1} of {STEPS.length} · {STEPS[current].title}
         </span>
@@ -262,8 +262,8 @@ function Stepper({
           ))}
         </div>
       </div>
-      <nav aria-label="Steps" className="hidden @3xl/main:block">
-        <ol className="flex flex-col gap-1">
+      <nav aria-label="Steps" className="hidden @2xl/main:block">
+        <ol className="grid grid-cols-4 gap-2">
           {STEPS.map((step, i) => {
             const done = i < current
             const active = i === current
@@ -541,15 +541,18 @@ export function UploadPage() {
 
   return (
     <PageShell>
-      <PageContainer variant="wide" className="flex flex-col gap-8">
-        <div className="flex flex-col gap-4">
+      <PageContainer
+        variant="wide"
+        className="flex flex-1 flex-col gap-(--page-gap)"
+      >
+        <div className="flex flex-col gap-2 @3xl/main:flex-row @3xl/main:items-center @3xl/main:justify-between @3xl/main:gap-4">
           <PageHeader
             title="New interview"
             description="Four short steps, planned from your resume and the job offer."
           />
           {me.data && <QuotaNotice me={me.data} blocked={quotaBlocked} />}
         </div>
-        <div className="grid gap-8 @3xl/main:grid-cols-[14rem_minmax(0,1fr)] @3xl/main:gap-12">
+        <div className="flex flex-1 flex-col gap-(--page-gap)">
           <Stepper
             current={step}
             onSelect={setStep}
@@ -566,7 +569,7 @@ export function UploadPage() {
               if (quotaBlocked !== null) return
               form.handleSubmit()
             }}
-            className="flex max-w-2xl min-w-0 flex-col gap-8"
+            className="flex min-w-0 flex-1 flex-col gap-3"
           >
             <div className="flex flex-col gap-1">
               <h2 className="text-title-lg">{STEPS[step].title}</h2>
@@ -575,7 +578,15 @@ export function UploadPage() {
               </p>
             </div>
             <div>
-              <FieldGroup className="gap-6">
+              <FieldGroup
+                className={cn(
+                  "grid items-start gap-4 *:min-w-0",
+                  STEPS[step].id === "role" &&
+                    "@2xl/main:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)]",
+                  STEPS[step].id === "calibration" && "@4xl/main:grid-cols-2",
+                  STEPS[step].id === "interviewer" && "@2xl/main:grid-cols-6"
+                )}
+              >
                 {STEPS[step].id === "role" && (
                   <>
                     <form.Field
@@ -614,7 +625,7 @@ export function UploadPage() {
                               <FieldLabel
                                 htmlFor={field.name}
                                 className={cn(
-                                  "flex w-full cursor-pointer flex-col items-center justify-center gap-3 rounded-xl border border-dashed border-input/60 px-4 py-8 text-center transition-colors hover:border-primary hover:bg-primary-container/30 has-[:disabled]:pointer-events-none has-[:disabled]:opacity-50",
+                                  "flex w-full cursor-pointer flex-row items-center justify-center gap-3 rounded-xl border border-dashed border-input/60 px-4 py-5 text-center transition-colors hover:border-primary hover:bg-primary-container/30 has-[:disabled]:pointer-events-none has-[:disabled]:opacity-50 @2xl/main:min-h-40 @2xl/main:flex-col @2xl/main:py-6",
                                   isInvalid && "border-destructive"
                                 )}
                               >
@@ -696,10 +707,8 @@ export function UploadPage() {
                             <FieldLabel htmlFor={field.name}>
                               Job offer
                             </FieldLabel>
-                            {/* max-h: the shared Textarea uses
-                                field-sizing-content, which grows without a
-                                ceiling — a pasted offer used to push the
-                                footer off screen. */}
+                            {/* The editor uses spare viewport height; pasted
+                                text scrolls inside it instead of moving actions. */}
                             <Textarea
                               id={field.name}
                               name={field.name}
@@ -711,7 +720,7 @@ export function UploadPage() {
                               aria-invalid={isInvalid}
                               disabled={mutation.isPending}
                               placeholder="Paste the job description here…"
-                              className="max-h-64 min-h-40 overflow-y-auto"
+                              className="field-sizing-fixed h-40 min-h-32 overflow-y-auto @2xl/main:h-[clamp(10rem,calc(100dvh-28rem),32rem)]"
                             />
                             {value.length > 0 && (
                               <FieldDescription className="tabular-nums">
@@ -750,7 +759,7 @@ export function UploadPage() {
                             }
                             aria-invalid={invalid}
                             disabled={mutation.isPending}
-                            className="max-h-96 min-h-64 overflow-y-auto"
+                            className="field-sizing-fixed h-[clamp(12rem,calc(100dvh-29rem),48rem)] min-h-48 overflow-y-auto"
                           />
                           <FieldDescription>
                             {field.state.value.length.toLocaleString()} / 30,000
@@ -777,7 +786,7 @@ export function UploadPage() {
                       })}
                     >
                       {({ resume, offer }) => (
-                        <div className="flex flex-col gap-2">
+                        <div className="col-span-full grid gap-2 @2xl/main:grid-cols-2">
                           {resume && (
                             <FilledRow
                               label={resume.name}
@@ -893,7 +902,7 @@ export function UploadPage() {
                         />
                       )}
                     </form.Field>
-                    <div className="grid items-start gap-4 @md/main:grid-cols-3">
+                    <div className="col-span-full grid items-start gap-4 @md/main:grid-cols-3">
                       {BUDGET_FIELDS.map(({ name, label, min, max }) => (
                         <form.Field
                           key={name}
@@ -933,7 +942,7 @@ export function UploadPage() {
                         />
                       ))}
                     </div>
-                    <FieldDescription>
+                    <FieldDescription className="col-span-full">
                       Leave limits blank to use the selected length and level.
                       Follow-ups may be lower for shorter or less advanced
                       interviews; the final limits are shown before you start.
@@ -952,18 +961,20 @@ export function UploadPage() {
                       })}
                     >
                       {({ seniority, length }) => (
-                        <FilledRow
-                          label={OPTION_LABELS[seniority] ?? seniority}
-                          detail={LENGTH_LABELS[length as InterviewLength]}
-                          action="Edit"
-                          disabled={mutation.isPending}
-                          onAction={() => setStep(1)}
-                        />
+                        <div className="col-span-full">
+                          <FilledRow
+                            label={OPTION_LABELS[seniority] ?? seniority}
+                            detail={LENGTH_LABELS[length as InterviewLength]}
+                            action="Edit"
+                            disabled={mutation.isPending}
+                            onAction={() => setStep(2)}
+                          />
+                        </div>
                       )}
                     </form.Subscribe>
 
                     {settingsQuery.isError && (
-                      <Alert variant="warning">
+                      <Alert variant="warning" className="col-span-full">
                         <AlertCircleIcon />
                         <AlertDescription>
                           Could not load your saved settings —{" "}
@@ -982,7 +993,10 @@ export function UploadPage() {
                           field.state.meta.isTouched &&
                           !field.state.meta.isValid
                         return (
-                          <Field data-invalid={isInvalid}>
+                          <Field
+                            data-invalid={isInvalid}
+                            className="@2xl/main:col-span-2"
+                          >
                             <FieldLabel htmlFor={field.name}>Name</FieldLabel>
                             <Input
                               id={field.name}
@@ -1007,7 +1021,7 @@ export function UploadPage() {
                       }}
                     />
 
-                    <div className="grid items-start gap-4 @md/main:grid-cols-2">
+                    <div className="grid items-start gap-4 @md/main:grid-cols-2 @2xl/main:col-span-4">
                       <form.Field
                         name="language"
                         children={(field) => (
@@ -1127,7 +1141,7 @@ export function UploadPage() {
                     <form.Field
                       name="persona"
                       children={(field) => (
-                        <Field>
+                        <Field className="@2xl/main:col-span-3">
                           <FieldLabel htmlFor={field.name}>
                             Personality{" "}
                             <span className="text-muted-foreground">
@@ -1144,7 +1158,7 @@ export function UploadPage() {
                             }
                             disabled={mutation.isPending}
                             placeholder="A warm but rigorous engineering manager…"
-                            className="max-h-40 min-h-20 overflow-y-auto"
+                            className="field-sizing-fixed h-24 min-h-20 overflow-y-auto @2xl/main:h-[clamp(6rem,calc(100dvh-40rem),20rem)]"
                           />
                           <FieldDescription>
                             Leave it empty to run this interview without one.
@@ -1156,7 +1170,7 @@ export function UploadPage() {
                     <form.Field
                       name="custom_instructions"
                       children={(field) => (
-                        <Field>
+                        <Field className="@2xl/main:col-span-3">
                           <FieldLabel htmlFor={field.name}>
                             Extra instructions{" "}
                             <span className="text-muted-foreground">
@@ -1173,7 +1187,7 @@ export function UploadPage() {
                             }
                             disabled={mutation.isPending}
                             placeholder="Focus on system design; ask in English but let me answer in Spanish…"
-                            className="max-h-40 min-h-20 overflow-y-auto"
+                            className="field-sizing-fixed h-24 min-h-20 overflow-y-auto @2xl/main:h-[clamp(6rem,calc(100dvh-40rem),20rem)]"
                           />
                           <FieldDescription>
                             Anything the interviewer should keep in mind.
@@ -1187,7 +1201,7 @@ export function UploadPage() {
                 {mutation.isPending && (
                   <div
                     role="status"
-                    className="flex flex-col gap-3 rounded-xl bg-primary-container/40 px-4 py-4"
+                    className="col-span-full flex flex-col gap-3 rounded-xl bg-primary-container/40 px-4 py-4"
                   >
                     <span className="text-sm font-medium">
                       Planning from the reviewed resume… (can take ~1 min)
@@ -1200,13 +1214,13 @@ export function UploadPage() {
                 )}
 
                 {resumePreview.pending && (
-                  <FieldDescription className="flex items-center gap-2">
+                  <FieldDescription className="col-span-full flex items-center gap-2">
                     <Spinner />
                     Reading the PDF…
                   </FieldDescription>
                 )}
                 {resumePreview.error && (
-                  <Alert variant="destructive">
+                  <Alert variant="destructive" className="col-span-full">
                     <AlertCircleIcon />
                     <AlertDescription>
                       {errorMessage(resumePreview.error)}
@@ -1215,7 +1229,7 @@ export function UploadPage() {
                 )}
 
                 {mutation.isError && (
-                  <Alert variant="destructive">
+                  <Alert variant="destructive" className="col-span-full">
                     <AlertCircleIcon />
                     <AlertDescription>
                       {interviewErrorMessage(mutation.error, me.data)}
@@ -1224,7 +1238,7 @@ export function UploadPage() {
                 )}
               </FieldGroup>
             </div>
-            <div className="flex items-center justify-between gap-2 border-t pt-6">
+            <div className="mt-auto flex items-center justify-between gap-2 border-t pt-3">
               {step > 0 ? (
                 <Button
                   type="button"

@@ -75,12 +75,12 @@ export function PreJoinRoom({
   }, [status, request])
 
   return (
-    <div className="flex min-h-svh flex-col bg-background">
+    <div className="flex flex-1 flex-col bg-background">
       <header className="flex h-16 shrink-0 items-center px-4 md:px-6">
         <BrandLink />
       </header>
 
-      <div className="mx-auto grid w-full max-w-7xl flex-1 content-center items-center gap-8 px-4 pb-10 md:px-8 lg:grid-cols-[minmax(0,1.6fr)_minmax(18rem,1fr)] lg:gap-14">
+      <div className="mx-auto grid w-full max-w-7xl flex-1 content-center items-center gap-(--page-gap) px-4 py-(--page-space) md:grid-cols-[minmax(0,1.6fr)_minmax(16rem,1fr)] md:px-6 lg:gap-8">
         <section aria-label="Your camera and microphone" className="min-w-0">
           <PreviewTile
             preview={preview}
@@ -92,7 +92,7 @@ export function PreJoinRoom({
 
         <section
           aria-labelledby="prejoin-title"
-          className="flex min-w-0 flex-col items-center gap-6 text-center"
+          className="flex min-w-0 flex-col items-center gap-(--page-gap) text-center"
         >
           <div className="flex flex-col gap-4">
             <h1 id="prejoin-title" className="text-headline">
@@ -178,7 +178,7 @@ function PreviewTile({
 
   return (
     // The tile is a dark surface in either theme, so it takes the dark tokens.
-    <div className="session-dark relative aspect-video w-full overflow-hidden rounded-xl bg-stage text-foreground">
+    <div className="session-dark relative aspect-video max-h-[max(14rem,calc(100dvh-12rem))] w-full overflow-hidden rounded-xl bg-stage text-foreground">
       {showVideo && preview.stream ? (
         <SelfView stream={preview.stream} className="size-full" />
       ) : (

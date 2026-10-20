@@ -96,12 +96,15 @@ function HomePage() {
   const continueRow = ready.at(0)
 
   return (
-    <PageShell className="gap-12 @lg/main:py-8">
-      <PageContainer variant="wide" className="flex flex-col gap-10">
+    <PageShell>
+      <PageContainer
+        variant="wide"
+        className="grid grid-cols-1 items-start gap-(--page-gap) *:min-w-0 @5xl/main:grid-cols-2"
+      >
         {/* Hero: one obvious action, and a way back into what is waiting. */}
-        <section className="grid items-center gap-10 @4xl/main:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
-          <div className="flex flex-col gap-6">
-            <h1 className="font-heading text-[2.25rem] leading-[2.75rem] font-normal @2xl/main:text-[2.75rem] @2xl/main:leading-[3.25rem]">
+        <section className="col-span-full grid grid-cols-1 items-center gap-6 @3xl/main:grid-cols-[minmax(0,1fr)_auto]">
+          <div className="flex min-w-0 flex-col gap-4">
+            <h1 className="max-w-3xl font-heading text-[clamp(1.75rem,4dvh,2.75rem)] leading-tight font-normal">
               Practice interviews with your AI interviewer
             </h1>
             <p className="max-w-xl text-base leading-relaxed text-muted-foreground">
@@ -148,15 +151,15 @@ function HomePage() {
               )}
             </div>
           </div>
-          <div aria-hidden className="hidden justify-center @4xl/main:flex">
-            <div className="flex aspect-square w-64 items-center justify-center rounded-full bg-primary-container/45">
-              <HomeMascot className="w-44" />
+          <div aria-hidden className="hidden justify-center @3xl/main:flex">
+            <div className="flex aspect-square w-[clamp(8rem,22dvh,14rem)] items-center justify-center rounded-full bg-primary-container/45">
+              <HomeMascot className="w-3/4" />
             </div>
           </div>
         </section>
 
         {unreachable ? (
-          <Alert variant="destructive">
+          <Alert variant="destructive" className="col-span-full">
             <AlertCircleIcon />
             <AlertDescription>
               Your interviews could not be loaded — {unreachable.message}
@@ -174,7 +177,7 @@ function HomePage() {
         ) : null}
 
         {!signedOut && recent.isError && (
-          <Alert variant="destructive">
+          <Alert variant="destructive" className="col-span-full">
             <AlertCircleIcon />
             <AlertDescription>
               Your interviews could not be loaded — {errorMessage(recent.error)}
@@ -207,6 +210,7 @@ function HomePage() {
           </Section>
         ) : total === 0 ? (
           <EmptyState
+            className="col-span-full py-4"
             illustration={<Mascot state="idle" className="w-36" />}
             title="No interviews yet"
             description="Start a new interview and your interviewer will plan it from your resume."
@@ -220,6 +224,7 @@ function HomePage() {
         ) : latest && latest.length > 0 ? (
           <Section
             title="Recent interviews"
+            className={ready.length === 0 ? "col-span-full" : undefined}
             actions={
               <LinkButton to="/interviews" variant="ghost" size="sm">
                 View all

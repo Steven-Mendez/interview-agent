@@ -29,8 +29,8 @@ export function InterviewPreferenceFields({
   disabled?: boolean
 }) {
   return (
-    <div className="flex flex-col gap-4">
-      <div className="grid gap-4 sm:grid-cols-2">
+    <div className="@container/preferences flex min-w-0 flex-col gap-4">
+      <div className="grid gap-4 @sm/preferences:grid-cols-2">
         <Field>
           <FieldLabel htmlFor="interview-type">Interview type</FieldLabel>
           <Select

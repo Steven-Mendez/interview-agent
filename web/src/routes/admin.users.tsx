@@ -111,7 +111,7 @@ function UsersPage() {
 
   return (
     <PageShell>
-      <PageContainer variant="wide" className="flex flex-col gap-6">
+      <PageContainer variant="wide" className="flex flex-col gap-(--page-gap)">
         <PageHeader
           title="Users"
           description="Everyone who has signed in, most recently seen first."

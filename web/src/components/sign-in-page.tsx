@@ -194,9 +194,9 @@ export function SignInPage({
   const mascot = useSignInMascot(resting)
   return (
     <SignInReactionsContext.Provider value={mascot.reactions}>
-      <div className="relative isolate flex min-h-dvh flex-1 flex-col overflow-hidden bg-background">
+      <div className="relative isolate flex flex-1 flex-col overflow-hidden bg-background">
         <Backdrop />
-        <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col items-center gap-6 px-4 pt-2 pb-10 md:grid md:grid-cols-2 md:items-center md:gap-10 md:px-8 md:py-10">
+        <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col items-center gap-(--page-gap) px-4 pt-2 pb-(--page-space) md:grid md:grid-cols-2 md:items-center md:gap-8 md:px-8 md:py-(--page-space)">
           <div className="flex flex-col items-center gap-2 text-center md:gap-6">
             <button
               ref={mascot.lookRef}
@@ -204,7 +204,7 @@ export function SignInPage({
               aria-label="Say hi to the interviewer"
               data-mascot-state={mascot.state}
               onClick={mascot.tickle}
-              className="relative aspect-square w-28 cursor-pointer touch-manipulation rounded-full outline-offset-4 select-none [--mascot-look-x:0] [--mascot-look-y:0.8] md:w-64 md:[--mascot-look-x:0.8] md:[--mascot-look-y:0.25] lg:w-80"
+              className="relative aspect-square w-[clamp(4rem,14dvh,7rem)] cursor-pointer touch-manipulation rounded-full outline-offset-4 select-none [--mascot-look-x:0] [--mascot-look-y:0.8] md:w-[clamp(8rem,32dvh,20rem)] md:[--mascot-look-x:0.8] md:[--mascot-look-y:0.25]"
             >
               <span
                 aria-hidden

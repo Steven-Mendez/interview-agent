@@ -84,7 +84,7 @@ export function ResultsPage({
 
   return (
     <PageShell className="animate-in duration-300 fade-in">
-      <PageContainer variant="wide" className="flex flex-col gap-6">
+      <PageContainer variant="wide" className="flex flex-col gap-(--page-gap)">
         <LinkButton
           variant="quiet"
           size="sm"
@@ -276,7 +276,7 @@ function EvaluatedOverview({
     interview.status === "evaluating" ||
     interview.status === "evaluation_failed"
   return (
-    <div className="flex flex-col gap-8">
+    <div className="flex flex-col gap-(--page-gap)">
       {assessmentOnTop && <AssessmentRequest interview={interview} />}
       <InterviewEnding interview={interview} />
       <EvaluationOutcome
@@ -292,7 +292,7 @@ function EvaluatedOverview({
 
       <AnswerComparisons evaluation={ev} />
 
-      <div className="grid gap-8 @3xl/main:grid-cols-2">
+      <div className="grid gap-(--page-gap) @3xl/main:grid-cols-2">
         <FeedbackList
           title="Strengths"
           items={ev.strengths}

@@ -63,8 +63,12 @@ function ProfilePage() {
 
   return (
     <PageShell>
-      <PageContainer className="flex flex-col gap-8">
+      <PageContainer
+        variant="wide"
+        className="grid grid-cols-1 items-start gap-(--page-gap) @3xl/main:grid-cols-2"
+      >
         <PageHeader
+          className="col-span-full"
           title="Profile"
           description="Your account and your interviews."
           actions={

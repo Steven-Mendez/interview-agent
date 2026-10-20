@@ -21,7 +21,7 @@ export function ProductLogo({
   compact = false,
   className,
 }: {
-  compact?: boolean
+  compact?: boolean | "mobile"
   className?: string
 }) {
   return (
@@ -32,8 +32,13 @@ export function ProductLogo({
       )}
     >
       <BrandMark className="size-9" />
-      {!compact && (
-        <span className="font-heading text-[1.375rem] leading-7 font-normal tracking-[-0.01em]">
+      {compact !== true && (
+        <span
+          className={cn(
+            "font-heading text-[1.375rem] leading-7 font-normal tracking-[-0.01em]",
+            compact === "mobile" && "hidden sm:inline"
+          )}
+        >
           Interviewer Agent
         </span>
       )}
@@ -47,7 +52,7 @@ export function BrandLink({
   compact = false,
 }: {
   className?: string
-  compact?: boolean
+  compact?: boolean | "mobile"
 }) {
   return (
     <Link

@@ -60,8 +60,12 @@ function SettingsPage() {
 
   return (
     <PageShell>
-      <PageContainer variant="reading" className="flex flex-col gap-8">
+      <PageContainer
+        variant="wide"
+        className="grid grid-cols-1 items-start gap-(--page-gap) @5xl/main:grid-cols-[minmax(0,1fr)_17rem]"
+      >
         <PageHeader
+          className="col-span-full"
           title="Settings"
           description="Defaults for new interviews, and how the app looks on this device."
         />
@@ -69,6 +73,7 @@ function SettingsPage() {
           <SettingsSection
             title="Interviewer"
             description="Who runs your interviews by default."
+            columns
           >
             {Array.from({ length: 4 }, (_, i) => (
               <SettingRow key={i} label={<Skeleton className="h-4 w-24" />}>
@@ -107,11 +112,13 @@ function SettingsSection({
   description,
   children,
   footer,
+  columns = false,
 }: {
   title: string
   description: string
   children: React.ReactNode
   footer?: React.ReactNode
+  columns?: boolean
 }) {
   return (
     <section className="flex flex-col gap-3" aria-label={title}>
@@ -120,7 +127,13 @@ function SettingsSection({
         <p className="text-sm text-muted-foreground">{description}</p>
       </div>
       <div className="overflow-hidden rounded-xl border bg-card">
-        <div className="divide-y">{children}</div>
+        <div
+          className={
+            columns ? "grid gap-4 p-4 @2xl/main:grid-cols-6" : "divide-y"
+          }
+        >
+          {children}
+        </div>
         {footer && (
           <div className="flex items-center justify-end gap-2 border-t bg-muted/50 px-5 py-3">
             {footer}
@@ -131,22 +144,28 @@ function SettingsSection({
   )
 }
 
-/** Label and help on the left, the control on the right; stacked when
- *  narrow. */
+/** A setting keeps its label and help next to its control in a compact grid. */
 function SettingRow({
   label,
   htmlFor,
   description,
   children,
+  className,
 }: {
   label: React.ReactNode
   htmlFor?: string
   description?: React.ReactNode
   children: React.ReactNode
+  className?: string
 }) {
   return (
-    <div className="flex flex-col gap-3 px-5 py-5 @2xl/main:flex-row @2xl/main:gap-8">
-      <div className="flex flex-col gap-1 @2xl/main:w-56 @2xl/main:shrink-0 @2xl/main:pt-2.5">
+    <div
+      className={cn(
+        "flex min-w-0 flex-col gap-2 @2xl/main:col-span-2",
+        className
+      )}
+    >
+      <div className="flex flex-col gap-1">
         {htmlFor ? (
           <label htmlFor={htmlFor} className="text-label">
             {label}
@@ -160,7 +179,7 @@ function SettingRow({
           </p>
         )}
       </div>
-      <div className="flex min-w-0 flex-1 flex-col gap-1.5">{children}</div>
+      <div className="mt-auto flex min-w-0 flex-col gap-1.5">{children}</div>
     </div>
   )
 }
@@ -211,6 +230,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
     >
       <SettingsSection
         title="Interviewer"
+        columns
         description="Who runs your interviews by default. Applies to every interview created from now on; each new interview can still change it."
         footer={
           <>
@@ -374,6 +394,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
           children={(field) => (
             <SettingRow
               label="Persona"
+              className="@2xl/main:col-span-3"
               htmlFor={field.name}
               description="Optional — the interviewer’s personality."
             >
@@ -385,7 +406,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
                 onChange={(event) => field.handleChange(event.target.value)}
                 disabled={mutation.isPending}
                 placeholder="A warm but rigorous engineering manager…"
-                className="max-h-48 min-h-20 overflow-y-auto"
+                className="field-sizing-fixed h-24 min-h-24 overflow-y-auto @2xl/main:h-[clamp(6rem,calc(100dvh-36rem),18rem)]"
               />
             </SettingRow>
           )}
@@ -396,6 +417,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
           children={(field) => (
             <SettingRow
               label="Custom instructions"
+              className="@2xl/main:col-span-3"
               htmlFor={field.name}
               description="Optional — extra guidance the interviewer keeps in mind."
             >
@@ -407,7 +429,7 @@ function SettingsForm({ settings }: { settings: Settings }) {
                 onChange={(event) => field.handleChange(event.target.value)}
                 disabled={mutation.isPending}
                 placeholder="Focus on system design…"
-                className="max-h-48 min-h-24 overflow-y-auto"
+                className="field-sizing-fixed h-24 min-h-24 overflow-y-auto @2xl/main:h-[clamp(6rem,calc(100dvh-36rem),18rem)]"
               />
             </SettingRow>
           )}
@@ -436,11 +458,11 @@ function AppearanceSection() {
       title="Appearance"
       description="Saved on this device and applied right away. The live interview room is always dark."
     >
-      <SettingRow label="Theme">
+      <SettingRow label="Theme" className="p-4">
         <div
           role="radiogroup"
           aria-label="Theme"
-          className="grid grid-cols-3 gap-2 @lg/main:max-w-md"
+          className="grid grid-cols-3 gap-2 @5xl/main:grid-cols-1"
         >
           {THEMES.map(({ value, label, icon: Icon }) => {
             const checked = current === value
@@ -453,7 +475,7 @@ function AppearanceSection() {
                 disabled={!mounted}
                 onClick={() => setTheme(value)}
                 className={cn(
-                  "flex flex-col items-center gap-2 rounded-lg border px-3 py-3 text-sm transition-colors hover:bg-foreground/[0.04] disabled:opacity-40",
+                  "flex flex-col items-center justify-center gap-2 rounded-lg border px-3 py-3 text-sm transition-colors hover:bg-foreground/[0.04] disabled:opacity-40 @5xl/main:flex-row @5xl/main:justify-start",
                   checked &&
                     "border-primary bg-primary-container/60 text-on-primary-container hover:bg-primary-container/60"
                 )}

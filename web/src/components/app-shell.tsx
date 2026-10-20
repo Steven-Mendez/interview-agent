@@ -137,7 +137,7 @@ function SideNav() {
     <>
       <nav
         aria-label="Main"
-        className="hidden w-64 shrink-0 flex-col pt-2 pr-3 pb-6 pl-2 lg:flex"
+        className="hidden w-56 shrink-0 flex-col pt-2 pr-3 pb-6 pl-2 xl:flex"
       >
         <ul className="flex flex-col gap-1">
           {NAV_ITEMS.map((item) => (
@@ -149,7 +149,7 @@ function SideNav() {
       </nav>
       <nav
         aria-label="Main"
-        className="hidden w-20 shrink-0 flex-col items-center pt-2 pb-6 md:flex lg:hidden"
+        className="hidden w-20 shrink-0 flex-col items-center pt-2 pb-6 md:flex xl:hidden"
       >
         <ul className="flex flex-col items-center gap-3">
           {NAV_ITEMS.map((item) => {
@@ -377,7 +377,7 @@ function TopBar({ onMenu }: { onMenu: () => void }) {
       >
         <MenuIcon />
       </IconButton>
-      <BrandLink className="md:pl-2" />
+      <BrandLink compact="mobile" className="md:pl-2" />
       <div className="ml-auto flex items-center gap-2">
         <LinkButton
           to="/new"
@@ -457,7 +457,7 @@ function AppShell({
     <div
       data-immersive={immersive}
       data-chrome={chrome}
-      className="flex min-h-svh flex-col bg-background"
+      className="flex min-h-dvh flex-col bg-background"
     >
       <a
         href="#main"

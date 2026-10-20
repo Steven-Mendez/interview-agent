@@ -4,7 +4,7 @@ import type * as SentrySdk from "./sentry-sdk"
 // Browser errors to Sentry without interview content: exception types and
 // stack frames only. Messages, request data, extras, breadcrumbs and any user
 // field besides the opaque account id never leave the page. Without
-// VITE_SENTRY_DSN (tests, local dev, the prerendered shell) nothing starts.
+// VITE_SENTRY_DSN or outside production nothing starts.
 //
 // The SDK is imported on demand, out of the entry chunk: every page loads
 // without it, and a build with no DSN never fetches it. Reports made while it
@@ -13,7 +13,35 @@ import type * as SentrySdk from "./sentry-sdk"
 let sentry: Promise<typeof SentrySdk | null> | null = null
 
 /** Strip an event down to what locates the failure. */
-export function beforeSend(event: ErrorEvent): ErrorEvent {
+export function beforeSend(event: ErrorEvent): ErrorEvent | null {
+  // Production previews on localhost should not pollute the hosted project.
+  if (event.request?.url) {
+    try {
+      const { hostname } = new URL(event.request.url)
+      if (
+        hostname === "localhost" ||
+        hostname.endsWith(".localhost") ||
+        hostname === "[::1]" ||
+        /^127\./.test(hostname)
+      ) {
+        return null
+      }
+    } catch {
+      // Malformed URLs do not make genuine errors unreportable.
+    }
+  }
+  const exceptions = event.exception?.values ?? []
+  // A handled request cancellation (navigation/auth refresh) is expected.
+  // Unhandled aborts and mixed exception chains still need investigation.
+  if (
+    exceptions.length > 0 &&
+    exceptions.every(
+      (exception) =>
+        exception.type === "AbortError" && exception.mechanism?.handled === true
+    )
+  ) {
+    return null
+  }
   for (const exception of event.exception?.values ?? []) {
     exception.value = ""
   }
@@ -37,7 +65,8 @@ export function beforeSend(event: ErrorEvent): ErrorEvent {
 /** Starts reporting once, in the browser, when a DSN is configured. */
 export function initErrorReporting(): void {
   const dsn = import.meta.env.VITE_SENTRY_DSN
-  if (sentry || typeof window === "undefined" || !dsn) return
+  if (sentry || typeof window === "undefined" || !import.meta.env.PROD || !dsn)
+    return
   sentry = import("./sentry-sdk").then(
     (Sentry) => {
       Sentry.init({

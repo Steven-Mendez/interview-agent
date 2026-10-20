@@ -131,6 +131,23 @@ def test_log_records_replayed_from_another_process_are_not_reported_again(report
     assert CANARY not in reported.serialized()
 
 
+def test_redacted_sdk_logs_are_grouped_by_code_location_not_content(reported):
+    for name, line, message in (
+        ("livekit", 10, CANARY),
+        ("livekit", 10, "different dynamic content"),
+        ("opentelemetry.exporter.otlp.proto.http.metric_exporter", 20, CANARY),
+    ):
+        record = logging.getLogger(name).makeRecord(
+            name, logging.ERROR, __file__, line, message, None, None, func="export"
+        )
+        logging.getLogger(name).callHandlers(record)
+    events = reported.events()
+    assert len(events) == 3
+    assert events[0]["fingerprint"] == events[1]["fingerprint"]
+    assert events[0]["fingerprint"] != events[2]["fingerprint"]
+    assert CANARY not in reported.serialized()
+
+
 def test_local_variables_of_the_raising_frame_are_not_sent(reported):
     def parse(resume: str) -> None:
         excerpt = resume[:200]
@@ -206,6 +223,12 @@ def test_without_dsn_nothing_is_configured_or_sent():
     assert not error_reporting.configure(Settings(_env_file=None), "api")
     assert not sentry_sdk.is_initialized()
     sentry_sdk.capture_message(CANARY)  # a no-op without a client
+
+
+@pytest.mark.parametrize("environment", ["development", "test"])
+def test_local_failures_do_not_report_to_a_configured_production_project(environment):
+    assert not error_reporting.configure(settings(SENTRY_ENVIRONMENT=environment), "api")
+    assert not sentry_sdk.is_initialized()
 
 
 def test_configuration_emits_no_deprecation_warning():

@@ -32,10 +32,12 @@ const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" })
 
 /** An ISO timestamp as the history page shows dates. */
 export function formatDateTime(iso: string): string {
-  return dateTimeFormat.format(new Date(iso))
+  const date = new Date(iso)
+  return Number.isFinite(date.getTime()) ? dateTimeFormat.format(date) : "—"
 }
 
 /** An ISO timestamp, the day only. */
 export function formatDate(iso: string): string {
-  return dateFormat.format(new Date(iso))
+  const date = new Date(iso)
+  return Number.isFinite(date.getTime()) ? dateFormat.format(date) : "—"
 }

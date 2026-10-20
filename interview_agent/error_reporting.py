@@ -6,7 +6,7 @@ transcript, job offer or credential: exception messages, local variables,
 log arguments, request bodies, headers, cookies, query strings, extras and
 breadcrumbs never leave the process. The user is the opaque account id only.
 
-Without SENTRY_DSN nothing is configured and every call here is a no-op.
+Without SENTRY_DSN, or in local development, reporting is a no-op.
 """
 
 from __future__ import annotations
@@ -88,6 +88,16 @@ def before_send(event: dict, hint: dict) -> dict | None:
     if logentry is not None:
         template = logentry.get("message")
         event["logentry"] = {"message": template if template in SAFE_LOG_TEMPLATES else _OMITTED}
+        if template not in SAFE_LOG_TEMPLATES and not event.get("exception") and record:
+            # Redaction must not merge unrelated SDK errors into one issue.
+            # These are code locations, never interpolated message content.
+            event["fingerprint"] = [
+                "{{ default }}",
+                record.name,
+                record.module,
+                record.funcName,
+                str(record.lineno),
+            ]
     if "message" in event and event["message"] not in SAFE_LOG_TEMPLATES:
         del event["message"]
     request = event.get("request")
@@ -111,11 +121,13 @@ def before_send(event: dict, hint: dict) -> dict | None:
 
 
 def configure(settings: Settings, component: str, *, transport: Transport | None = None) -> bool:
-    """Start reporting this process's errors, once; False without SENTRY_DSN.
+    """Start reporting once; disabled without a DSN or in local development.
 
     `component` ("api" / "worker") tags every event. The transport replaces
     the network one in tests."""
-    if not settings.sentry_dsn:
+    if not settings.sentry_dsn or (
+        settings.sentry_environment in {"development", "test"} and transport is None
+    ):
         return False
     if not sentry_sdk.is_initialized():
         sentry_sdk.init(

@@ -18,6 +18,7 @@ async function load() {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  vi.stubEnv("PROD", true)
 })
 
 afterEach(() => {
@@ -56,26 +57,91 @@ describe("beforeSend", () => {
     const result = beforeSend(event)
 
     expect(JSON.stringify(result)).not.toContain(CANARY)
-    expect(result.exception?.values?.[0]).toEqual({
+    expect(result?.exception?.values?.[0]).toEqual({
       type: "TypeError",
       value: "",
       stacktrace: { frames: [{ function: "parse", lineno: 3 }] },
     })
-    expect(result.request).toEqual({
+    expect(result?.request).toEqual({
       method: "GET",
       url: "https://app.example/interviews/1",
     })
-    expect(result.user).toEqual({ id: "user-synthetic" })
+    expect(result?.user).toEqual({ id: "user-synthetic" })
   })
 
   it("drops a user without an id", async () => {
     const { beforeSend } = await load()
     const result = beforeSend({ type: undefined, user: { email: CANARY } })
-    expect(result.user).toBeUndefined()
+    expect(result?.user).toBeUndefined()
   })
+
+  it("ignores handled cancellations but preserves unhandled failures", async () => {
+    const { beforeSend } = await load()
+    const cancelled: ErrorEvent = {
+      type: undefined,
+      exception: {
+        values: [
+          { type: "AbortError", mechanism: { type: "generic", handled: true } },
+        ],
+      },
+    }
+    expect(beforeSend(cancelled)).toBeNull()
+    expect(
+      beforeSend({
+        type: undefined,
+        exception: {
+          values: [
+            {
+              type: "AbortError",
+              mechanism: { type: "onunhandledrejection", handled: false },
+            },
+          ],
+        },
+      })
+    ).not.toBeNull()
+    expect(
+      beforeSend({
+        type: undefined,
+        exception: {
+          values: [...cancelled.exception!.values!, { type: "TypeError" }],
+        },
+      })
+    ).not.toBeNull()
+  })
+
+  it.each(["localhost", "127.0.0.1", "[::1]", "app.localhost"])(
+    "ignores production previews on %s",
+    async (host) => {
+      const { beforeSend } = await load()
+      expect(
+        beforeSend({
+          type: undefined,
+          request: { url: `http://${host}:4173/privacy` },
+        })
+      ).toBeNull()
+      expect(
+        beforeSend({
+          type: undefined,
+          request: {
+            url: "https://interview-agent-lime-seven.vercel.app/privacy",
+          },
+        })
+      ).not.toBeNull()
+    }
+  )
 })
 
 describe("initErrorReporting", () => {
+  it("does not send development failures even when a production DSN is present", async () => {
+    vi.stubEnv("VITE_SENTRY_DSN", "https://synthetic@o0.ingest.sentry.io/0")
+    vi.stubEnv("PROD", false)
+    const reporting = await load()
+    reporting.initErrorReporting()
+    reporting.captureRouteError(new Error(CANARY))
+    await vi.dynamicImportSettled()
+    expect(mocks.init).not.toHaveBeenCalled()
+    expect(mocks.captureException).not.toHaveBeenCalled()
+  })
   it("does nothing without VITE_SENTRY_DSN", async () => {
     vi.stubEnv("VITE_SENTRY_DSN", "")
     const reporting = await load()

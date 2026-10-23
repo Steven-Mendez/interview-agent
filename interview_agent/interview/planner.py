@@ -12,6 +12,7 @@ from interview_agent.config import Settings
 from interview_agent.interview.budgets import resolve_budget
 from interview_agent.interview.context import SOURCE_RULE, source_block, validate_source_documents
 from interview_agent.interview.models import (
+    MAX_ROLE_REQUIREMENTS,
     InterviewLength,
     InterviewPlan,
     InterviewPreferences,
@@ -95,7 +96,7 @@ If explicit, preserve that level. Otherwise classify from the offer's stated
 level and responsibilities, quoting its actual text in seniority_evidence.
 Technologies alone do not determine seniority. Prefer the lower defensible
 level if ambiguous; do not invent an experience requirement.
-Extract the distinct competencies necessary for this role, up to 12. Preserve
+Extract the distinct competencies necessary for this role, up to {MAX_ROLE_REQUIREMENTS}. Preserve
 the essential duties even when a short interview cannot cover all of them.
 Include technical and behavioral duties supported by the offer. Each must
 cite a verbatim job_quote and explain its relevance. A transferable behavioral

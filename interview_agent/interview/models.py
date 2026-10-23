@@ -86,10 +86,14 @@ class RoleRequirement(BaseModel):
     essential: bool
 
 
+# Planner latency is dominated by output tokens; interviews select ~7 topics.
+MAX_ROLE_REQUIREMENTS = 8
+
+
 class RoleRubric(BaseModel):
     seniority: Seniority
     seniority_evidence: str
-    requirements: list[RoleRequirement] = Field(min_length=1, max_length=12)
+    requirements: list[RoleRequirement] = Field(min_length=1, max_length=MAX_ROLE_REQUIREMENTS)
 
 
 class PlannedTopic(BaseModel):

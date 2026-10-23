@@ -83,10 +83,10 @@ class Settings(BaseSettings):
     interviewer_reasoning_effort: str = Field(default="low", alias="INTERVIEWER_REASONING_EFFORT")
     interviewer_temperature: float = Field(default=0.7, alias="INTERVIEWER_TEMPERATURE")
 
-    # Interview planner/evaluator: run once per interview with no latency
-    # pressure, so use Sol with high reasoning effort.
+    # Interview planner/evaluator run once per interview on Sol. The planner
+    # uses medium effort: high doubled its reasoning tokens and the user waits.
     planner_model: str = Field(default="gpt-6.1-sol", alias="PLANNER_MODEL")
-    planner_reasoning_effort: str = Field(default="high", alias="PLANNER_REASONING_EFFORT")
+    planner_reasoning_effort: str = Field(default="medium", alias="PLANNER_REASONING_EFFORT")
     evaluator_model: str = Field(default="gpt-6.1-sol", alias="EVALUATOR_MODEL")
     evaluator_reasoning_effort: str = Field(default="high", alias="EVALUATOR_REASONING_EFFORT")
 

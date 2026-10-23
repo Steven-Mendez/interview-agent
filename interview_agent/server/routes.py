@@ -46,6 +46,7 @@ from interview_agent.interview import resume as resume_ingestion
 from interview_agent.interview.budgets import resolve_budget
 from interview_agent.interview.context import validate_source_documents
 from interview_agent.interview.models import (
+    MAX_ROLE_REQUIREMENTS,
     InterviewLength,
     InterviewPreferences,
     RoleRubric,
@@ -1634,9 +1635,15 @@ async def repeat_interview(
         preferences = body.preferences or InterviewPreferences.model_validate(
             source.interview_preferences or (source.plan or {}).get("preferences", {})
         )
-        # A new level or explicit auto classification needs a fresh role rubric.
+        # A new level, explicit auto classification or a rubric from before the
+        # requirement cap needs a fresh role rubric.
         rubric = None
-        if requested_seniority == source.seniority and (source.plan or {}).get("requirements"):
+        stored = (source.plan or {}).get("requirements")
+        if (
+            requested_seniority == source.seniority
+            and stored
+            and len(stored) <= MAX_ROLE_REQUIREMENTS
+        ):
             rubric = RoleRubric(
                 seniority=source.seniority,
                 seniority_evidence=source.seniority_evidence or "",

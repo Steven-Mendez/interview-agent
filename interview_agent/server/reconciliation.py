@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
 from datetime import timedelta
 
 from sqlalchemy import func, select
@@ -22,6 +23,15 @@ from interview_agent.playback import confirmation_source
 
 logger = logging.getLogger(__name__)
 SWEEP_SECONDS = 5
+# Opening a connection to Neon (TLS verify-full, a compute that is waking up
+# or was just restarted) regularly takes longer than a query is allowed to.
+CONNECT_SECONDS = 10
+# Consecutive sweeps lost to connect timeouts before it stops being a blip.
+CONNECT_TIMEOUTS_BEFORE_ERROR = 3
+
+
+class DatabaseConnectTimeoutError(TimeoutError):
+    """No connection within CONNECT_SECONDS: nothing was queried or written."""
 
 
 async def reconcile_interview(session, conversation_id, settings):
@@ -141,6 +151,23 @@ class LifecycleSweeper:
         self.evaluations = evaluations
         self.sessions = sessionmaker
         self.settings = settings
+        self.connect_timeouts = 0
+
+    @asynccontextmanager
+    async def session(self):
+        """A session with its connection already open. The connect (pool
+        checkout, pre-ping, a reconnect to Neon) gets CONNECT_SECONDS; the
+        queries inside the block keep the DATABASE_SECONDS budget."""
+        async with self.sessions() as session:
+            try:
+                async with asyncio.timeout(CONNECT_SECONDS):
+                    await session.connection()
+            except TimeoutError as error:
+                raise DatabaseConnectTimeoutError(
+                    f"no database connection within {CONNECT_SECONDS}s"
+                ) from error
+            async with asyncio.timeout(DATABASE_SECONDS):
+                yield session
 
     async def once(self):
         changed = failures = 0
@@ -148,7 +175,7 @@ class LifecycleSweeper:
         # later expired row. Release the inventory connection before writes.
         cursor = None
         while True:
-            async with asyncio.timeout(DATABASE_SECONDS), self.sessions() as session:
+            async with self.session() as session:
                 query = (
                     select(db.Conversation.id)
                     .where(db.Conversation.status.in_(("interviewing", "closing")))
@@ -160,10 +187,14 @@ class LifecycleSweeper:
                 ids = list(await session.scalars(query))
             for interview_id in ids:
                 try:
-                    async with asyncio.timeout(DATABASE_SECONDS), self.sessions() as session:
+                    async with self.session() as session:
                         changed += bool(
                             await reconcile_interview(session, interview_id, self.settings)
                         )
+                except DatabaseConnectTimeoutError:
+                    # The database is unreachable, not this row: abort the
+                    # sweep instead of waiting CONNECT_SECONDS per row.
+                    raise
                 except Exception:
                     failures += 1
                     logger.exception("Lifecycle reconciliation failed")
@@ -185,10 +216,24 @@ class LifecycleSweeper:
             self.metric("sweep_lag_seconds", max(0, started - next_sweep))
             try:
                 changed, failures = await self.once()
+                self.connect_timeouts = 0
                 self.metric("sweep_reconciled", changed)
                 self.metric("sweep_errors", failures)
             except asyncio.CancelledError:
                 raise
+            except DatabaseConnectTimeoutError:
+                # An isolated slow connect (Neon waking up, a pod that was
+                # just replaced) retries in SWEEP_SECONDS; only a run of them
+                # is an outage worth paging about.
+                self.connect_timeouts += 1
+                self.metric("sweep_errors", 1)
+                if self.connect_timeouts < CONNECT_TIMEOUTS_BEFORE_ERROR:
+                    logger.warning(
+                        "Lifecycle sweep skipped: database connect timed out",
+                        extra={"consecutive": self.connect_timeouts},
+                    )
+                else:
+                    logger.exception("Lifecycle sweep failed")
             except Exception:
                 logger.exception("Lifecycle sweep failed")
                 self.metric("sweep_errors", 1)

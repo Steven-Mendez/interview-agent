@@ -1,6 +1,7 @@
 """Browser-independent lifecycle recovery against PostgreSQL's clock."""
 
 import asyncio
+import logging
 import time
 import uuid
 from datetime import timedelta
@@ -11,7 +12,13 @@ from sqlalchemy import func, select
 
 from interview_agent.config import Settings
 from interview_agent.interview import db, workers
-from interview_agent.server.reconciliation import LifecycleSweeper, reconcile_interview
+from interview_agent.server import reconciliation
+from interview_agent.server.reconciliation import (
+    CONNECT_TIMEOUTS_BEFORE_ERROR,
+    DatabaseConnectTimeoutError,
+    LifecycleSweeper,
+    reconcile_interview,
+)
 
 LIMITS = Settings(_env_file=None)
 
@@ -245,3 +252,73 @@ async def test_expired_inactivity_cannot_be_reset_by_replacement(postgres_sessio
     await age(postgres_sessionmaker, interview_id, worker_lease_until=-1, worker_activity_at=-181)
     assert await workers.WorkerCoordinator(interview_id, postgres_sessionmaker).claim() is None
     assert await reconcile(postgres_sessionmaker, interview_id) == "sealed_partial"
+
+
+class SlowSession:
+    """A session whose connect and inventory query each take a fixed time."""
+
+    def __init__(self, connect=0.0, query=0.0):
+        self.connect_seconds = connect
+        self.query_seconds = query
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def connection(self):
+        await asyncio.sleep(self.connect_seconds)
+
+    async def scalars(self, query):
+        await asyncio.sleep(self.query_seconds)
+        return iter([])
+
+
+async def test_sweep_connect_has_its_own_budget_beyond_the_query_one(monkeypatch):
+    monkeypatch.setattr(reconciliation, "DATABASE_SECONDS", 0.05)
+    monkeypatch.setattr(reconciliation, "CONNECT_SECONDS", 0.5)
+    # A connect slower than a query is allowed to be, but within CONNECT_SECONDS.
+    assert await LifecycleSweeper(lambda: SlowSession(connect=0.1), LIMITS).once() == (0, 0)
+    with pytest.raises(DatabaseConnectTimeoutError):
+        await LifecycleSweeper(lambda: SlowSession(connect=1), LIMITS).once()
+    # Queries keep the short budget, and a slow query is not a connect timeout.
+    with pytest.raises(TimeoutError) as failure:
+        await LifecycleSweeper(lambda: SlowSession(query=0.1), LIMITS).once()
+    assert not isinstance(failure.value, DatabaseConnectTimeoutError)
+
+
+async def test_isolated_connect_timeouts_warn_and_a_run_of_them_errors(monkeypatch, caplog):
+    sweeper = LifecycleSweeper(None, LIMITS)
+    outcomes = [DatabaseConnectTimeoutError()] * CONNECT_TIMEOUTS_BEFORE_ERROR
+    outcomes += [(0, 0), DatabaseConnectTimeoutError(), RuntimeError("other")]
+
+    async def once():
+        if not outcomes:
+            raise asyncio.CancelledError
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    metrics = []
+    monkeypatch.setattr(sweeper, "once", once)
+    monkeypatch.setattr(sweeper, "metric", lambda name, value: metrics.append((name, value)))
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    with (
+        caplog.at_level(logging.WARNING, logger=reconciliation.logger.name),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await sweeper.run()
+    records = [r for r in caplog.records if r.name == reconciliation.logger.name]
+    # Two blips are warnings, the third in a row is an error, a successful
+    # sweep resets the count, and any other failure is still an error.
+    assert [r.levelno for r in records] == [
+        logging.WARNING,
+        logging.WARNING,
+        logging.ERROR,
+        logging.WARNING,
+        logging.ERROR,
+    ]
+    assert records[0].consecutive == 1 and records[-2].consecutive == 1
+    assert metrics.count(("sweep_errors", 1)) == CONNECT_TIMEOUTS_BEFORE_ERROR + 2

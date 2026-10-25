@@ -496,7 +496,6 @@ With both origins known:
   console on `<web-origin>`: an `Error` (its message scrubbed) shows up under
   the React project with environment `production`.
 - LiveKit Cloud's project settings show agent observability off.
-
 - `lk agent status` shows the agent running.
 - A full voice interview, from the plan to the results; with LangSmith, its
   traces appear in the production project.

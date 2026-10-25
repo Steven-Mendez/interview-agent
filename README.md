@@ -24,7 +24,7 @@ Choose technical, behavioral or mixed questions, and interview simulation or foc
 - **TanStack Start + shadcn/ui** — React frontend in `web/`, built as a SPA
 
 All three LLM roles default to `gpt-6.1-sol`: low reasoning effort for the
-interviewer and high for planning and evaluation.
+interviewer, medium for planning and high for evaluation.
 
 ## Requirements
 
@@ -43,7 +43,7 @@ That starts the whole stack: Postgres, the API + frontend, and the LiveKit worke
 
 Open <http://localhost:8000> and choose **New interview**: upload a resume PDF, paste the job offer and wait for the plan (~30–60 s). The preparation room lets you check your microphone and camera before you start the voice interview. When it ends, the results open in the app as soon as the evaluation is ready.
 
-The **History** screen lists every interview you have run, newest first, with its score, verdict and how far the topics got — filterable by state. Opening one shows its scorecard and, folded away, the full transcript. **Repeat** runs the same role again: a brand-new interview off the stored resume and job offer, at the same level and length, with freshly planned questions. The original is left untouched, and every re-run stays grouped under it.
+The **History** screen lists every interview you have run, newest first, with its score, verdict and how far the topics got — filterable by state. Opening one shows its scorecard, its topics and the full transcript, each in its own tab. **Repeat** runs the same role again: a brand-new interview off the stored resume and job offer, at the same level and length, with freshly planned questions. **Repeat with changes…** (under **More actions**) lets you change the length and question settings first. The original is left untouched, and every re-run stays grouped under it.
 
 The **Settings** screen configures the agent globally: its name, the interview language (English or Spanish, with a feminine and a masculine voice per language), an optional interviewer persona and custom instructions. Changes apply to interviews created afterwards.
 
@@ -59,7 +59,7 @@ A persisted question that never started can resume under the same ID. An uncerta
 
 In the normal closing flow, `AgentSession.say()` speaks the localized farewell through the same audio track as the questions, so it enters the session history and LangSmith recording. A browser-readiness RPC prevents speaking to an incompatible or audio-blocked tab. The worker checks the speech handle for errors, interruption and audio playout, then drains recognition and writes an immutable transcript seal before results become available. Native `played` is explicitly labelled `agent_playout`: it confirms the agent finished, not complete playback at the browser or physical speaker. Historical WAV acknowledgements remain labelled `browser_playback`; no new WAV is sent. **Enable audio** resumes the existing session audio. Worker loss, abandonment and incomplete recording remain visible, and missing audio is not treated as a wrong answer.
 
-The results distinguish coverage from ability and show criterion evidence and suggested practice. **Request new assessment** creates a separate request while retaining the earlier feedback; an uncertain HTTP reply keeps the same request identity on retry. **Evaluation history** includes earlier results and failed attempts. **Review saved answers** supports explicit incident decisions and new transcript versions; it preserves old versions and assessments, and a confirmed omission keeps the affected old global score hidden. These controls are optional and do not require a manual review to conduct an interview.
+The results distinguish coverage from ability and show criterion evidence and suggested practice. **Request new assessment** (under **More actions > Evaluation details**) creates a separate request while retaining the earlier feedback; an uncertain HTTP reply keeps the same request identity on retry. **Evaluation history** includes earlier results and failed attempts. **Review saved answers** supports explicit incident decisions and new transcript versions; it preserves old versions and assessments, and a confirmed omission keeps the affected old global score hidden. These controls are optional and do not require a manual review to conduct an interview.
 
 The current endpointing delays are 1.5 seconds minimum and 2.5 seconds for longer hesitation. SDK and synthetic-audio integration tests cover the implemented contracts; they do not establish physical microphone behavior, audible latency or improved interview quality. Latency, spend and closing outcomes are exported as anonymous OpenTelemetry metrics (categories and numbers only) to Grafana: the compose `lgtm` service serves it on <http://localhost:3001> with the dashboards in `infra/grafana/dashboards`. Local logs (rotating files under `LOG_DIR`, `logs/` by default; empty keeps the console as the only output) never contain interview content.
 
